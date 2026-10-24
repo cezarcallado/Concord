@@ -814,6 +814,9 @@ impl App {
                     menu_at = Some(more.rect.left_bottom());
                 }
                 ui.add_space(AVATAR_R + 8.0);
+                // (I6: the details scroll when the app's window is shorter than the card.)
+                let body_h = (screen.bottom() - 6.0 - pos.y - BANNER_H - AVATAR_R - 8.0).max(80.0);
+                let body = egui::ScrollArea::vertical().id_salt("profile_popout_body").max_height(body_h).auto_shrink([false, true]).show(ui, |ui| {
                 egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 0, bottom: 14 }).show(ui, |ui| {
                     ui.set_width(POPOUT_WIDTH - 32.0);
                     // Name, badge, username.
@@ -936,8 +939,10 @@ impl App {
                         }
                     }
                 });
-                // The height the card wants: everything laid out, also what the window clips.
-                let natural = ui.min_rect().height();
+                });
+                // The height the card wants: everything laid out, also what the window clips (and
+                // what its details scroll: the card moves up for them first).
+                let natural = ui.min_rect().height() - body.inner_rect.height() + body.content_size.y;
                 if ui.ctx().data(|d| d.get_temp::<f32>(natural_id)) != Some(natural) {
                     ui.ctx().data_mut(|d| d.insert_temp(natural_id, natural));
                     ui.ctx().request_repaint();

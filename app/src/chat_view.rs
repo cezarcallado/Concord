@@ -44,6 +44,10 @@ pub trait ChatLine {
     fn mention_ids(&self) -> &[UserId];
     fn everyone(&self) -> bool;
     fn mentions_me(&self, me: UserId) -> bool;
+    /// v1.1 (E2): an end-to-end encrypted line (`Some(true)`: it could not be read here).
+    fn e2e(&self) -> Option<bool> {
+        None
+    }
     /// A DM's call line ("Chamada perdida"...): its text and whether it ended normally.
     fn call_line(&self, _me: UserId) -> Option<(String, bool)> {
         None
@@ -114,6 +118,9 @@ impl ChatLine for DmMessage {
     fn mentions_me(&self, _me: UserId) -> bool {
         false
     }
+    fn e2e(&self) -> Option<bool> {
+        crate::backend::e2ee::dm::is_e2e(self).then(|| crate::backend::e2ee::dm::is_unreadable(self))
+    }
     fn call_line(&self, me: UserId) -> Option<(String, bool)> {
         (self.kind != DmMessageKind::Text).then(|| (super::dms::call_line_text(self, me), self.kind == DmMessageKind::CallEnded))
     }
@@ -141,7 +148,20 @@ pub struct ListSpec<'a> {
     pub loading_older: bool,
     /// `previews::tick_view` key of this chat.
     pub view_key: i64,
+    /// The recently used reactions (the quick row of a message's menu).
+    pub recent: &'a [String],
+    /// Autotests: note what the list scrolls and take scroll requests (`ui_kit::note_scroll`).
+    pub probe: bool,
+    /// v1.1 (E2): this computer's own lines (when, text), shown among the messages by time
+    /// ("O código de segurança de Fulano mudou").
+    pub notes: &'a [(i64, String)],
+    /// v1.1 (E2): link previews also under end-to-end encrypted lines ("Prévias de links nas
+    /// conversas criptografadas"; asking for one tells the hub the link).
+    pub sealed_previews: bool,
 }
+
+/// The key of the chat's scroll probe (autotests).
+pub const CHAT_SCROLL: &str = "chat";
 
 /// What the list asks for, done after it is drawn (outside its borrows).
 #[derive(Default)]
@@ -174,7 +194,12 @@ pub fn message_list<T: ChatLine>(ui: &mut egui::Ui, p: Parts<'_>, msgs: &[T], sp
         p.previews.maintain(now_instant);
     }
     let me = spec.me;
-    egui::ScrollArea::vertical().id_salt(spec.scroll_id).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+    // (Autotests: a message whose menu is to open as if right-clicked.)
+    let forced = if spec.probe { chat_extras::forced_menu(ui.ctx()) } else { None };
+    let scroll = egui::ScrollArea::vertical().id_salt(spec.scroll_id).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+        if spec.probe {
+            ui_kit::apply_scroll_request(ui, CHAT_SCROLL);
+        }
         ui.set_width(ui.available_width());
         ui.add_space(6.0);
         let quiet = |ui: &mut egui::Ui, text: &str| {
@@ -193,7 +218,12 @@ pub fn message_list<T: ChatLine>(ui: &mut egui::Ui, p: Parts<'_>, msgs: &[T], sp
             quiet(ui, spec.empty);
         }
         let mut prev: Option<(UserId, i64)> = None;
+        let mut notes = spec.notes.iter().peekable();
         for m in msgs {
+            while let Some((at, text)) = notes.next_if(|(at, _)| *at <= m.at_ms()) {
+                local_line(ui, text, &format_time(*at, now, offset));
+                prev = None;
+            }
             if let Some((text, ended)) = me.and_then(|me| m.call_line(me)) {
                 call_line(ui, &text, ended, &format_time(m.at_ms(), now, offset));
                 prev = None;
@@ -231,7 +261,10 @@ pub fn message_list<T: ChatLine>(ui: &mut egui::Ui, p: Parts<'_>, msgs: &[T], sp
                     }
                     let top = ui.cursor().top();
                     let caption = m.caption();
-                    if !caption.is_empty() || m.attachments().is_empty() {
+                    if m.e2e() == Some(true) {
+                        // "Não foi possível ler esta mensagem" / "... antes deste aparelho existir".
+                        ui.label(RichText::new(format!("{}  {caption}", ph::LOCK_SIMPLE)).italics().color(theme::NEVOA));
+                    } else if !caption.is_empty() || m.attachments().is_empty() {
                         let (ids, everyone) = match &spec.dm_people {
                             Some(us) => (&us[..], false),
                             None => (m.mention_ids(), m.everyone()),
@@ -241,7 +274,7 @@ pub fn message_list<T: ChatLine>(ui: &mut egui::Ui, p: Parts<'_>, msgs: &[T], sp
                     if let Some(i) = crate::chat_images::show_attachments(ui, p.images, m.attachments(), p.auto_images, images_settled) {
                         out.open_image = Some((m.attachments().to_vec(), i));
                     }
-                    if p.previews_on {
+                    if p.previews_on && (m.e2e().is_none() || spec.sealed_previews) {
                         let band = egui::Rect::from_min_max(egui::pos2(ui.max_rect().left(), top), egui::pos2(ui.max_rect().right(), ui.cursor().top().max(top + 1.0)));
                         let on_screen = may_ask && ui.is_rect_visible(band);
                         for url in crate::links::urls(caption, previews::MAX_CARDS_PER_MESSAGE) {
@@ -287,14 +320,21 @@ pub fn message_list<T: ChatLine>(ui: &mut egui::Ui, p: Parts<'_>, msgs: &[T], sp
                 out.offers.push((spec.target, m.id()));
             }
             let person_menu = !menus_before && out.open_menu.is_some();
-            chat_extras::message_menu(ui, row, ui.id().with(("msg_menu", m.id())), actions, m.id(), person_menu, &mut out.acts);
+            let info = chat_extras::MenuInfo { caption: m.caption(), reactions: m.reactions(), me, recent: spec.recent };
+            chat_extras::message_menu(ui, row, ui.id().with(("msg_menu", m.id())), actions, m.id(), info, person_menu, forced == Some(m.id()), &mut out.acts);
             if hovered {
                 chat_extras::hover_bar(ui, row, actions, m.id(), &mut out.acts);
             }
             prev = Some((author.id, m.at_ms()));
         }
+        for (at, text) in notes {
+            local_line(ui, text, &format_time(*at, now, offset));
+        }
         ui.add_space(10.0);
     });
+    if spec.probe {
+        ui_kit::note_scroll(ui.ctx(), CHAT_SCROLL, &scroll);
+    }
     out
 }
 
@@ -312,6 +352,16 @@ fn header(ui: &mut egui::Ui, author: &User, roles_on: bool, time: &str, out: &mu
             out.open_profile = Some(author.clone());
         }
         crate::roles::role_badge(ui, role);
+        ui.label(RichText::new(time).font(theme::body(11.0)).color(theme::NEVOA));
+    });
+}
+
+/// v1.1 (E2): one of this computer's own lines (about a person's keys), like a call line.
+fn local_line(ui: &mut egui::Ui, text: &str, time: &str) {
+    ui.add_space(GROUP_GAP);
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(AVATAR + GUTTER_GAP - ui.spacing().item_spacing.x);
+        ui.label(RichText::new(format!("{}  {text}", ph::SHIELD)).color(theme::AVISO));
         ui.label(RichText::new(time).font(theme::body(11.0)).color(theme::NEVOA));
     });
 }
@@ -379,6 +429,10 @@ impl App {
             no_more: log.no_more,
             loading_older: log.loading_older,
             view_key: ch,
+            recent: &self.settings.recent_reactions,
+            probe: !self.persist,
+            notes: &[],
+            sealed_previews: true,
         };
         let previews_on = self.settings.show_link_previews && !self.previews.unsupported();
         let parts = Parts {
@@ -416,6 +470,10 @@ impl App {
             no_more: log.no_more,
             loading_older: log.loading_older,
             view_key: -1_000_000 - dm,
+            recent: &self.settings.recent_reactions,
+            probe: !self.persist,
+            notes: self.dms.notes.get(&peer.id).map_or(&[][..], Vec::as_slice),
+            sealed_previews: self.settings.e2e_link_previews,
         };
         let previews_on = self.settings.show_link_previews && !self.previews.unsupported();
         let parts = Parts {
@@ -488,12 +546,18 @@ impl App {
                     }
                     let right = if self.dms.input.trim().is_empty() { 30.0 } else { 64.0 };
                     let hint = if blocked { format!("Você bloqueou @{name}") } else { format!("Mensagem para @{name}") };
+                    let id = egui::Id::new("dm_input_box");
+                    let kept = box_menu_before(ui, id, &self.dms.input);
                     let resp = ui.add(
                         field_edit(&mut self.dms.input, hint)
                             .char_limit(vox_proto::DM_MESSAGE_MAX_CHARS)
                             .desired_width((ui.available_width() - right).max(40.0))
-                            .id(egui::Id::new("dm_input_box")),
+                            .id(id),
                     );
+                    if !blocked && box_menu(ui, &resp, id, &self.dms.input, kept, self.video.parent.unwrap_or(0)) == BoxOut::PasteImage {
+                        let ctx = ui.ctx().clone();
+                        self.paste_image_from_menu(target, &ctx);
+                    }
                     send |= resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         self.cancel_reply(target);
@@ -551,4 +615,176 @@ fn emoji_button(ui: &mut egui::Ui, text: &mut String) -> bool {
         });
     });
     picked
+}
+
+// ---------------------------------------------------------------- the text box's right-click menu
+
+/// What the text box's menu asked for: done on the next frame, right before the box is drawn,
+/// through the box's own handling of the key events (so it behaves exactly like the shortcuts).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BoxCmd {
+    Cut,
+    Copy,
+    Paste(String),
+    SelectAll,
+}
+
+impl BoxCmd {
+    fn name(&self) -> &'static str {
+        match self {
+            BoxCmd::Cut => "Recortar",
+            BoxCmd::Copy => "Copiar",
+            BoxCmd::Paste(_) => "Colar",
+            BoxCmd::SelectAll => "Selecionar tudo",
+        }
+    }
+}
+
+fn box_cmd_id(id: egui::Id) -> egui::Id {
+    id.with("menu_cmd")
+}
+
+fn box_paste_id(id: egui::Id) -> egui::Id {
+    id.with("menu_paste")
+}
+
+fn box_forced_id() -> egui::Id {
+    egui::Id::new("force_box_menu")
+}
+
+/// Autotests: hold the menu of the text box `box_id` open at `at` (as a right click there opens
+/// it) until [`force_box_menu_off`]; the window is never under the real pointer.
+pub fn force_box_menu(ctx: &egui::Context, box_id: egui::Id, at: egui::Pos2) {
+    ctx.data_mut(|d| d.insert_temp(box_forced_id(), (box_id, at)));
+}
+
+/// Autotests: let the held menu go (it closes).
+pub fn force_box_menu_off(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove::<(egui::Id, egui::Pos2)>(box_forced_id()));
+    egui::Popup::close_all(ctx);
+}
+
+/// Before the text box `id` (holding `text`) is drawn: do what its menu asked for last frame, and
+/// keep the selection under a right click (egui moves the cursor on any press; the menu acts on
+/// the selection). Returns the selection to put back once the box is drawn ([`box_menu`]).
+pub(super) fn box_menu_before(ui: &mut egui::Ui, id: egui::Id, text: &str) -> Option<egui::text::CCursorRange> {
+    if let Some(cmd) = ui.data(|d| d.get_temp::<BoxCmd>(box_cmd_id(id))) {
+        ui.data_mut(|d| d.remove::<BoxCmd>(box_cmd_id(id)));
+        ui.memory_mut(|m| m.request_focus(id));
+        tracing::info!(what = cmd.name(), "text box menu");
+        let event = match cmd {
+            BoxCmd::Cut => Some(egui::Event::Cut),
+            BoxCmd::Copy => Some(egui::Event::Copy),
+            BoxCmd::Paste(t) => Some(egui::Event::Paste(t)),
+            BoxCmd::SelectAll => {
+                let mut st = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+                let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(text.chars().count()));
+                st.cursor.set_char_range(Some(all));
+                st.store(ui.ctx(), id);
+                None
+            }
+        };
+        if let Some(e) = event {
+            ui.input_mut(|i| i.events.push(e));
+        }
+    }
+    if ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary)) {
+        egui::text_edit::TextEditState::load(ui.ctx(), id).and_then(|s| s.cursor.char_range())
+    } else {
+        None
+    }
+}
+
+/// What the text box's menu leaves to the chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BoxOut {
+    Nothing,
+    /// "Colar" with a picture (or files) on the clipboard: attach it, as Ctrl+V does.
+    PasteImage,
+}
+
+/// The shortcut shown beside a menu entry ("Ctrl+V"; "Cmd+V" on the Mac).
+fn shortcut(key: &str) -> String {
+    if cfg!(target_os = "macos") { format!("Cmd+{key}") } else { format!("Ctrl+{key}") }
+}
+
+/// After the text box `id` (response `resp`, holding `text`) is drawn: put back the selection a
+/// right click kept, then its right-click menu: Recortar, Copiar, Colar and Selecionar tudo, each
+/// off when it does not apply (nothing selected, nothing on the clipboard, an empty box).
+pub(super) fn box_menu(ui: &mut egui::Ui, resp: &egui::Response, id: egui::Id, text: &str, kept: Option<egui::text::CCursorRange>, owner: isize) -> BoxOut {
+    if let Some(range) = kept.filter(|r| !r.is_empty() && resp.hovered()) {
+        if let Some(mut st) = egui::text_edit::TextEditState::load(ui.ctx(), id) {
+            st.cursor.set_char_range(Some(range));
+            st.store(ui.ctx(), id);
+        }
+    }
+    let forced_at = ui.data(|d| d.get_temp::<(egui::Id, egui::Pos2)>(box_forced_id())).filter(|(b, _)| *b == id).map(|(_, at)| at);
+    if resp.secondary_clicked() || forced_at.is_some() {
+        // What the clipboard holds, when the menu opens (not every frame it is up).
+        let known = ui.data(|d| d.get_temp::<crate::clipboard::PasteKind>(box_paste_id(id))).is_some();
+        if resp.secondary_clicked() || !known {
+            let kind = crate::clipboard::paste_kind();
+            ui.data_mut(|d| d.insert_temp(box_paste_id(id), kind));
+        }
+    }
+    let popup = match forced_at {
+        Some(at) => egui::Popup::menu(resp).open_memory(Some(egui::SetOpenCommand::Bool(true))).at_position(at),
+        None => egui::Popup::context_menu(resp),
+    };
+    let mut out = BoxOut::Nothing;
+    let mut cmd = None;
+    popup.frame(ui_kit::popup_frame(ui.style())).style(ui_kit::menu_style).show(|ui| {
+        ui.set_min_width(220.0);
+        ui.set_max_width(240.0);
+        let selected = egui::text_edit::TextEditState::load(ui.ctx(), id).and_then(|s| s.cursor.char_range()).is_some_and(|r| !r.is_empty());
+        let paste = ui.data(|d| d.get_temp::<crate::clipboard::PasteKind>(box_paste_id(id))).unwrap_or(crate::clipboard::PasteKind::Nothing);
+        let row = |ui: &mut egui::Ui, on: bool, icon: &str, label: &str, key: &str| ui.add_enabled_ui(on, |ui| ui_kit::menu_row_hint(ui, icon, label, &shortcut(key))).inner.clicked();
+        if row(ui, selected, ph::SCISSORS, "Recortar", "X") {
+            cmd = Some(BoxCmd::Cut);
+        }
+        if row(ui, selected, ph::COPY, "Copiar", "C") {
+            cmd = Some(BoxCmd::Copy);
+        }
+        if row(ui, paste != crate::clipboard::PasteKind::Nothing, ph::CLIPBOARD_TEXT, "Colar", "V") {
+            match paste {
+                crate::clipboard::PasteKind::Text => cmd = crate::clipboard::read_text(owner).filter(|t| !t.is_empty()).map(BoxCmd::Paste),
+                crate::clipboard::PasteKind::Image => out = BoxOut::PasteImage,
+                crate::clipboard::PasteKind::Nothing => {}
+            }
+            ui.close();
+        }
+        ui_kit::menu_separator(ui);
+        if row(ui, !text.is_empty(), ph::SELECTION_ALL, "Selecionar tudo", "A") {
+            cmd = Some(BoxCmd::SelectAll);
+        }
+        if cmd.is_some() {
+            ui.close();
+        }
+    });
+    if let Some(c) = cmd {
+        // Done on the next frame, with the box focused (`box_menu_before`).
+        ui.data_mut(|d| d.insert_temp(box_cmd_id(id), c));
+        ui.memory_mut(|m| m.request_focus(id));
+        ui.ctx().request_repaint();
+    }
+    out
+}
+
+/// Autotests: what the menu of the text box `id` offers now (Recortar, Copiar, Colar, Selecionar
+/// tudo: on or off), as [`box_menu`] decides it.
+pub fn box_menu_state(ctx: &egui::Context, id: egui::Id, text: &str) -> [bool; 4] {
+    let selected = egui::text_edit::TextEditState::load(ctx, id).and_then(|s| s.cursor.char_range()).is_some_and(|r| !r.is_empty());
+    let paste = ctx.data(|d| d.get_temp::<crate::clipboard::PasteKind>(box_paste_id(id))).unwrap_or(crate::clipboard::PasteKind::Nothing);
+    [selected, selected, paste != crate::clipboard::PasteKind::Nothing, !text.is_empty()]
+}
+
+/// Autotests: "Colar" with `text` on the clipboard (without touching the real clipboard), done
+/// the next time the text box `id` is drawn, as the menu does it.
+pub fn queue_box_paste(ctx: &egui::Context, id: egui::Id, text: &str) {
+    ctx.data_mut(|d| d.insert_temp(box_cmd_id(id), BoxCmd::Paste(text.to_string())));
+}
+
+/// Autotests: "Selecionar tudo", as the menu does it.
+pub fn queue_box_select_all(ctx: &egui::Context, id: egui::Id) {
+    ctx.data_mut(|d| d.insert_temp(box_cmd_id(id), BoxCmd::SelectAll));
 }

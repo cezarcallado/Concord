@@ -1,6 +1,6 @@
 //! `%APPDATA%\concord\settings.json`. The server password is only stored when the user ticks
 //! "Lembrar senha", and then only encrypted with Windows DPAPI (current user) or, on macOS, kept in
-//! the login Keychain (settings.json holds only a reference, see `keychain`). The saved server
+//! a user-only file, secrets.json (settings.json holds only a reference, see `filestore`). The saved server
 //! list (v0.9.1) is `servers.json` next to it (see `servers.rs`).
 
 use std::collections::BTreeMap;
@@ -143,8 +143,17 @@ pub struct Settings {
     /// "Priorizar fluidez": keep the frame rate under congestion (default: drop fps first).
     pub share_smooth: bool,
     pub ptt_enabled: bool,
+    /// Push-to-talk's key before v1.1, still written (from the first push-to-talk binding of
+    /// `keybinds`) so an older app keeps its key; read once into `keybinds` at start
+    /// (`keybinds::adopt_legacy_ptt`). 0 when that binding is a combination.
     pub ptt_vk: u32,
+    /// The name shown for push-to-talk's key (the binding's label).
     pub ptt_name: String,
+    /// "Atalhos de teclado" (v1.1): mute, deafen, push-to-talk, leave, Go Live, a sound. Older
+    /// files have none (their push-to-talk key is adopted from `ptt_vk`); an entry this version
+    /// does not understand is skipped, never the whole file.
+    #[serde(default, deserialize_with = "crate::keybinds::de_list")]
+    pub keybinds: Vec<crate::keybinds::Keybind>,
     /// Input sensitivity ("Sensibilidade de entrada"): automatic or manual voice-activity gate.
     pub input_gate: GateConfig,
     /// "Supressão de ruído": Padrão (WebRTC), IA leve (RNNoise, the default) or IA máxima
@@ -166,6 +175,11 @@ pub struct Settings {
     /// small picture of what I share. Off tears the preview tap down completely (no second
     /// video processor, no staging textures). Older files get the default (on).
     pub show_self_preview: bool,
+    /// "Prévia da minha transmissão ao passar o mouse" (v1.1): while I am live, a small still
+    /// picture of what I share (and the app's name and icon) goes to the server for the hover
+    /// cards. Off: nothing is sent, and a picture already there is dropped. Older files get the
+    /// default (on, as in Discord).
+    pub share_hover_preview: bool,
     /// Camera to use (`vox_capture::CameraInfo::id`); `None` = the first camera.
     pub camera_device: Option<String>,
     /// Its name, to find it again if the id changed (plugged into another USB port).
@@ -183,6 +197,9 @@ pub struct Settings {
     /// "Mostrar prévia de links": cards with title and thumbnail under chat links (the hub
     /// fetches them). Added with item 10, so older settings.json files get the default (on).
     pub show_link_previews: bool,
+    /// v1.1 (E2): "Prévias de links nas conversas criptografadas": off by default (asking the hub
+    /// for a card tells it which link was in an end-to-end encrypted DM).
+    pub e2e_link_previews: bool,
     /// "Qualidade das imagens enviadas" (chat images): Normal (1920 px), Alta (2560) or Original
     /// (up to 4096). Older files get Normal.
     pub image_quality: vox_client_core::images::Quality,
@@ -196,6 +213,10 @@ pub struct Settings {
     /// `backend::Guard`); a token without one (saved before v1.0.1, or by an older hub) gets it
     /// at its next login. Not a secret.
     pub device_token_servers: BTreeMap<String, String>,
+    /// v1.1 (T0): the TLS certificate pin (64 hex digits) of the server that issued each login
+    /// token above, same keys. A token with one is sent only over TLS with that certificate
+    /// (`backend::Guard::check_pin`). Not a secret.
+    pub device_token_pins: BTreeMap<String, String>,
     /// Soundboard volume, mute and silenced sounds (added after v0.4.1: older files get the defaults).
     pub soundboard: crate::soundboard::SoundboardSettings,
     /// Profile settings of this computer (idle time before "Ausente"); older files get the defaults.
@@ -206,6 +227,11 @@ pub struct Settings {
     pub recent_reactions: Vec<String>,
     /// The v1.0 shell's remembered choices (center mode, docked chat width, member list).
     pub layout: crate::layout::LayoutSettings,
+    /// "Apoie o concord" (v1.1, `donate.rs`): how many of the two popups this user got. Older
+    /// files get 0 (the first comes at the next login).
+    pub donate_popups_shown: u32,
+    /// Seconds logged in to a server, tray included (for the second popup). Older files start at 0.
+    pub usage_secs: u64,
     /// "Seus servidores salvos" (v0.9.1). Kept in `servers.json` next to this file, not in it: an
     /// older app rewrites settings.json without it (see `servers.rs`). `server`, `username`,
     /// `remember_password` and `password_enc` above mirror its most recently used entry.
@@ -229,6 +255,7 @@ impl Default for Settings {
             ptt_enabled: false,
             ptt_vk: 0,
             ptt_name: String::new(),
+            keybinds: Vec::new(),
             input_gate: GateConfig::default(),
             noise_suppression: NoiseLevel::default(),
             voice_fx: VoiceFxConfig::default(),
@@ -237,6 +264,7 @@ impl Default for Settings {
             stream_popout: false,
             stream_focus_audio: false,
             show_self_preview: true,
+            share_hover_preview: true,
             camera_device: None,
             camera_name: None,
             camera_preset: CameraPreset::default(),
@@ -244,15 +272,19 @@ impl Default for Settings {
             hw_accel: true,
             video_encoder: None,
             show_link_previews: true,
+            e2e_link_previews: false,
             image_quality: Default::default(),
             auto_show_images: true,
             device_tokens: BTreeMap::new(),
             device_token_servers: BTreeMap::new(),
+            device_token_pins: BTreeMap::new(),
             soundboard: Default::default(),
             profile: Default::default(),
             notify: Default::default(),
             recent_reactions: Vec::new(),
             layout: Default::default(),
+            donate_popups_shown: 0,
+            usage_secs: 0,
             servers: Default::default(),
         }
     }
@@ -295,6 +327,12 @@ pub fn file_path() -> Option<PathBuf> {
 /// The saved server list (v0.9.1), next to settings.json.
 pub fn servers_path(settings: &Path) -> PathBuf {
     settings.with_file_name("servers.json")
+}
+
+/// v1.1 (E0): this computer's identity keys and the device keys it has seen (`e2ee_store.rs`),
+/// next to settings.json.
+pub fn e2ee_path() -> Option<PathBuf> {
+    path().map(|p| p.with_file_name("e2ee.json"))
 }
 
 /// Write through a temporary file, so a crash never leaves half a file.
@@ -377,6 +415,7 @@ impl Settings {
     pub fn set_device_token(&mut self, server: &str, username: &str, token: Option<&str>) {
         let key = Self::device_key(server, username);
         self.device_token_servers.remove(&key);
+        self.device_token_pins.remove(&key);
         match token.and_then(protect) {
             Some(enc) => {
                 self.device_tokens.insert(key, enc);
@@ -391,6 +430,26 @@ impl Settings {
     /// on `server`, when known.
     pub fn device_token_server(&self, server: &str, username: &str) -> Option<String> {
         self.device_token_servers.get(&Self::device_key(server, username)).filter(|id| vox_proto::is_server_id(id)).cloned()
+    }
+
+    /// v1.1 (T0): the certificate of the server that issued this computer's login token for
+    /// `username` on `server`, when known.
+    pub fn device_token_pin(&self, server: &str, username: &str) -> Option<[u8; 32]> {
+        vox_proto::tls_pin_from_hex(self.device_token_pins.get(&Self::device_key(server, username))?)
+    }
+
+    /// v1.1 (T0): tie the login token saved for `username` on `server` (if there is one) to a
+    /// certificate (`None`: unknown).
+    pub fn set_device_token_pin(&mut self, server: &str, username: &str, pin: Option<[u8; 32]>) {
+        let key = Self::device_key(server, username);
+        match pin.filter(|_| self.device_tokens.contains_key(&key)) {
+            Some(pin) => {
+                self.device_token_pins.insert(key, vox_proto::tls_pin_hex(&pin));
+            }
+            None => {
+                self.device_token_pins.remove(&key);
+            }
+        }
     }
 
     /// v1.0.1: tie the login token saved for `username` on `server` (if there is one) to a server
@@ -527,198 +586,401 @@ pub(crate) fn unprotect(_hex: &str) -> Option<String> {
     None
 }
 
-// ---------------------------------------------------------------- macOS Keychain
+// ---------------------------------------------------------------- macOS: a user-only file
 
-/// macOS: the secret goes to the login Keychain; settings.json keeps only an opaque reference.
+/// macOS: the secret goes to secrets.json next to settings.json (readable only by this user);
+/// settings.json keeps only an opaque reference. See `filestore`.
 #[cfg(target_os = "macos")]
 pub(crate) fn protect(plain: &str) -> Option<String> {
-    keychain::protect(plain)
+    filestore::protect_in(filestore::Vault::Secrets, plain)
 }
 
 #[cfg(target_os = "macos")]
 pub(crate) fn unprotect(reference: &str) -> Option<String> {
-    keychain::unprotect(reference)
+    filestore::unprotect(reference)
 }
 
-/// Saved passwords and login tokens on macOS (phase M1 of docs/PLANO-macOS.md).
-///
-/// - Every secret lives in ONE generic-password item of the login Keychain (service `concord`,
-///   account `secrets`): a small JSON map from random ids to secrets. settings.json and
-///   servers.json only hold `kc1:<id>` (32 random hex digits): no plaintext, no ciphertext.
-/// - One item, not one per secret: the app is signed ad hoc, so after an update macOS asks once
-///   ("Permitir Sempre") instead of once per saved password.
-/// - The same secret saved again reuses its id, and [`keychain_gc`] (at startup) drops the ids no
-///   file mentions any more, so the item does not grow with every login.
-/// - Autotests with their own settings folder use their own account (`secrets-test-<hash>`), so
-///   they never touch the real item. Unit tests keep the map in memory only (the real item
-///   functions have their own test).
-/// - Keychain unavailable (locked, access denied): nothing is saved (`None`), as before M1.
+/// v1.1 (E0): this computer's end-to-end identity keys (e2ee.json). Same protection as
+/// [`protect`] on Windows; on macOS their own map in secrets.json (`kck:` references).
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn protect_key(plain: &str) -> Option<String> {
+    protect(plain)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn unprotect_key(stored: &str) -> Option<String> {
+    unprotect(stored)
+}
+
 #[cfg(target_os = "macos")]
-mod keychain {
+pub(crate) fn protect_key(plain: &str) -> Option<String> {
+    filestore::protect_in(filestore::Vault::Keys, plain)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn unprotect_key(reference: &str) -> Option<String> {
+    filestore::unprotect(reference)
+}
+
+/// Saved passwords, login tokens and the end-to-end identity keys on macOS (v1.1.0).
+///
+/// - Everything lives in `secrets.json` next to settings.json (~/Library/Application
+///   Support/concord), mode 0600 (this user only), always replaced atomically (a 0600 temp file,
+///   then a rename). settings.json, servers.json and e2ee.json hold only `kc1:<id>` (passwords and
+///   tokens) or `kck:<id>` (identity keys): 32 random hex digits, no secret.
+/// - The Keychain is no longer used: the app is signed ad hoc, so every update made macOS ask for
+///   the Keychain password again. The prefixes are the ones the Keychain versions wrote, so their
+///   references keep working once migrated.
+/// - Migration, once: when secrets.json has not been migrated yet and a settings file mentions a
+///   `kc1:`/`kck:` id it lacks, the old Keychain item of that kind (`secrets` / `device-keys`) is
+///   read ONE time and the mentioned entries are copied here. A read that fails or is refused is
+///   not retried: that saved password is simply gone (typed again once) and the identity key goes
+///   the existing "chave nova" way (`e2ee_store::UNREADABLE_KEY_TEXT`). The Keychain items are left
+///   as they are (deleting them could ask again; an older concord still finds them).
+/// - [`secrets_gc`] (at startup) drops the ids no file mentions any more.
+/// - Autotests with their own settings folder get their own secrets.json there. Unit tests keep
+///   the map in memory only (the file functions have their own tests) and never read the Keychain.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod filestore {
     use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard};
 
-    pub(super) const SERVICE: &str = "concord";
-    pub(super) const PREFIX: &str = "kc1:";
-    /// errSecItemNotFound
-    const NOT_FOUND: i32 = -25300;
+    use serde::{Deserialize, Serialize};
 
-    /// The map as last read or written (`None`: not read yet).
-    static CACHE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+    /// Which map a secret lives in.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Vault {
+        /// Server passwords and login tokens (`kc1:`).
+        Secrets,
+        /// v1.1: the end-to-end identity keys (`kck:`).
+        Keys,
+    }
 
-    fn account() -> String {
-        match super::DIR.get() {
+    impl Vault {
+        pub(super) const ALL: [Vault; 2] = [Vault::Secrets, Vault::Keys];
+
+        pub(super) fn prefix(self) -> &'static str {
+            match self {
+                Vault::Secrets => "kc1:",
+                Vault::Keys => "kck:",
+            }
+        }
+
+        /// The Keychain account the Keychain versions used (read by the migration only).
+        #[cfg_attr(not(all(target_os = "macos", not(test))), allow(dead_code))]
+        fn keychain_account(self) -> &'static str {
+            match self {
+                Vault::Secrets => "secrets",
+                Vault::Keys => "device-keys",
+            }
+        }
+
+        /// The vault and id of a reference (`None`: not one of ours).
+        pub(super) fn of(reference: &str) -> Option<(Vault, String)> {
+            Vault::ALL.into_iter().find_map(|v| {
+                let id = reference.strip_prefix(v.prefix())?;
+                (id.len() == 32 && id.bytes().all(|c| c.is_ascii_hexdigit())).then(|| (v, id.to_ascii_lowercase()))
+            })
+        }
+    }
+
+    /// secrets.json.
+    #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+    pub(super) struct Data {
+        #[serde(default)]
+        pub(super) secrets: HashMap<String, String>,
+        #[serde(default)]
+        pub(super) keys: HashMap<String, String>,
+        /// The one-time copy from the Keychain was done (or tried): never read it again.
+        #[serde(default)]
+        pub(super) keychain_migrated: bool,
+    }
+
+    impl Data {
+        pub(super) fn map(&mut self, vault: Vault) -> &mut HashMap<String, String> {
+            match vault {
+                Vault::Secrets => &mut self.secrets,
+                Vault::Keys => &mut self.keys,
+            }
+        }
+    }
+
+    /// secrets.json as last read or written (`None`: not read yet).
+    static CACHE: Mutex<Option<Data>> = Mutex::new(None);
+
+    /// A reference id: 16 random bytes, hex.
+    fn new_id() -> Option<String> {
+        let mut b = [0u8; 16];
+        #[cfg(unix)]
+        {
+            use std::io::Read;
+            std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).ok()?;
+        }
+        // Only the unit tests get here (Windows keeps DPAPI): distinct ids are enough.
+        #[cfg(not(unix))]
+        for c in b.chunks_mut(8) {
+            use std::hash::{BuildHasher, Hasher};
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_u64(0);
+            c.copy_from_slice(&h.finish().to_le_bytes());
+        }
+        Some(super::to_hex(&b))
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_reference(s: &str) -> bool {
+        Vault::of(s).is_some()
+    }
+
+    /// The file (`None` in unit tests: memory only).
+    #[cfg(not(test))]
+    fn file() -> Option<PathBuf> {
+        super::path().map(|p| p.with_file_name("secrets.json"))
+    }
+
+    #[cfg(test)]
+    fn file() -> Option<PathBuf> {
+        None
+    }
+
+    /// Read secrets.json (`Ok(None)`: there is none yet). Group/other permissions are taken away.
+    pub(super) fn read_file(p: &Path) -> Result<Option<Data>, String> {
+        let bytes = match std::fs::read(p) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(m) = std::fs::metadata(p) {
+                if m.permissions().mode() & 0o077 != 0 {
+                    let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
+                }
+            }
+        }
+        serde_json::from_slice(&bytes).map(Some).map_err(|e| format!("damaged file: {e}"))
+    }
+
+    /// Replace secrets.json atomically: a new 0600 file next to it, then a rename over it.
+    pub(super) fn write_file(p: &Path, data: &Data) -> Result<(), String> {
+        use std::io::Write;
+        let dir = p.parent().ok_or("no folder")?;
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let json = serde_json::to_vec(data).map_err(|e| e.to_string())?;
+        let tmp = dir.join(format!(".secrets.json.{}.tmp", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
+        }
+        let done = o
+            .open(&tmp)
+            .and_then(|mut f| {
+                f.write_all(&json)?;
+                f.sync_all()
+            })
+            .and_then(|_| std::fs::rename(&tmp, p));
+        if done.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        done.map_err(|e| e.to_string())
+    }
+
+    /// The one-time copy from the Keychain: for each vault whose ids `text` (the settings files)
+    /// mentions but `data` lacks, `read` that Keychain item once and keep the mentioned entries.
+    /// Returns whether the Keychain was asked at all (then `data` must be written).
+    pub(super) fn migrate(data: &mut Data, text: &str, read: impl Fn(Vault) -> Result<Option<HashMap<String, String>>, String>) -> bool {
+        let mut asked = false;
+        for vault in Vault::ALL {
+            let prefix = vault.prefix();
+            let map = data.map(vault);
+            let wanted: Vec<String> = text
+                .match_indices(prefix)
+                .filter_map(|(i, _)| text.get(i..i + prefix.len() + 32))
+                .filter_map(|r| Vault::of(r).map(|(_, id)| id))
+                .filter(|id| !map.contains_key(id))
+                .collect();
+            if wanted.is_empty() {
+                continue;
+            }
+            asked = true;
+            match read(vault) {
+                Ok(Some(old)) => {
+                    let mut copied = 0;
+                    for id in &wanted {
+                        if let Some(v) = old.get(id) {
+                            map.insert(id.clone(), v.clone());
+                            copied += 1;
+                        }
+                    }
+                    tracing::info!(?vault, copied, missing = wanted.len() - copied, "secrets: moved out of the Keychain into secrets.json");
+                }
+                Ok(None) => tracing::info!(?vault, "secrets: no Keychain item to move"),
+                // Refused or unreadable: never asked again; those saved secrets are gone.
+                Err(e) => tracing::warn!(error = %e, ?vault, "secrets: the old Keychain item cannot be read; those saved secrets are dropped"),
+            }
+        }
+        data.keychain_migrated = true;
+        asked
+    }
+
+    /// The old Keychain item of `vault` (migration only).
+    #[cfg(all(target_os = "macos", not(test)))]
+    fn keychain_read(vault: Vault) -> Result<Option<HashMap<String, String>>, String> {
+        /// errSecItemNotFound
+        const NOT_FOUND: i32 = -25300;
+        let account = match super::DIR.get() {
+            // Autotests of the Keychain versions used an account per settings folder.
             Some(d) => {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 d.hash(&mut h);
-                format!("secrets-test-{:016x}", h.finish())
+                format!("{}-test-{:016x}", vault.keychain_account(), h.finish())
             }
-            None => "secrets".to_string(),
-        }
-    }
-
-    /// A reference id: 16 random bytes, hex.
-    fn new_id() -> Option<String> {
-        use std::io::Read;
-        let mut b = [0u8; 16];
-        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).ok()?;
-        Some(super::to_hex(&b))
-    }
-
-    pub(super) fn is_reference(s: &str) -> bool {
-        s.strip_prefix(PREFIX).is_some_and(|id| id.len() == 32 && id.bytes().all(|c| c.is_ascii_hexdigit()))
-    }
-
-    /// The item's bytes (`Ok(None)`: there is no item yet).
-    pub(super) fn item_get(account: &str) -> Result<Option<Vec<u8>>, String> {
-        match security_framework::passwords::get_generic_password(SERVICE, account) {
-            Ok(b) => Ok(Some(b)),
+            None => vault.keychain_account().to_string(),
+        };
+        match security_framework::passwords::get_generic_password("concord", &account) {
+            Ok(b) => serde_json::from_slice(&b).map(Some).map_err(|e| format!("damaged item: {e}")),
             Err(e) if e.code() == NOT_FOUND => Ok(None),
             Err(e) => Err(format!("{e} ({})", e.code())),
         }
     }
 
-    pub(super) fn item_set(account: &str, bytes: &[u8]) -> Result<(), String> {
-        security_framework::passwords::set_generic_password(SERVICE, account, bytes).map_err(|e| format!("{e} ({})", e.code()))
+    // Unit tests and other systems never read a Keychain.
+    #[cfg(not(all(target_os = "macos", not(test))))]
+    fn keychain_read(_vault: Vault) -> Result<Option<HashMap<String, String>>, String> {
+        Ok(None)
     }
 
-    pub(super) fn item_delete(account: &str) -> Result<(), String> {
-        match security_framework::passwords::delete_generic_password(SERVICE, account) {
-            Err(e) if e.code() != NOT_FOUND => Err(format!("{e} ({})", e.code())),
-            _ => Ok(()),
+    fn persist(data: &Data) -> Result<(), String> {
+        match file() {
+            Some(p) => write_file(&p, data),
+            None if cfg!(test) => Ok(()),
+            None => Err("no settings folder".into()),
         }
     }
 
-    #[cfg(not(test))]
-    fn load() -> Result<HashMap<String, String>, String> {
-        Ok(match item_get(&account())? {
-            Some(b) => serde_json::from_slice(&b).map_err(|e| format!("damaged item: {e}"))?,
-            None => HashMap::new(),
-        })
-    }
-
-    #[cfg(not(test))]
-    fn store(map: &HashMap<String, String>) -> Result<(), String> {
-        let a = account();
-        if map.is_empty() {
-            return item_delete(&a);
-        }
-        item_set(&a, serde_json::to_string(map).map_err(|e| e.to_string())?.as_bytes())
-    }
-
-    // Unit tests never touch the user's Keychain.
-    #[cfg(test)]
-    fn load() -> Result<HashMap<String, String>, String> {
-        Ok(HashMap::new())
-    }
-
-    #[cfg(test)]
-    fn store(_map: &HashMap<String, String>) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// The cache, read from the Keychain on first use (`None`: it cannot be read).
-    fn cached() -> Option<MutexGuard<'static, Option<HashMap<String, String>>>> {
+    /// The cache, read from secrets.json on first use (and migrated, once) (`None`: unreadable).
+    fn loaded() -> Option<MutexGuard<'static, Option<Data>>> {
         let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
         if cache.is_none() {
-            match load() {
-                Ok(m) => *cache = Some(m),
-                Err(e) => {
-                    tracing::warn!(error = %e, "keychain: cannot read the saved secrets");
+            let mut data = match file().map(|p| read_file(&p)) {
+                Some(Ok(d)) => d.unwrap_or_default(),
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, "secrets: cannot read secrets.json");
                     return None;
                 }
+                None => Data::default(),
+            };
+            if !data.keychain_migrated && file().is_some() {
+                if let Some(text) = super::path().and_then(|p| super::secret_files_text(&p)) {
+                    if migrate(&mut data, &text, keychain_read) {
+                        if let Err(e) = persist(&data) {
+                            tracing::warn!(error = %e, "secrets: cannot write secrets.json");
+                        }
+                    }
+                }
             }
+            *cache = Some(data);
         }
         Some(cache)
     }
 
-    pub(super) fn protect(plain: &str) -> Option<String> {
-        let mut cache = cached()?;
-        let map = cache.as_mut()?;
-        if let Some(id) = map.iter().find(|(_, v)| v.as_str() == plain).map(|(k, _)| k.clone()) {
-            return Some(format!("{PREFIX}{id}"));
+    pub(crate) fn protect_in(vault: Vault, plain: &str) -> Option<String> {
+        let mut cache = loaded()?;
+        let data = cache.as_mut()?;
+        let prefix = vault.prefix();
+        let found = data.map(vault).iter().find(|(_, v)| v.as_str() == plain).map(|(k, _)| k.clone());
+        if let Some(id) = found {
+            return Some(format!("{prefix}{id}"));
         }
         let id = new_id()?;
-        map.insert(id.clone(), plain.to_string());
-        match store(map) {
-            Ok(()) => Some(format!("{PREFIX}{id}")),
+        data.map(vault).insert(id.clone(), plain.to_string());
+        match persist(data) {
+            Ok(()) => Some(format!("{prefix}{id}")),
             Err(e) => {
-                map.remove(&id);
-                tracing::warn!(error = %e, "keychain: cannot save a secret");
+                data.map(vault).remove(&id);
+                tracing::warn!(error = %e, ?vault, "secrets: cannot save a secret");
                 None
             }
         }
     }
 
+    /// A reference of either vault.
     pub(super) fn unprotect(reference: &str) -> Option<String> {
-        if !is_reference(reference) {
-            return None;
-        }
-        let id = reference[PREFIX.len()..].to_ascii_lowercase();
-        cached()?.as_ref()?.get(&id).cloned()
+        let (vault, id) = Vault::of(reference)?;
+        loaded()?.as_mut()?.map(vault).get(&id).cloned()
     }
 
-    /// Drop the entries whose reference is not in `text`; returns how many went.
-    pub(super) fn keep_referenced(map: &mut HashMap<String, String>, text: &str) -> usize {
+    /// Drop the entries whose reference (with the vault's prefix) is not in `text`; returns how
+    /// many went.
+    pub(super) fn keep_referenced_in(vault: Vault, map: &mut HashMap<String, String>, text: &str) -> usize {
         let before = map.len();
-        map.retain(|id, _| text.contains(&format!("{PREFIX}{id}")));
+        let prefix = vault.prefix();
+        map.retain(|id, _| text.contains(&format!("{prefix}{id}")));
         before - map.len()
     }
 
     /// Forget every secret whose reference does not appear in `text` (the settings files).
     pub(super) fn gc(text: &str) {
-        let Some(mut cache) = cached() else { return };
-        let Some(map) = cache.as_mut() else { return };
-        let dropped = keep_referenced(map, text);
+        let Some(mut cache) = loaded() else { return };
+        let Some(data) = cache.as_mut() else { return };
+        let dropped: usize = Vault::ALL.into_iter().map(|v| keep_referenced_in(v, data.map(v), text)).sum();
         if dropped == 0 {
             return;
         }
-        match store(map) {
-            Ok(()) => tracing::info!(dropped, kept = map.len(), "keychain: unused saved secrets removed"),
-            Err(e) => tracing::warn!(error = %e, "keychain: cannot clean up"),
+        match persist(data) {
+            Ok(()) => tracing::info!(dropped, "secrets: unused saved secrets removed"),
+            Err(e) => tracing::warn!(error = %e, "secrets: cannot clean up"),
         }
     }
 }
 
-/// macOS, at startup: drop the Keychain secrets that neither settings.json nor servers.json
-/// mention any more (a password saved again gets a new reference). An unreadable file: nothing is
-/// dropped.
+/// macOS, at startup: move the Keychain secrets out once (see `filestore`) and drop the saved
+/// secrets that neither settings.json, servers.json nor e2ee.json (the identity keys) mention any
+/// more (a password saved again gets a new reference). An unreadable file: nothing is dropped.
 #[cfg(target_os = "macos")]
-pub fn keychain_gc() {
+pub fn secrets_gc() {
     let Some(p) = path() else { return };
+    let Some(text) = secret_files_text(&p) else { return };
+    filestore::gc(&text);
+}
+
+/// Every file that may hold a `kc1:`/`kck:` reference, next to settings.json at `settings` (what
+/// [`secrets_gc`] keeps). A missing file counts as empty; `None` when one cannot be read.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn secret_files_text(settings: &Path) -> Option<String> {
     let read = |p: &Path| match std::fs::read_to_string(p) {
         Ok(t) => Some(t),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
         Err(_) => None,
     };
-    let (Some(a), Some(b)) = (read(&p), read(&servers_path(&p))) else { return };
-    keychain::gc(&format!("{a}\n{b}"));
+    let mut text = String::new();
+    let e2ee = settings.with_file_name("e2ee.json");
+    for f in [settings.to_path_buf(), servers_path(settings), crate::e2ee_store::bad_path(&e2ee), e2ee] {
+        text.push_str(&read(&f)?);
+        text.push('\n');
+    }
+    Some(text)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_files_start_the_donation_popups_and_the_usage_counter_at_zero() {
+        // A file written before v1.1's donation popups.
+        let s: Settings = serde_json::from_str(r#"{"server":"http://x","volume_pct":80}"#).unwrap();
+        assert_eq!((s.donate_popups_shown, s.usage_secs, s.volume_pct), (0, 0, 80));
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&Settings { donate_popups_shown: 2, usage_secs: 7, ..s }).unwrap()).unwrap();
+        assert_eq!((back.donate_popups_shown, back.usage_secs), (2, 7));
+    }
 
     #[test]
     fn the_preview_of_my_own_live_is_on_by_default_and_old_files_get_that() {
@@ -732,36 +994,152 @@ mod tests {
         assert!(!back.show_self_preview);
     }
 
-    /// macOS: the real Keychain item functions (its own account, removed at the end), and a saved
-    /// secret's reference is opaque and reused for the same secret.
-    #[cfg(target_os = "macos")]
+    /// v1.1 shortcuts: an old file (push-to-talk key only) loads with no bindings and its key in
+    /// `ptt_vk`; the bindings survive the file; an older app's reader ignores the new field.
     #[test]
-    fn keychain_item_roundtrip_and_opaque_references() {
-        let account = format!("unit-test-{}", std::process::id());
-        match keychain::item_set(&account, b"{\"x\":\"y\"}") {
-            Ok(()) => {
-                assert_eq!(keychain::item_get(&account).unwrap().as_deref(), Some(&b"{\"x\":\"y\"}"[..]));
-                keychain::item_set(&account, b"{}").unwrap();
-                assert_eq!(keychain::item_get(&account).unwrap().as_deref(), Some(&b"{}"[..]), "replaced in place");
-                keychain::item_delete(&account).unwrap();
-                assert_eq!(keychain::item_get(&account).unwrap(), None);
-                keychain::item_delete(&account).unwrap();
-            }
-            // A session without a usable login Keychain (e.g. some SSH sessions): nothing to test.
-            Err(e) => eprintln!("keychain unavailable here, item test skipped: {e}"),
+    fn shortcuts_load_from_old_files_and_survive_the_file() {
+        use crate::keybinds::{Action, Combo, Keybind, MOD_CTRL};
+        let old: Settings = serde_json::from_str(r#"{"server":"h","ptt_enabled":true,"ptt_vk":86,"ptt_name":"V"}"#).unwrap();
+        assert!(old.keybinds.is_empty());
+        assert_eq!(old.ptt_vk, 86);
+        let mut s = Settings { ptt_enabled: true, ..Default::default() };
+        s.keybinds.push(Keybind { action: Action::ToggleMute, key: Combo::new(0x4D, MOD_CTRL), key_name: "M".into() });
+        s.keybinds.push(Keybind { action: Action::PushToTalk, key: Combo::new(0x56, 0), key_name: "V".into() });
+        let text = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.keybinds, s.keybinds);
+        // What an app without the field sees: the same file, read by a struct that does not know it.
+        #[derive(serde::Deserialize)]
+        struct OldApp {
+            ptt_enabled: bool,
         }
-        let r = protect("senha do Mac").unwrap();
-        assert!(keychain::is_reference(&r) && !r.contains("senha"), "{r}");
-        assert_eq!(protect("senha do Mac"), Some(r.clone()), "the same secret keeps its reference");
-        assert_ne!(protect("outra senha"), Some(r.clone()));
-        assert_eq!(unprotect(&r).as_deref(), Some("senha do Mac"));
-        assert_eq!(unprotect("kc1:00000000000000000000000000000000"), None);
-        assert_eq!(unprotect("01000000d08c9ddf"), None, "a Windows DPAPI value means nothing here");
-        // The startup clean-up keeps exactly what the files mention.
+        assert!(serde_json::from_str::<OldApp>(&text).unwrap().ptt_enabled);
+        // A broken shortcut list does not cost the rest of the settings.
+        let bad: Settings = serde_json::from_str(r#"{"username":"ana","keybinds":[{"action":{"kind":"from_the_future"}}]}"#).unwrap();
+        assert_eq!(bad.username, "ana");
+        assert!(bad.keybinds.is_empty());
+    }
+
+    /// The secret store of macOS (secrets.json): opaque references, the same secret keeps its
+    /// reference, two vaults, and the startup clean-up keeps exactly what the files mention. Runs
+    /// on every system (memory only in unit tests; the file functions are tested below).
+    #[test]
+    fn secret_store_references_and_clean_up() {
+        let p = |v: filestore::Vault, s: &str| filestore::protect_in(v, s).unwrap();
+        let (sec, keys) = (filestore::Vault::Secrets, filestore::Vault::Keys);
+        let r = p(sec, "senha do Mac");
+        assert!(filestore::is_reference(&r) && r.starts_with("kc1:") && !r.contains("senha"), "{r}");
+        assert_eq!(p(sec, "senha do Mac"), r, "the same secret keeps its reference");
+        assert_ne!(p(sec, "outra senha"), r);
+        assert_eq!(filestore::unprotect(&r).as_deref(), Some("senha do Mac"));
+        assert_eq!(filestore::unprotect("kc1:00000000000000000000000000000000"), None);
+        assert_eq!(filestore::unprotect("01000000d08c9ddf"), None, "a Windows DPAPI value means nothing here");
+        let k = p(keys, "chave do aparelho");
+        assert!(k.starts_with("kck:") && !k.contains("chave"), "{k}");
+        assert_eq!(filestore::unprotect(&k).as_deref(), Some("chave do aparelho"));
+        assert_ne!(p(keys, "senha do Mac"), r, "same secret, other vault: another reference");
         let mut m: std::collections::HashMap<String, String> = [("a".repeat(32), "1".into()), ("b".repeat(32), "2".into())].into_iter().collect();
         let text = format!("{{\"password_enc\":\"kc1:{}\"}}", "a".repeat(32));
-        assert_eq!(keychain::keep_referenced(&mut m, &text), 1);
+        assert_eq!(filestore::keep_referenced_in(sec, &mut m, &text), 1);
         assert_eq!(m.keys().cloned().collect::<Vec<_>>(), vec!["a".repeat(32)]);
+        // A kc1: mention does not keep a kck: key of the same id.
+        let mut m: std::collections::HashMap<String, String> = [("a".repeat(32), "x".into())].into_iter().collect();
+        assert_eq!(filestore::keep_referenced_in(keys, &mut m, &text), 1);
+    }
+
+    /// v1.1.0 (macOS): secrets.json is written atomically, readable only by this user, and read
+    /// back; the one-time Keychain migration copies only the mentioned entries, is never retried,
+    /// and a refused read just drops them.
+    #[test]
+    fn secret_file_and_the_one_time_keychain_migration() {
+        use filestore::{migrate, read_file, write_file, Data, Vault};
+        let dir = std::env::temp_dir().join(format!("concord-secrets-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let f = dir.join("secrets.json");
+        assert_eq!(read_file(&f).unwrap(), None, "no file yet");
+        let mut d = Data::default();
+        d.secrets.insert("a".repeat(32), "senha".into());
+        d.keys.insert("b".repeat(32), "chave".into());
+        write_file(&f, &d).unwrap();
+        write_file(&f, &d).unwrap(); // replacing it works too
+        assert_eq!(read_file(&f).unwrap(), Some(d.clone()));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temp file left behind");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600);
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+            read_file(&f).unwrap();
+            assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600, "made user-only again");
+        }
+        std::fs::write(&f, b"{\"secrets\":").unwrap();
+        assert!(read_file(&f).is_err(), "a damaged file is an error, not an empty store");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Migration: settings mention two passwords and one key; the Keychain has them plus junk.
+        let (pa, pb, kc, junk) = ("a".repeat(32), "b".repeat(32), "c".repeat(32), "d".repeat(32));
+        let text = format!(r#"{{"password_enc":"kc1:{pa}"}} {{"servers":[{{"password_enc":"kc1:{}"}}]}} {{"secret":"kck:{kc}"}}"#, pb.to_uppercase());
+        let keychain = |v: Vault| -> Result<Option<std::collections::HashMap<String, String>>, String> {
+            Ok(Some(match v {
+                Vault::Secrets => [(pa.clone(), "s1".to_string()), (pb.clone(), "s2".into()), (junk.clone(), "x".into())].into_iter().collect(),
+                Vault::Keys => [(kc.clone(), "k".to_string())].into_iter().collect(),
+            }))
+        };
+        let mut d = Data::default();
+        assert!(migrate(&mut d, &text, keychain));
+        assert!(d.keychain_migrated);
+        assert_eq!((d.secrets.len(), d.secrets.get(&pb).map(String::as_str)), (2, Some("s2")), "only what the files mention");
+        assert_eq!(d.keys.get(&kc).map(String::as_str), Some("k"));
+        // Nothing missing: the Keychain is not asked at all.
+        let never = |_: Vault| -> Result<Option<std::collections::HashMap<String, String>>, String> { panic!("the Keychain was read again") };
+        assert!(!migrate(&mut d, &text, never));
+        // A refused read: nothing copied, no error for the caller, marked done (not asked again).
+        let mut d = Data::default();
+        assert!(migrate(&mut d, &text, |_| Err("refused (-128)".into())));
+        assert!(d.keychain_migrated && d.secrets.is_empty() && d.keys.is_empty());
+        // No reference at all (a new install): the Keychain is never asked.
+        let mut d = Data::default();
+        assert!(!migrate(&mut d, "{\"username\":\"ana\"}", never));
+    }
+
+    /// v1.1 (E0): the startup clean-up reads e2ee.json too, or every Mac would lose its identity
+    /// key at the next start (its reference is only in that file).
+    #[test]
+    fn secrets_gc_keeps_the_identity_keys_of_e2ee_json() {
+        let dir = std::env::temp_dir().join(format!("concord-gc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = dir.join("settings.json");
+        let (pw, srv) = (format!("kc1:{}", "a".repeat(32)), format!("kc1:{}", "b".repeat(32)));
+        std::fs::write(&settings, format!(r#"{{"password_enc":"{pw}"}}"#)).unwrap();
+        std::fs::write(servers_path(&settings), format!(r#"{{"servers":[{{"password_enc":"{srv}"}}]}}"#)).unwrap();
+        // The identity's reference is only in e2ee.json (written by the store, as in the app).
+        fn store_like(_: &str) -> Option<String> {
+            Some(format!("kck:{}", "c".repeat(32)))
+        }
+        let key = store_like("").unwrap();
+        assert!(!secret_files_text(&settings).unwrap().contains(&key));
+        let mut store = crate::e2ee_store::Store::at(dir.join("e2ee.json"), store_like, |_| None);
+        let _id = store.identity("00112233445566778899aabbccddeeff", 3, 1).unwrap();
+        assert_eq!(Some(dir.join("e2ee.json")), Some(settings.with_file_name("e2ee.json")));
+        let text = secret_files_text(&settings).unwrap();
+        for r in [&pw, &srv, &key] {
+            assert!(text.contains(r.as_str()), "{r} must be kept");
+        }
+        // What the clean-up does with it (the maps of saved secrets, by id).
+        let mut m: std::collections::HashMap<String, String> = ["a", "b", "c", "d"].iter().map(|c| (c.repeat(32), "x".to_string())).collect();
+        assert_eq!(filestore::keep_referenced_in(filestore::Vault::Secrets, &mut m, &text), 2, "the key and the unreferenced one are not passwords");
+        let mut k: std::collections::HashMap<String, String> = ["c", "d"].iter().map(|c| (c.repeat(32), "x".to_string())).collect();
+        assert_eq!(filestore::keep_referenced_in(filestore::Vault::Keys, &mut k, &text), 1);
+        assert!(k.contains_key(&"c".repeat(32)), "the identity key stays");
+        // Without e2ee.json (no identity yet) the rest is still read.
+        std::fs::remove_file(dir.join("e2ee.json")).unwrap();
+        assert!(secret_files_text(&settings).unwrap().contains(&pw));
+        // A damaged e2ee.json kept aside (e2ee_store::bad_path): its references stay too.
+        let old = format!("kck:{}", "e".repeat(32));
+        std::fs::write(crate::e2ee_store::bad_path(&dir.join("e2ee.json")), format!("{{\"identities\":[{{\"secret\":\"{old}\"")).unwrap();
+        assert!(secret_files_text(&settings).unwrap().contains(&old));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -803,6 +1181,8 @@ mod tests {
         assert_eq!(s.server, "http://x:7890");
         assert_eq!(s.volume_pct, 100);
         assert!(s.share_audio);
+        assert!(s.share_hover_preview, "hover previews of my live are on in older files");
+        assert!(!serde_json::from_str::<Settings>(r#"{"share_hover_preview":false}"#).unwrap().share_hover_preview);
         assert!(!s.stream_popout, "streams open inside the app by default");
         let s: Settings = serde_json::from_str(r#"{"stream_popout":true}"#).unwrap();
         assert!(s.stream_popout);

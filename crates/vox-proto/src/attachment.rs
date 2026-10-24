@@ -36,6 +36,14 @@
 //! marker again with [`strip_attachment_marker`] (`Message::caption`, `DmMessage::caption`).
 //! Deleting a message deletes its images (a file shared by several messages stays until the last
 //! one goes); moderators deleting a channel message remove its images too.
+//!
+//! **Sealed images (v1.1, E2).** `POST /api/attachments?sealed=1&thumb_len=<n>`: the body is the
+//! ciphertext of a picture (and `n` bytes of its thumbnail's), made by the `vox-e2ee` crate with a
+//! key only the DM's devices get. The hub cannot check it: it stores it as
+//! `application/octet-stream` with no sizes (`width` / `height` 0, [`Attachment::sealed`]), still
+//! under every quota (daily allowance, pending count, total storage). A sealed attachment can only
+//! go on a sealed DM line ([`ERR_SEALED_ONLY_DM`] otherwise, and a sealed line takes only sealed
+//! images). [`AttachmentLimits::sealed`] says the hub knows all this.
 
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +72,13 @@ pub const ATTACHMENT_MAX_UPLOAD_BODY: usize = ATTACHMENT_MAX_ANIMATED_BYTES + AT
 pub const ERR_ATTACHMENT_DAILY: &str = "daily upload limit reached";
 /// `507` answer: the server's total image storage is full.
 pub const ERR_ATTACHMENT_STORAGE_FULL: &str = "server image storage is full";
+/// `400` answer: a sealed image on a channel message or a readable DM line (or a readable image on
+/// a sealed line).
+pub const ERR_SEALED_ONLY_DM: &str = "sealed images only go on encrypted direct messages";
+/// What sealing adds to a picture or a thumbnail (the AEAD tag).
+pub const ATTACHMENT_SEALED_OVERHEAD: usize = 16;
+/// The `mime` of a sealed attachment on the hub.
+pub const ATTACHMENT_SEALED_MIME: &str = "application/octet-stream";
 
 /// One image on a message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +102,10 @@ pub struct Attachment {
     /// Short hash of the stored file (a cache key; the same file always has the same one).
     #[serde(default)]
     pub hash: String,
+    /// E2: the stored file is ciphertext (`mime` is [`ATTACHMENT_SEALED_MIME`], sizes 0 on the
+    /// hub; the app fills the real ones from the line's plaintext).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sealed: bool,
 }
 
 /// `GET /api/attachments/limits`: what this hub accepts, and how much of my daily allowance is
@@ -103,6 +122,9 @@ pub struct AttachmentLimits {
     /// The total storage cap is reached (uploads are refused until the owner frees space).
     #[serde(default)]
     pub storage_full: bool,
+    /// E2: the hub takes sealed uploads (`?sealed=1`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sealed: bool,
 }
 
 /// `POST /api/channels/{id}/messages`
@@ -169,7 +191,7 @@ mod tests {
     use crate::{Message, ServerEvent, User};
 
     fn att(id: i64) -> Attachment {
-        Attachment { id, mime: "image/webp".into(), width: 1920, height: 1080, size: 312_000, thumb_w: 400, thumb_h: 225, animated: false, hash: "ab12".into() }
+        Attachment { id, mime: "image/webp".into(), width: 1920, height: 1080, size: 312_000, thumb_w: 400, thumb_h: 225, animated: false, hash: "ab12".into(), sealed: false }
     }
 
     #[test]

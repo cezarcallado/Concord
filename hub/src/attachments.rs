@@ -18,6 +18,11 @@
 //! everybody else as for an unknown id); a pending image only to its uploader; a private channel's
 //! images only to the people who may see the channel (v0.9, `access.rs`). Files are only ever
 //! served by attachment id, never by hash.
+//!
+//! **Sealed images (v1.1, E2).** `?sealed=1`: the body is ciphertext the hub cannot read. It is
+//! not decoded (nothing to validate), stored as `application/octet-stream` with no sizes and
+//! `attachments.sealed = 1` (one more column, `DEFAULT 0`: older hubs never read it), and counts
+//! against the same quotas. Sealed rows only link to sealed DM lines ([`check_pending`]).
 
 mod validate;
 
@@ -134,7 +139,12 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
             bytes INTEGER NOT NULL,
             PRIMARY KEY (user_id, day)
         );",
-    )
+    )?;
+    // v1.1 (E2): sealed (end-to-end encrypted) files. Checked before it is added: repeatable.
+    if !crate::db::has_column(conn, "attachments", "sealed")? {
+        conn.execute_batch("ALTER TABLE attachments ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0")?;
+    }
+    Ok(())
 }
 
 /// Keep image rows tied to their messages whichever hub deletes a message (run after the
@@ -185,9 +195,11 @@ pub struct Row {
     pub message_id: Option<MessageId>,
     pub dm_message_id: Option<DmMessageId>,
     pub created_at_ms: i64,
+    /// E2: ciphertext (only for a sealed DM line).
+    pub sealed: bool,
 }
 
-const COLS: &str = "id, uploader_id, blob_hash, thumb_hash, mime, size, width, height, thumb_w, thumb_h, animated, message_id, dm_message_id, created_at_ms";
+const COLS: &str = "id, uploader_id, blob_hash, thumb_hash, mime, size, width, height, thumb_w, thumb_h, animated, message_id, dm_message_id, created_at_ms, sealed";
 
 fn row(r: &rusqlite::Row) -> rusqlite::Result<Row> {
     let n = |i: usize| -> rusqlite::Result<u32> { Ok(r.get::<_, i64>(i)?.clamp(0, i64::from(u32::MAX)) as u32) };
@@ -206,6 +218,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Row> {
         message_id: r.get(11)?,
         dm_message_id: r.get(12)?,
         created_at_ms: r.get(13)?,
+        sealed: r.get::<_, i64>(14)? != 0,
     })
 }
 
@@ -221,6 +234,7 @@ impl Row {
             thumb_h: self.thumb_h,
             animated: self.animated,
             hash: self.blob_hash.chars().take(SHORT_HASH).collect(),
+            sealed: self.sealed,
         }
     }
 
@@ -271,12 +285,15 @@ pub fn fill_messages(conn: &Connection, msgs: &mut [Message]) -> rusqlite::Resul
     Ok(())
 }
 
-/// Fill `attachments` of DM lines.
+/// Fill `attachments` of DM lines (sealed ones go to `sealed_attachments`, where an older app
+/// never looks).
 pub fn fill_dm_messages(conn: &Connection, msgs: &mut [DmMessage]) -> rusqlite::Result<()> {
     let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
     let mut map = for_owners(conn, &ids, true)?;
     for m in msgs {
-        m.attachments = map.remove(&m.id).unwrap_or_default();
+        let (sealed, plain): (Vec<Attachment>, Vec<Attachment>) = map.remove(&m.id).unwrap_or_default().into_iter().partition(|a| a.sealed);
+        m.attachments = plain;
+        m.sealed_attachments = sealed;
     }
     Ok(())
 }
@@ -287,6 +304,8 @@ pub enum LinkError {
     TooMany,
     /// Unknown, not mine, already used, or listed twice.
     Invalid,
+    /// E2: a sealed file on a readable message, or a readable file on a sealed DM line.
+    Sealed,
 }
 
 /// Where linked attachments go.
@@ -296,9 +315,9 @@ pub enum Owner {
     Dm(DmMessageId),
 }
 
-/// Check that `ids` are `me`'s pending attachments (distinct, at most four). Run it in the same
-/// transaction as [`link`].
-pub fn check_pending(conn: &Connection, me: UserId, ids: &[AttachmentId]) -> rusqlite::Result<Result<(), LinkError>> {
+/// Check that `ids` are `me`'s pending attachments (distinct, at most four), all sealed for a
+/// sealed DM line (`sealed`) and none sealed otherwise. Run it in the same transaction as [`link`].
+pub fn check_pending(conn: &Connection, me: UserId, ids: &[AttachmentId], sealed: bool) -> rusqlite::Result<Result<(), LinkError>> {
     if ids.len() > ATTACHMENT_MAX_PER_MESSAGE {
         return Ok(Err(LinkError::TooMany));
     }
@@ -307,6 +326,7 @@ pub fn check_pending(conn: &Connection, me: UserId, ids: &[AttachmentId]) -> rus
             return Ok(Err(LinkError::Invalid));
         }
         match get(conn, *id)? {
+            Some(r) if r.uploader == me && r.pending() && r.sealed != sealed => return Ok(Err(LinkError::Sealed)),
             Some(r) if r.uploader == me && r.pending() => {}
             _ => return Ok(Err(LinkError::Invalid)),
         }
@@ -389,11 +409,33 @@ pub fn uploaded_today(conn: &Connection, user: UserId, now_ms: i64) -> rusqlite:
 pub struct Upload {
     pub main: validate::Clean,
     pub thumb: Option<validate::Clean>,
+    /// E2: ciphertext. The parts' `kind`, sizes and `animated` mean nothing then: they are stored
+    /// as [`ATTACHMENT_SEALED_MIME`] with no sizes.
+    pub sealed: bool,
 }
 
 impl Upload {
     fn bytes(&self) -> u64 {
         (self.main.bytes.len() + self.thumb.as_ref().map_or(0, |t| t.bytes.len())) as u64
+    }
+
+    /// The stored type of one part.
+    fn mime(&self, part: &validate::Clean) -> &'static str {
+        if self.sealed { ATTACHMENT_SEALED_MIME } else { part.kind.mime() }
+    }
+
+    /// A sealed upload (the picture's ciphertext, then `thumb_len` bytes of its thumbnail's): no
+    /// decoding, only the lengths (each part at least an AEAD tag) are checked.
+    pub fn sealed(body: &[u8], thumb_len: usize) -> Option<Upload> {
+        let (main, thumb) = body.split_at(body.len().checked_sub(thumb_len)?);
+        let part = |b: &[u8]| validate::Clean { bytes: b.to_vec(), kind: Kind::Jpeg, width: 0, height: 0, animated: false };
+        if main.len() < ATTACHMENT_SEALED_OVERHEAD || main.len() > ATTACHMENT_MAX_ANIMATED_BYTES + ATTACHMENT_SEALED_OVERHEAD {
+            return None;
+        }
+        if thumb_len > 0 && (thumb.len() < ATTACHMENT_SEALED_OVERHEAD || thumb.len() > ATTACHMENT_MAX_THUMB_BYTES + ATTACHMENT_SEALED_OVERHEAD) {
+            return None;
+        }
+        Some(Upload { main: part(main), thumb: (thumb_len > 0).then(|| part(thumb)), sealed: true })
     }
 }
 
@@ -484,15 +526,15 @@ pub fn store_upload(conn: &mut Connection, dir: &Path, user: UserId, up: &Upload
     }
     let mut written = Vec::new();
     let result = (|| -> Result<Row, StoreError> {
-        let (main_hash, new) = put_blob(&tx, dir, &up.main.bytes, up.main.kind.mime(), now)?;
+        let (main_hash, new) = put_blob(&tx, dir, &up.main.bytes, up.mime(&up.main), now)?;
         if new {
-            written.push((main_hash.clone(), up.main.kind.mime()));
+            written.push((main_hash.clone(), up.mime(&up.main)));
         }
         let (thumb_hash, tw, th) = match &up.thumb {
             Some(t) => {
-                let (h, new) = put_blob(&tx, dir, &t.bytes, t.kind.mime(), now)?;
+                let (h, new) = put_blob(&tx, dir, &t.bytes, up.mime(t), now)?;
                 if new {
-                    written.push((h.clone(), t.kind.mime()));
+                    written.push((h.clone(), up.mime(t)));
                 }
                 (Some(h), t.width, t.height)
             }
@@ -501,9 +543,9 @@ pub fn store_upload(conn: &mut Connection, dir: &Path, user: UserId, up: &Upload
         // A fresh id: a deleted image's id never comes back (the apps cache thumbnails).
         let id = crate::ids::insert_with(&tx, crate::ids::Seq::Attachments, |id| {
             tx.execute(
-                "INSERT INTO attachments (id, uploader_id, blob_hash, thumb_hash, mime, size, width, height, thumb_w, thumb_h, animated, created_at_ms)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![id, user, main_hash, thumb_hash, up.main.kind.mime(), up.main.bytes.len() as i64, up.main.width, up.main.height, tw, th, up.main.animated as i64, now],
+                "INSERT INTO attachments (id, uploader_id, blob_hash, thumb_hash, mime, size, width, height, thumb_w, thumb_h, animated, created_at_ms, sealed)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![id, user, main_hash, thumb_hash, up.mime(&up.main), up.main.bytes.len() as i64, up.main.width, up.main.height, tw, th, up.main.animated as i64, now, up.sealed as i64],
             )?;
             Ok(id)
         })?;
@@ -614,6 +656,7 @@ pub async fn limits(State(s): State<AppState>, AuthUser(me): AuthUser) -> ApiRes
         daily_bytes: daily,
         daily_bytes_left: daily.saturating_sub(used_today),
         storage_full: !evict && used >= cap,
+        sealed: true,
     }))
 }
 
@@ -621,6 +664,9 @@ pub async fn limits(State(s): State<AppState>, AuthUser(me): AuthUser) -> ApiRes
 pub struct UploadQuery {
     #[serde(default)]
     thumb_len: usize,
+    /// E2: `1` = the body is ciphertext.
+    #[serde(default)]
+    sealed: u8,
 }
 
 /// Check an upload (image + optional thumbnail); the hub makes the thumbnail when the app sent
@@ -635,7 +681,7 @@ pub fn check_upload(body: &[u8], thumb_len: usize) -> Result<Upload, Refusal> {
     } else {
         None
     };
-    Ok(Upload { main, thumb })
+    Ok(Upload { main, thumb, sealed: false })
 }
 
 fn body_rejection(e: BytesRejection) -> ApiErr {
@@ -646,11 +692,16 @@ fn body_rejection(e: BytesRejection) -> ApiErr {
     }
 }
 
-/// `POST /api/attachments?thumb_len=`
+/// `POST /api/attachments?thumb_len=` (`&sealed=1`: ciphertext, see the module docs)
 pub async fn upload(State(s): State<AppState>, AuthUser(me): AuthUser, Query(q): Query<UploadQuery>, body: Result<Bytes, BytesRejection>) -> ApiResult<Attachment> {
     let body = body.map_err(body_rejection)?;
-    if body.is_empty() || q.thumb_len >= body.len() || q.thumb_len > ATTACHMENT_MAX_THUMB_BYTES {
+    let sealed = q.sealed != 0;
+    let thumb_max = ATTACHMENT_MAX_THUMB_BYTES + if sealed { ATTACHMENT_SEALED_OVERHEAD } else { 0 };
+    if body.is_empty() || q.thumb_len >= body.len() || q.thumb_len > thumb_max {
         return Err(ApiErr::new(StatusCode::BAD_REQUEST, "expected an image (and a thumbnail no bigger than 256 KB)"));
+    }
+    if sealed && body.len() - q.thumb_len > ATTACHMENT_MAX_ANIMATED_BYTES + ATTACHMENT_SEALED_OVERHEAD {
+        return Err(refusal(Refusal::TooBig { animated: true }));
     }
     let a = &s.attachments;
     if let Err(wait) = a.uploads.allow(me.id, Instant::now()) {
@@ -664,6 +715,17 @@ pub async fn upload(State(s): State<AppState>, AuthUser(me): AuthUser, Query(q):
     }
     if !policy.may_evict && used >= policy.storage_cap {
         return Err(store_err(StoreError::Full));
+    }
+    if sealed {
+        // Nothing to decode: the quotas are all there is to check.
+        let up = Upload::sealed(&body, q.thumb_len).ok_or_else(|| ApiErr::new(StatusCode::BAD_REQUEST, "a sealed image is too short or too long"))?;
+        let (dir, sizes) = (a.dir.clone(), (up.main.bytes.len(), up.thumb.as_ref().map_or(0, |t| t.bytes.len())));
+        let stored = s.db.call(move |c| Ok(store_upload(c, &dir, id, &up, policy, now_ms()))).await?.map_err(|e| {
+            tracing::info!(user = %me.username, ?e, "sealed image not stored");
+            store_err(e)
+        })?;
+        tracing::info!(user = %me.username, id = stored.id, stored = sizes.0, thumb = sizes.1, "sealed image uploaded");
+        return Ok(Json(stored.to_wire()));
     }
     // The decode slot goes with the blocking decode: a client that hangs up mid-decode cannot
     // free it while the decode still runs.
@@ -765,6 +827,7 @@ pub fn link_err(e: LinkError) -> ApiErr {
     match e {
         LinkError::TooMany => ApiErr::new(StatusCode::BAD_REQUEST, format!("at most {ATTACHMENT_MAX_PER_MESSAGE} images per message")),
         LinkError::Invalid => ApiErr::new(StatusCode::BAD_REQUEST, "unknown or already used image"),
+        LinkError::Sealed => ApiErr::new(StatusCode::BAD_REQUEST, ERR_SEALED_ONLY_DM),
     }
 }
 
@@ -785,7 +848,7 @@ mod tests {
     }
 
     fn upload_of(bytes: Vec<u8>) -> Upload {
-        Upload { main: validate::Clean { bytes, kind: Kind::Jpeg, width: 10, height: 10, animated: false }, thumb: None }
+        Upload { main: validate::Clean { bytes, kind: Kind::Jpeg, width: 10, height: 10, animated: false }, thumb: None, sealed: false }
     }
 
     const BIG: Policy = Policy { storage_cap: 1 << 40, daily_bytes: 1 << 40, may_evict: false };
@@ -853,14 +916,21 @@ mod tests {
         let mut c = mem();
         let a = store_upload(&mut c, dir.path(), 1, &upload_of(vec![1; 10]), BIG, 1).unwrap();
         let b = store_upload(&mut c, dir.path(), 2, &upload_of(vec![2; 10]), BIG, 1).unwrap();
-        assert_eq!(check_pending(&c, 1, &[a.id]).unwrap(), Ok(()));
-        assert_eq!(check_pending(&c, 1, &[b.id]).unwrap(), Err(LinkError::Invalid), "not mine");
-        assert_eq!(check_pending(&c, 1, &[a.id, a.id]).unwrap(), Err(LinkError::Invalid), "twice");
-        assert_eq!(check_pending(&c, 1, &[1, 2, 3, 4, 5]).unwrap(), Err(LinkError::TooMany));
+        assert_eq!(check_pending(&c, 1, &[a.id], false).unwrap(), Ok(()));
+        assert_eq!(check_pending(&c, 1, &[a.id], true).unwrap(), Err(LinkError::Sealed), "a readable image on a sealed line");
+        assert_eq!(check_pending(&c, 1, &[b.id], false).unwrap(), Err(LinkError::Invalid), "not mine");
+        assert_eq!(check_pending(&c, 1, &[a.id, a.id], false).unwrap(), Err(LinkError::Invalid), "twice");
+        assert_eq!(check_pending(&c, 1, &[1, 2, 3, 4, 5], false).unwrap(), Err(LinkError::TooMany));
+        let s = store_upload(&mut c, dir.path(), 1, &Upload::sealed(&[7u8; 64], 20).unwrap(), BIG, 1).unwrap();
+        assert!(s.sealed && s.mime == ATTACHMENT_SEALED_MIME && (s.width, s.height, s.thumb_w, s.thumb_h) == (0, 0, 0, 0));
+        assert_eq!(check_pending(&c, 1, &[s.id], false).unwrap(), Err(LinkError::Sealed), "a sealed image on a readable message");
+        assert_eq!(check_pending(&c, 1, &[s.id], true).unwrap(), Ok(()));
+        assert!(Upload::sealed(&[7u8; 20], 10).is_none(), "each part is at least a tag");
+        assert!(Upload::sealed(&[7u8; 20], 0).is_some());
         c.execute("INSERT INTO messages VALUES (77, 1, 1, '', 0)", []).unwrap();
         let linked = link(&c, &[a.id], Owner::Channel(77)).unwrap();
         assert_eq!(linked[0].id, a.id);
-        assert_eq!(check_pending(&c, 1, &[a.id]).unwrap(), Err(LinkError::Invalid), "already used");
+        assert_eq!(check_pending(&c, 1, &[a.id], false).unwrap(), Err(LinkError::Invalid), "already used");
         let mut m = vec![Message { id: 77, channel_id: 1, author: User::new(1, "a"), content: String::new(), created_at_ms: 0, attachments: vec![], mentions: vec![], mention_everyone: false, reply: None, reactions: vec![] }];
         fill_messages(&c, &mut m).unwrap();
         assert_eq!(m[0].attachments.len(), 1);

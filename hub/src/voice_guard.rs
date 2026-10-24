@@ -76,6 +76,9 @@ struct Inner {
     revoked_at: HashMap<UserId, i64>,
     /// user -> when the hub last gave them a join token (ms).
     issued_at: HashMap<UserId, i64>,
+    /// v1.1 (E1): (user, voice channel) -> whether the last join token for that room was for an
+    /// end-to-end encrypted room.
+    issued_e2ee: HashMap<(UserId, ChannelId), bool>,
     /// Check every `voice_check_fast` until then ([`watch_closely`]).
     close_until: Option<Instant>,
 }
@@ -88,6 +91,23 @@ impl VoiceGuard {
     /// The hub just gave `user` a join token.
     pub fn issued(&self, user: UserId) {
         self.lock().issued_at.insert(user, now_ms());
+    }
+
+    /// v1.1 (E1): the hub just gave `user` a join token for voice channel `channel`'s room, for an
+    /// end-to-end encrypted room or not (`e2ee`).
+    pub fn issued_voice(&self, user: UserId, channel: ChannelId, e2ee: bool) {
+        let mut g = self.lock();
+        g.issued_at.insert(user, now_ms());
+        g.issued_e2ee.insert((user, channel), e2ee);
+    }
+
+    /// v1.1 (E1): is `user`'s last token for `channel` from the other encryption mode than the
+    /// room's now (`e2ee`)? The flag only changes in an empty room, so somebody in it with such a
+    /// token joined in the moment the flag changed: an app that encrypts in a plain room (noise for
+    /// everybody) or one that sends in the clear in an encrypted room. Unknown (a hub restarted
+    /// since): no.
+    fn wrong_mode(&self, user: UserId, channel: ChannelId, e2ee: bool) -> bool {
+        self.lock().issued_e2ee.get(&(user, channel)).is_some_and(|m| *m != e2ee)
     }
 
     /// Would a participant session of `user` that joined at `joined_at` (unix seconds) be using a
@@ -212,6 +232,11 @@ pub async fn check(s: &AppState) {
                     acts.push(Act::Remove { room: room.clone(), user, why: "no access to this private channel" });
                     continue;
                 }
+                // v1.1 (E1): a token from before the room's end-to-end encryption changed.
+                if s.channel(ch).is_some_and(|c| s.voice_guard.wrong_mode(user, ch, c.e2ee)) {
+                    acts.push(Act::Remove { room: room.clone(), user, why: "joined with a token from before the room's encryption changed" });
+                    continue;
+                }
             }
             if listed(s, kind, user) {
                 s.voice_guard.lock().unlisted.remove(&key);
@@ -287,5 +312,18 @@ mod tests {
         g.lock().issued_at.insert(1, 10_500);
         assert!(!g.stale_token(1, 11), "a token issued after the revocation is fine");
         assert!(!g.stale_token(2, 11), "somebody else");
+    }
+
+    #[test]
+    fn tokens_from_the_other_encryption_mode_are_wrong() {
+        let g = VoiceGuard::default();
+        assert!(!g.wrong_mode(1, 5, true), "unknown (a restarted hub): left alone");
+        g.issued_voice(1, 5, false);
+        assert!(g.wrong_mode(1, 5, true), "a plain token in a room that is encrypted now");
+        assert!(!g.wrong_mode(1, 5, false));
+        assert!(!g.wrong_mode(1, 6, true), "another room");
+        g.issued_voice(1, 5, true);
+        assert!(!g.wrong_mode(1, 5, true), "a fresh token of the right mode");
+        assert!(g.wrong_mode(1, 5, false));
     }
 }

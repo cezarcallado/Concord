@@ -353,6 +353,10 @@ pub fn show_card(ui: &mut egui::Ui, url: &str, card: &Card<'_>) {
     });
     // The coloured bar down the left edge, as on Discord's embeds.
     let r = out.response.rect;
+    // A right click on the card: its message's menu offers this link (Copiar link / Abrir link).
+    if ui.rect_contains_pointer(r) && ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary)) {
+        crate::links::note_right_clicked(ui.ctx(), url);
+    }
     let bar = egui::Rect::from_min_max(r.min, egui::pos2(r.min.x + ACCENT_W, r.max.y));
     ui.painter().rect_filled(bar, egui::CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 }, crate::theme::LINK.gamma_multiply(0.7));
 }

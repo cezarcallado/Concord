@@ -18,11 +18,12 @@ O concord é um app leve no estilo do Discord, feito para **grupos de amigos** e
 
 | | |
 |---|---|
-| **Texto** | Canais de texto, mensagens diretas, respostas, menções (`@nome`), reações, imagens (comprimidas antes de enviar), links com prévia e soundboard |
-| **Voz** | Salas de voz, supressão de ruído com IA (RNNoise / DeepFilterNet), modificador de voz, push-to-talk e volume por pessoa |
+| **Texto** | Canais de texto, mensagens diretas, respostas, menções (`@nome`), reações e emojis coloridos, imagens (comprimidas antes de enviar), links com prévia e soundboard |
+| **Voz** | Salas de voz, supressão de ruído com IA (RNNoise / DeepFilterNet), modificador de voz, push-to-talk, atalhos de teclado configuráveis e volume por pessoa |
 | **Go Live** | Até 4 transmissões ao mesmo tempo, **áudio só do app que você escolheu**, modo "só áudio", fixar várias telas, tela cheia e codificação pela placa de vídeo (NVIDIA, AMD ou Intel) |
 | **Câmeras** | Várias câmeras na sala, com ajustes de imagem (brilho, exposição, foco, zoom), espelhar e girar |
-| **Mensagens diretas** | Conversa privada entre duas pessoas, com chamada de voz e câmera ("Ligar") |
+| **Mensagens diretas** | Conversa privada entre duas pessoas, com chamada de voz e câmera ("Ligar"), criptografadas de ponta a ponta desde a v1.1 |
+| **Segurança** | Conexão protegida (TLS) com o servidor e criptografia de ponta a ponta nas mensagens diretas, nas chamadas diretas e nas salas de voz que um Admin escolher (v1.1) |
 | **Canais privados** | Só os cargos ou as pessoas escolhidas veem o canal e entram na voz dele |
 | **Convites** | Códigos `vox1-...` com validade e limite de usos: o amigo cola o código e entra, sem digitar IP nem senha |
 | **Hospedar pelo app** | "Criar servidor" na tela inicial: o app baixa a parte de voz, tenta abrir as portas do roteador e gera os convites |
@@ -53,11 +54,14 @@ App nativo em Rust, sem Electron e sem navegador embutido; o vídeo é codificad
 
 ## Baixar
 
-Na página de [**Releases**](../../releases), baixe o **`concord-v1.0.2-PUBLICO.zip`**, extraia a pasta (não rode de dentro do .zip) e abra o `concord.exe`.
+Na página de [**Releases**](../../releases), baixe o **`concord-v1.1.0-PUBLICO.zip`**, extraia a pasta (não rode de dentro do .zip) e abra o `concord.exe`.
 
-**No Mac** (Apple Silicon, M1 ou mais novo, macOS 13+): baixe o **`concord-1.0.2-mac-arm64.zip`**, arraste o `concord.app` para Aplicativos e siga o `LEIA-ME-MAC.txt` (primeira abertura e permissões). No Mac já funcionam chat, voz, assistir e transmitir (tela, janela, áudio do app e câmera); ainda faltam o ícone na barra de menus, as notificações, o push-to-talk global e hospedar pelo app.
+**No Mac** (Apple Silicon, M1 ou mais novo, macOS 13+): baixe o **`concord-1.1.0-mac-arm64.zip`**, arraste o `concord.app` para Aplicativos e siga o `LEIA-ME-MAC.txt` (primeira abertura e permissões). No Mac já funcionam chat, voz, assistir e transmitir (tela, janela, áudio do app e câmera), a conexão protegida e as mensagens e chamadas criptografadas com quem usa Windows (testado nos dois sentidos), e os atalhos com a janela do concord em foco; ainda faltam o ícone na barra de menus, as notificações, os atalhos e o push-to-talk globais e hospedar pelo app.
 
-O executável não é assinado digitalmente. Na primeira vez o Windows pode mostrar "O Windows protegeu o computador": clique em "Mais informações" e depois em "Executar assim mesmo". Baixe só deste repositório ou de quem hospeda o seu grupo.
+Os apps não são assinados digitalmente. Baixe só deste repositório ou de quem hospeda o seu grupo. Na primeira vez:
+
+- **Windows:** se aparecer "O Windows protegeu o computador", clique em "Mais informações" e depois em "Executar assim mesmo".
+- **Mac:** tente abrir uma vez, depois vá em Ajustes do Sistema → Privacidade e Segurança e clique em "Abrir Mesmo Assim". Ou rode no Terminal `xattr -dr com.apple.quarantine /Applications/concord.app`.
 
 ## Como entrar (seus amigos)
 
@@ -78,12 +82,14 @@ O servidor fica ligado enquanto o app estiver aberto (ou na bandeja). Quem cria 
 
 Para deixar um PC ligado com o servidor sem abrir o app:
 
-1. Na página de Releases, baixe o **`concord-servidor-v1.0.2.zip`** e extraia a pasta num lugar fixo.
+1. Na página de Releases, baixe o **`concord-servidor-v1.1.0.zip`** e extraia a pasta num lugar fixo.
 2. Rode `baixar-livekit.bat` (baixa a parte de voz do site oficial e confere o checksum).
 3. Rode `liberar-firewall.bat` e aceite o pedido do Windows. Ele libera o servidor e a voz no Firewall do Windows em todas as redes, em IPv4 e IPv6 (o `remover-firewall.bat` desfaz). Vem no zip do servidor a partir da v1.0.2.
 4. Rode `iniciar-servidor.bat`. Na primeira vez ele cria `data\config.toml`: **defina uma senha** (`server_password`) antes de convidar alguém. A partir da v1.0.2, alguns segundos depois de ligar, a janela do servidor mostra um diagnóstico de conexão (IPv4/IPv6, CGNAT, Firewall do Windows) e o que corrigir.
 5. Deixe o servidor alcançável. A partir da v1.0.2 ele escuta em IPv6 além de IPv4: amigos com IPv6 em geral entram pelo IPv6 deste PC sem abrir portas, mesmo com CGNAT (os convites criados no servidor já levam esse endereço; alguns roteadores bloqueiam IPv6 vindo de fora até você liberar no firewall IPv6 deles). Senão, use uma VPN (mais seguro) ou libere no roteador as portas **TCP 7890, 7880 e 7881** e **UDP 7882**.
 6. Abra o app **no próprio PC do servidor** com o endereço `127.0.0.1` para virar o Dono.
+
+Para atualizar um servidor 1.0.x: feche o servidor, copie o novo `bin\concord-server.exe` por cima do antigo e ligue de novo. Não mexa na pasta `data\`; o `config.toml` antigo serve como está (sem a linha `tls`, o servidor usa `tls = "auto"`).
 
 O passo a passo completo está no `LEIA-ME-SERVIDOR.txt` dentro do zip.
 
@@ -94,7 +100,9 @@ Detalhes em [hub/README.md](hub/README.md).
 Leia o [SECURITY.md](SECURITY.md). Em resumo:
 
 - O concord foi feito para **grupos pequenos de amigos que confiam entre si**.
-- A conexão entre o app e o servidor **ainda não é criptografada** (sem HTTPS/TLS). O áudio e o vídeo vão criptografados; senhas, convites e mensagens, não. **Prefira uma VPN (Tailscale ou ZeroTier)** a abrir portas no roteador.
+- Desde a v1.1, a conexão entre o app e o servidor é **protegida (TLS)**: o servidor cria o próprio certificado e os convites levam a impressão digital dele. Mensagens diretas e chamadas diretas são **criptografadas de ponta a ponta**; nas salas de voz, um Admin liga a opção. Os canais de texto ganham isso na 1.2.
+- Apps 1.0 ainda entram num servidor 1.1, sem conexão protegida e sem entrar nas salas criptografadas. A conexão protegida, a criptografia e o "parar som" para todos precisam do servidor 1.1.
+- Mesmo assim, **prefira uma VPN (Tailscale ou ZeroTier)** a abrir portas no roteador.
 - Use uma senha de servidor forte e exclusiva, e uma senha pessoal que você não usa em nenhum outro lugar.
 - Um código de convite funciona como uma senha: mande só em conversa privada.
 - A pasta `data\` (e a de cada servidor criado pelo app) guarda segredos e as mensagens: nunca a envie para ninguém.
@@ -114,6 +122,7 @@ Os executáveis ficam em `target/release/` (`concord.exe` e `concord-server.exe`
 - Código do concord: [MIT](LICENSE).
 - **O logo não está sob a licença MIT.** Ele é a marca do projeto; por favor, não o use para representar outros projetos. Veja [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 - Bibliotecas, fontes e ícones de terceiros têm as próprias licenças, também listadas em [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+- Emojis coloridos: [Twemoji](https://github.com/jdecked/twemoji) © Twitter, Inc e outros colaboradores, licença CC-BY 4.0.
 
 ## Créditos
 
@@ -121,4 +130,4 @@ Feito por Cezar Callado · cezar.callado@gmail.com
 
 ---
 
-**English summary:** concord (called voxhub before v1.0.1) is a lightweight, self-hosted Discord-like app for Windows, written in Rust, for small groups of friends. It has text channels, DMs, replies, mentions and reactions, voice rooms with AI noise suppression, cameras, and Go Live screen sharing with per-app audio and hardware encoding. It also has private channels, invite codes, a saved server list, and one-click hosting from the app (or the standalone `concord-server.exe`). The server runs on one friend's PC. There is no TLS yet, so prefer a VPN and read `SECURITY.md`. Download `concord-v1.0.2-PUBLICO.zip` from Releases. Code: MIT. The logo is not MIT-licensed (see `THIRD-PARTY-NOTICES.md`). Made by Cezar Callado.
+**English summary:** concord (called voxhub before v1.0.1) is a lightweight, self-hosted Discord-like app for Windows and macOS (Apple Silicon), written in Rust, for small groups of friends. It has text channels, DMs, replies, mentions and reactions, voice rooms with AI noise suppression, cameras, and Go Live screen sharing with per-app audio and hardware encoding. It also has private channels, invite codes, a saved server list, and one-click hosting from the app (or the standalone `concord-server.exe`). The server runs on one friend's PC. Since v1.1 the app talks to the server over TLS, and DMs and calls are end-to-end encrypted; still prefer a VPN and read `SECURITY.md`. Download `concord-v1.1.0-PUBLICO.zip` (Windows) or `concord-1.1.0-mac-arm64.zip` (Mac) from Releases. Code: MIT. The logo is not MIT-licensed (see `THIRD-PARTY-NOTICES.md`). Made by Cezar Callado.

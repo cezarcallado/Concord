@@ -114,6 +114,23 @@ impl Auto {
                 if e.url != hub1 || !e.username.eq_ignore_ascii_case(&self.args.name) {
                     return self.fail(&format!("migrated entry is {} / {}", e.url, e.username));
                 }
+                // macOS: v0.9.0's DPAPI-encrypted password means nothing here: the app saves it
+                // into this run's own secrets.json now, the way "Lembrar a senha" does. Phase 2 (a
+                // new process) must find it again.
+                #[cfg(target_os = "macos")]
+                if app.settings.server_password(e).is_none() {
+                    let id = e.id;
+                    let Some(enc) = crate::settings::protect(&self.args.password) else { return self.fail("macOS: secrets.json refused to save the password") };
+                    if let Some(x) = app.settings.servers.servers.iter_mut().find(|s| s.id == id) {
+                        x.password_enc = Some(enc);
+                        x.needs_password = true;
+                    }
+                    app.settings.sync_legacy_server();
+                    app.settings.save();
+                    log("macOS: hub 1's password saved in this run's secrets.json");
+                }
+                let list = app.settings.servers.servers.clone();
+                let [e] = list.as_slice() else { return self.fail("the entry went away") };
                 if app.settings.server_password(e).as_deref() != Some(self.args.password.as_str()) {
                     return self.fail("the migrated entry lost its saved password");
                 }

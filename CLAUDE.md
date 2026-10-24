@@ -7,7 +7,7 @@ Guidance for Claude Code when someone asks for help with concord in this reposit
 1. **Use concord with friends** → point them to the Releases page: `concord-v1.0.1-PUBLICO.zip` (the app). Nothing to build.
 2. **Host a server** → two options, explain both and recommend the first for most people:
    - **From the app:** `concord.exe` → "Criar / abrir servidor". It downloads LiveKit, tries UPnP, and makes invite codes. The server runs while the app is open or in the tray.
-   - **Standalone:** `concord-servidor-v1.0.2.zip` from Releases → `baixar-livekit.bat` → `liberar-firewall.bat` → `iniciar-servidor.bat` → set `server_password` in `data\config.toml` → restart → open `concord.exe` on the same PC at `127.0.0.1` to become the owner (the first loopback login claims ownership and must set a personal password).
+   - **Standalone:** `concord-servidor-v1.1.0.zip` from Releases → `baixar-livekit.bat` → `liberar-firewall.bat` → `iniciar-servidor.bat` → set `server_password` in `data\config.toml` → restart → open `concord.exe` on the same PC at `127.0.0.1` to become the owner (the first loopback login claims ownership and must set a personal password).
 3. **Build from source** → `cargo build --release -p voxhub-app -p voxhub-server` (Rust stable, MSVC, Visual Studio Build Tools with C++). Outputs: `target\release\concord.exe` and `concord-server.exe`. Package names stay `voxhub-*` on purpose.
 
 ## Making the server reachable
@@ -24,7 +24,7 @@ Then the owner creates an invite in the app ("Convidar") with an expiry and a us
 
 ## Safety rules for you (Claude)
 
-- **There is no TLS yet.** Say so when the user exposes a server to the internet, and recommend a strong `server_password` and a VPN. Read `SECURITY.md` before giving security advice.
+- **TLS since v1.1:** a 1.1 server and 1.1 apps talk over TLS with the server's own pinned certificate (`tls = "auto"` by default; `"required"` refuses 1.0 apps). Keep the server's `data	ls` folder when moving it. Still recommend a strong `server_password` and a VPN when the user exposes a server to the internet. Read `SECURITY.md` before giving security advice.
 - **Never print, paste, commit or upload** the contents of `data\` (config with secrets, `voxhub.db` with messages), `%APPDATA%\concord\`, `%LOCALAPPDATA%\concord\`, logs, invite codes or passwords. Don't ask the user to paste them into an issue.
 - Don't change router settings, firewall rules or system settings yourself; tell the user what to change.
 - Don't stop processes by image name (other concord or voxhub instances may be the user's live server); stop only processes you started, by PID.

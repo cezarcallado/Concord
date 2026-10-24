@@ -54,6 +54,10 @@ impl MicTest {
             counters: Arc::new(StreamCounters::default()),
             gate: cfg.gate.clone(),
             noise: cfg.noise.clone(),
+            // A test of the chosen device: another one in its place would prove nothing.
+            fall_back: false,
+            on_status: None,
+            fake: None,
         };
         let playback = cfg.playback.then(|| PlaybackConfig {
             device: cfg.output_device,

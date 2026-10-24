@@ -10,7 +10,8 @@
 //!   <nome>" with "@ ligado" (also mention them; channels) and ✖. The reply shows a one-line quote
 //!   above it; a click scrolls to the original and flashes it (older pages are loaded when needed).
 //! - **Reações**: "😀" on the hover bar (or "Reagir" in the menu) opens a small picker: the emoji I
-//!   used last plus a fixed grid of common ones (all in egui's bundled emoji font, so they draw).
+//!   used last plus a fixed grid of common ones (every one has a colour Twemoji picture,
+//!   `theme::emoji`; the emoji font is the fallback for anything else).
 //!   Reactions show as chips under the message, highlighted when I am in them; a click toggles,
 //!   hovering lists who reacted.
 //!
@@ -39,7 +40,8 @@ use crate::backend::Cmd;
 use crate::theme::{self, ph};
 pub use crate::chat_images::Target;
 
-/// The curated reaction grid (every one of them is in egui's bundled emoji font).
+/// The curated reaction grid (every one of them is in egui's bundled emoji font and has a colour
+/// picture in `theme::emoji`'s atlas; a test checks both stay true).
 pub const REACTION_GRID: [&str; 40] = [
     "👍", "👎", "❤", "😂", "😮", "😢", "😡", "🎉", "🔥", "👏", //
     "🙏", "😀", "😄", "😁", "😆", "😅", "😊", "😉", "😍", "😘", //
@@ -507,12 +509,6 @@ pub struct MsgActions {
     pub own: bool,
 }
 
-impl MsgActions {
-    pub fn any(&self) -> bool {
-        self.delete || (self.social && (self.features.replies || self.features.reactions))
-    }
-}
-
 /// May I delete this message? My own: always, wherever I can write (channels on a hub that knows
 /// roles, which is where the delete endpoint exists; my DM lines). Somebody else's channel
 /// message: Moderador and above (the hub checks it again). Never somebody else's DM line, nor a
@@ -570,16 +566,16 @@ pub fn quote_line(ui: &mut egui::Ui, r: &ReplyRef) -> bool {
     resp.clicked()
 }
 
-/// The text of a message with its mention chips (plain `links::message` when it has none).
+/// The text of a message with its mention chips (plain `links::chat_message` when it has none).
 #[allow(clippy::too_many_arguments)]
 pub fn message_text(ui: &mut egui::Ui, chat: &mut ChatUi, target: Target, id: i64, caption: &str, ids: &[UserId], everyone: bool, me: Option<UserId>) {
     if (ids.is_empty() && !everyone) || !caption.contains('@') {
-        crate::links::message(ui, caption);
+        crate::links::chat_message(ui, caption);
         return;
     }
     let spans = chat.chips(target, id, caption, ids, everyone);
     if spans.is_empty() {
-        crate::links::message(ui, caption);
+        crate::links::chat_message(ui, caption);
         return;
     }
     let mut offset = 0;
@@ -620,9 +616,7 @@ fn text_part(ui: &mut egui::Ui, text: &str) {
                 ui.label(t);
             }
             crate::links::Segment::Link { shown, url } => {
-                if ui.link(shown).on_hover_text(&url).clicked() {
-                    crate::links::open_url(&url);
-                }
+                crate::links::link(ui, shown, &url, crate::links::Within::Message);
             }
         }
     }
@@ -715,22 +709,108 @@ fn delete_hover(own: bool) -> &'static str {
     if own { "Apagar mensagem (Shift+clique: sem confirmar)" } else { "Apagar mensagem (moderação; Shift+clique: sem confirmar)" }
 }
 
-/// A message's right-click menu: Responder, Adicionar reação, Apagar mensagem (as allowed).
-pub fn menu_items(ui: &mut egui::Ui, a: MsgActions, id: i64, acts: &mut Vec<Act>) {
-    use crate::ui_kit::menu_row;
-    if a.social && a.features.replies && menu_row(ui, ph::ARROW_BEND_UP_LEFT, "Responder", false).clicked() {
+/// The emoji of the quick-reaction row at the top of a message's menu: the recently used ones
+/// first, then the usual ones, [`QUICK_REACTIONS`] in all.
+pub fn quick_reactions(recent: &[String]) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::with_capacity(QUICK_REACTIONS);
+    for e in recent.iter().map(String::as_str).chain(QUICK_DEFAULTS) {
+        if out.len() == QUICK_REACTIONS {
+            break;
+        }
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    out
+}
+
+/// How many emoji the quick-reaction row of a message's menu has.
+pub const QUICK_REACTIONS: usize = 5;
+/// The usual quick reactions, after the recently used ones.
+pub const QUICK_DEFAULTS: [&str; 6] = ["👍", "❤", "😂", "😮", "😢", "🔥"];
+
+/// What a message's menu shows besides the actions (only read while it is open).
+#[derive(Clone, Copy)]
+pub struct MenuInfo<'a> {
+    /// The text of the message (Copiar texto; its links: Copiar link / Abrir link).
+    pub caption: &'a str,
+    pub reactions: &'a [Reaction],
+    pub me: Option<UserId>,
+    /// The recently used reactions (the quick row).
+    pub recent: &'a [String],
+}
+
+/// The rows of a message's menu, in order, as the person reads them (the autotest compares them
+/// with what was drawn): `link` is the link it was opened on, if any.
+pub fn menu_labels(a: MsgActions, info: MenuInfo<'_>, link: Option<&str>) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    let has_link = link.is_some() || !crate::links::urls(info.caption, 1).is_empty();
+    let (react, reply) = (a.social && a.features.reactions, a.social && a.features.replies);
+    if react {
+        v.push("reações rápidas");
+        v.push("Adicionar reação");
+    }
+    if reply {
+        v.push("Responder");
+    }
+    if !info.caption.trim().is_empty() {
+        v.push("Copiar texto");
+    }
+    if has_link {
+        v.push("Copiar link");
+        v.push("Abrir link");
+    }
+    v.push("Copiar ID da mensagem");
+    if a.delete {
+        v.push(if a.own { "Apagar mensagem" } else { "Apagar mensagem (moderação)" });
+    }
+    v
+}
+
+/// A message's right-click menu (v1.1, like Discord's): the quick reactions and "Adicionar
+/// reação", Responder; Copiar texto, Copiar link and Abrir link (the link right-clicked, else
+/// the message's first one), Copiar ID da mensagem; Apagar mensagem (as allowed, with its
+/// confirmation). Messages cannot be edited, so there is no "Editar".
+pub fn menu_items(ui: &mut egui::Ui, a: MsgActions, id: i64, info: MenuInfo<'_>, link: Option<&str>, acts: &mut Vec<Act>) {
+    use crate::ui_kit::{menu_row, menu_separator};
+    let (react, reply) = (a.social && a.features.reactions, a.social && a.features.replies);
+    if react {
+        quick_reaction_row(ui, id, info, acts);
+        if menu_row(ui, ph::SMILEY, "Adicionar reação", false).clicked() {
+            let pos = ui.ctx().pointer_interact_pos().unwrap_or(ui.min_rect().left_bottom());
+            acts.push(Act::Picker { id, pos });
+            ui.close();
+        }
+    }
+    if reply && menu_row(ui, ph::ARROW_BEND_UP_LEFT, "Responder", false).clicked() {
         acts.push(Act::Reply(id));
         ui.close();
     }
-    if a.social && a.features.reactions && menu_row(ui, ph::SMILEY, "Adicionar reação", false).clicked() {
-        let pos = ui.ctx().pointer_interact_pos().unwrap_or(ui.min_rect().left_bottom());
-        acts.push(Act::Picker { id, pos });
+    if react || reply {
+        menu_separator(ui);
+    }
+    if !info.caption.trim().is_empty() && menu_row(ui, ph::COPY, "Copiar texto", false).clicked() {
+        ui.ctx().copy_text(info.caption.to_string());
+        tracing::info!(message = id, "message menu: text copied");
+        ui.close();
+    }
+    let first;
+    let link = match link {
+        Some(l) => Some(l),
+        None => {
+            first = crate::links::urls(info.caption, 1).pop();
+            first.as_deref()
+        }
+    };
+    if let Some(url) = link {
+        crate::links::menu_items(ui, url);
+    }
+    if menu_row(ui, ph::IDENTIFICATION_BADGE, "Copiar ID da mensagem", false).clicked() {
+        ui.ctx().copy_text(id.to_string());
         ui.close();
     }
     if a.delete {
-        if a.social && (a.features.replies || a.features.reactions) {
-            crate::ui_kit::menu_separator(ui);
-        }
+        menu_separator(ui);
         let label = if a.own { "Apagar mensagem" } else { "Apagar mensagem (moderação)" };
         let b = menu_row(ui, ph::TRASH, label, true).on_hover_text("Shift+clique: apaga sem confirmar");
         if b.clicked() {
@@ -740,19 +820,103 @@ pub fn menu_items(ui: &mut egui::Ui, a: MsgActions, id: i64, acts: &mut Vec<Act>
     }
 }
 
+/// The row of quick reactions at the top of a message's menu (a click puts mine on, or takes it
+/// off when it is already there).
+fn quick_reaction_row(ui: &mut egui::Ui, id: i64, info: MenuInfo<'_>, acts: &mut Vec<Act>) {
+    let quick = quick_reactions(info.recent);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for e in quick {
+            let mine = info.me.is_some_and(|me| info.reactions.iter().any(|r| r.emoji == e && r.users.contains(&me)));
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(36.0, 34.0), egui::Sense::click());
+            if ui.is_rect_visible(rect) {
+                let p = ui.painter();
+                if resp.hovered() {
+                    p.rect_filled(rect, theme::radius::ROW, theme::MOVEL_HOVER);
+                } else if mine {
+                    p.rect_filled(rect, theme::radius::ROW, theme::PAREDE);
+                }
+                p.text(rect.center(), egui::Align2::CENTER_CENTER, e, egui::FontId::proportional(19.0), theme::GIZ);
+            }
+            let hover = if mine { "Tirar a sua reação" } else { "Reagir com" };
+            if resp.on_hover_text(format!("{hover} {e}")).clicked() {
+                acts.push(Act::React { id, emoji: e.to_string(), add: !mine });
+                ui.close();
+            }
+        }
+    });
+    ui.add_space(2.0);
+}
+
+/// Where a message's menu keeps the link it was opened on.
+fn menu_link_id(menu_id: egui::Id) -> egui::Id {
+    menu_id.with("link")
+}
+
 /// The right-click menu of a message: opens on a right click anywhere on its row (text, images,
 /// link cards, reactions, the header's empty space), except where the row has a menu of its own
-/// (the author's name and picture: `person_menu`).
-pub fn message_menu(ui: &mut egui::Ui, row: egui::Rect, menu_id: egui::Id, a: MsgActions, id: i64, person_menu: bool, acts: &mut Vec<Act>) {
-    if !a.any() {
-        return;
-    }
+/// (the author's name and picture: `person_menu`). A right click on a link puts that link in it
+/// (`links::take_right_clicked`). `forced`: an autotest holds it open ([`force_menu`]).
+#[allow(clippy::too_many_arguments)]
+pub fn message_menu(ui: &mut egui::Ui, row: egui::Rect, menu_id: egui::Id, a: MsgActions, id: i64, info: MenuInfo<'_>, person_menu: bool, forced: bool, acts: &mut Vec<Act>) {
     let area = ui.interact(row, menu_id, egui::Sense::hover());
     let right_click = !person_menu && ui.rect_contains_pointer(row) && ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
-    egui::Popup::menu(&area).open_memory(right_click.then_some(egui::SetOpenCommand::Bool(true))).at_pointer_fixed().frame(crate::ui_kit::popup_frame(ui.style())).style(crate::ui_kit::menu_style).show(|ui| {
-        ui.set_min_width(200.0);
-        menu_items(ui, a, id, acts);
+    let forced_at = if forced { forced_menu_at(ui.ctx(), id) } else { None };
+    let open = right_click || forced_at.is_some();
+    if open {
+        // The link under the pointer (if any), for this opening of the menu.
+        let link = crate::links::take_right_clicked(ui.ctx());
+        ui.data_mut(|d| match link {
+            Some(l) => {
+                d.insert_temp(menu_link_id(menu_id), l);
+            }
+            None => d.remove::<String>(menu_link_id(menu_id)),
+        });
+    }
+    let popup = egui::Popup::menu(&area).open_memory(open.then_some(egui::SetOpenCommand::Bool(true)));
+    let popup = match forced_at {
+        Some(at) => popup.at_position(at),
+        None => popup.at_pointer_fixed(),
+    };
+    popup.frame(crate::ui_kit::popup_frame(ui.style())).style(crate::ui_kit::menu_style).show(|ui| {
+        // (The rows take the width they are given: at most this wide.)
+        ui.set_min_width(220.0);
+        ui.set_max_width(250.0);
+        let link: Option<String> = ui.data(|d| d.get_temp(menu_link_id(menu_id)));
+        menu_items(ui, a, id, info, link.as_deref(), acts);
     });
+}
+
+/// Autotests: hold this message's menu open at `at` (as a right click there, on `link` when given,
+/// opens it) until [`force_menu_off`]; the window is never under the real pointer.
+pub fn force_menu(ctx: &egui::Context, id: i64, link: Option<String>, at: egui::Pos2) {
+    ctx.data_mut(|d| d.insert_temp(forced_menu_key(), (id, link, at)));
+}
+
+/// Autotests: let the held menu go (it closes).
+pub fn force_menu_off(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove::<(i64, Option<String>, egui::Pos2)>(forced_menu_key()));
+    egui::Popup::close_all(ctx);
+}
+
+fn forced_menu_key() -> egui::Id {
+    egui::Id::new("force_msg_menu")
+}
+
+/// Autotests: the message whose menu [`force_menu`] holds open (read once per list drawn).
+pub fn forced_menu(ctx: &egui::Context) -> Option<i64> {
+    ctx.data(|d| d.get_temp::<(i64, Option<String>, egui::Pos2)>(forced_menu_key())).map(|(id, _, _)| id)
+}
+
+fn forced_menu_at(ctx: &egui::Context, id: i64) -> Option<egui::Pos2> {
+    let (want, link, at) = ctx.data(|d| d.get_temp::<(i64, Option<String>, egui::Pos2)>(forced_menu_key()))?;
+    if want != id {
+        return None;
+    }
+    if let Some(l) = link {
+        crate::links::note_right_clicked(ctx, &l);
+    }
+    Some(at)
 }
 
 /// How strong the flash of a jumped-to message is now (0 = none), and scroll to it once.
@@ -1098,11 +1262,17 @@ impl App {
             match a {
                 Act::Reply(id) => self.start_reply(target, id),
                 Act::React { id, emoji, add } => self.react(target, id, &emoji, add),
-                Act::Picker { id, pos } => self.chatx.picker = Some(Picker { target, id, pos, opened: self.chatx.frame }),
+                Act::Picker { id, pos } => self.open_reaction_picker(target, id, pos),
                 Act::Jump { id, deleted } => self.jump_to(target, id, deleted),
                 Act::Delete { id, now } => self.ask_delete(target, id, now),
             }
         }
+    }
+
+    /// Open the reaction picker for a message at `pos` (the hover bar's smiley, "Adicionar
+    /// reação" in its menu; the emoji autotest).
+    pub fn open_reaction_picker(&mut self, target: Target, id: i64, pos: egui::Pos2) {
+        self.chatx.picker = Some(Picker { target, id, pos, opened: self.chatx.frame });
     }
 
     /// The reaction picker, when open (drawn over everything).
@@ -1257,7 +1427,14 @@ impl App {
         }
         let open = list.is_some();
         let filter = egui::EventFilter { tab: open, vertical_arrows: open, horizontal_arrows: false, escape: open };
+        let kept = super::chat_view::box_menu_before(ui, id, &self.input);
         let resp = ui.add(super::chat_view::field_edit(&mut self.input, hint).desired_width(width).event_filter(filter).id(id));
+        // The right-click menu: Recortar, Copiar, Colar (a picture goes to the attachments, as
+        // Ctrl+V does), Selecionar tudo.
+        if super::chat_view::box_menu(ui, &resp, id, &self.input, kept, self.video.parent.unwrap_or(0)) == super::chat_view::BoxOut::PasteImage {
+            let ctx = ui.ctx().clone();
+            self.paste_image_from_menu(target, &ctx);
+        }
         if let Some((at, entries)) = &list {
             if esc {
                 self.chatx.ac_closed = Some((target, *at));
@@ -1426,7 +1603,7 @@ mod tests {
 
     #[test]
     fn quotes_and_hover_texts() {
-        let r = ReplyRef { id: 1, author: Some(User::new(2, "Tati")), excerpt: "oi".into(), images: 0, deleted: false };
+        let r = ReplyRef { id: 1, author: Some(User::new(2, "Tati")), excerpt: "oi".into(), images: 0, deleted: false, sealed: false };
         assert_eq!(quote_parts(&r), (Some("Tati".into()), "oi".into()));
         assert_eq!(quote_parts(&ReplyRef { excerpt: String::new(), images: 1, ..r.clone() }).1, "imagem");
         assert_eq!(quote_parts(&ReplyRef { excerpt: String::new(), images: 3, ..r.clone() }).1, "3 imagens");
@@ -1449,6 +1626,34 @@ mod tests {
         }
         assert_eq!(r.len(), RECENT_MAX);
         assert_eq!(r[0], REACTION_GRID[39]);
+    }
+
+    #[test]
+    fn the_quick_row_puts_the_recent_reactions_first() {
+        assert_eq!(quick_reactions(&[]), ["👍", "❤", "😂", "😮", "😢"]);
+        let recent: Vec<String> = ["🔥", "👍", "🎉"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(quick_reactions(&recent), ["🔥", "👍", "🎉", "❤", "😂"]);
+        let many: Vec<String> = REACTION_GRID.iter().take(8).map(|s| s.to_string()).collect();
+        assert_eq!(quick_reactions(&many).len(), QUICK_REACTIONS);
+    }
+
+    #[test]
+    fn the_message_menu_has_what_applies() {
+        let a = MsgActions { features: ChatFeatures::ALL, social: true, delete: true, own: true };
+        let info = MenuInfo { caption: "olha https://example.com/x", reactions: &[], me: Some(1), recent: &[] };
+        let rows = menu_labels(a, info, None);
+        assert_eq!(rows, ["reações rápidas", "Adicionar reação", "Responder", "Copiar texto", "Copiar link", "Abrir link", "Copiar ID da mensagem", "Apagar mensagem"]);
+        // No link, an image without a caption, someone else's message in a blocked DM.
+        let a = MsgActions { features: ChatFeatures::ALL, social: false, delete: false, own: false };
+        let info = MenuInfo { caption: "", reactions: &[], me: Some(1), recent: &[] };
+        assert_eq!(menu_labels(a, info, None), ["Copiar ID da mensagem"]);
+        // Opened on a link of a message without one in its text (a preview card): the link rows.
+        let info = MenuInfo { caption: "sem link", reactions: &[], me: Some(1), recent: &[] };
+        assert!(menu_labels(a, info, Some("https://example.com")).contains(&"Abrir link"));
+        // A moderator's delete of someone else's message says so; there is never "Editar".
+        let a = MsgActions { features: ChatFeatures::ALL, social: true, delete: true, own: false };
+        let rows = menu_labels(a, info, None);
+        assert!(rows.contains(&"Apagar mensagem (moderação)") && !rows.contains(&"Editar"));
     }
 
     #[test]

@@ -55,6 +55,16 @@ impl HubClient {
     /// `POST /api/attachments?thumb_len=`: a compressed picture and its thumbnail. The answer is a
     /// pending attachment: put it on a message within the hour.
     pub async fn upload_attachment(&self, image: &[u8], thumb: Option<&[u8]>) -> Result<Attachment> {
+        self.upload_attachment_as(image, thumb, false).await
+    }
+
+    /// E2: `POST /api/attachments?sealed=1&thumb_len=`: the ciphertext of a picture (and of its
+    /// thumbnail), sealed by `vox_e2ee::dm::seal_blob`. Only a sealed DM line can carry it.
+    pub async fn upload_sealed_attachment(&self, image: &[u8], thumb: Option<&[u8]>) -> Result<Attachment> {
+        self.upload_attachment_as(image, thumb, true).await
+    }
+
+    async fn upload_attachment_as(&self, image: &[u8], thumb: Option<&[u8]>, sealed: bool) -> Result<Attachment> {
         let n = thumb.map_or(0, <[u8]>::len);
         let mut body = Vec::with_capacity(image.len() + n);
         body.extend_from_slice(image);
@@ -62,6 +72,9 @@ impl HubClient {
             body.extend_from_slice(t);
         }
         let mut url = self.url("api/attachments")?;
+        if sealed {
+            url.query_pairs_mut().append_pair("sealed", "1");
+        }
         url.query_pairs_mut().append_pair("thumb_len", &n.to_string());
         let resp = self.auth(self.http.post(url))?.timeout(Duration::from_secs(180)).body(body).send().await.context("image upload request")?;
         checked("image upload", resp).await?.json::<Attachment>().await.context("image upload: invalid response body")

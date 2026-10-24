@@ -66,7 +66,7 @@ async fn host_invite_join_stop_and_reopen() {
 
     // An invite, turned into the code the app shows (addresses from the host status).
     let created: InviteCreated = http.post(format!("{base}/api/invites")).bearer_auth(&owner.token).json(&json!({"max_uses": 5})).send().await.unwrap().json().await.unwrap();
-    let code = InviteCode { token: invite_token_from_hex(&created.token).unwrap(), hub_port: st.hub_addr.unwrap().port(), addrs: st.invite_addrs() }.encode();
+    let code = InviteCode { token: invite_token_from_hex(&created.token).unwrap(), hub_port: st.hub_addr.unwrap().port(), addrs: st.invite_addrs(), tls_pin: st.tls_pin }.encode();
 
     // The friend: only the code.
     let decoded = InviteCode::decode(&code).unwrap();

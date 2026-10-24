@@ -137,6 +137,11 @@ pub struct InviteHints {
     pub lan_ipv4: Option<Ipv4Addr>,
     #[serde(default)]
     pub lan_prefix: u8,
+    /// v1.1 (T0): the SHA-256 of the hub's TLS certificate, 64 hex digits ([`tls_pin_hex`]), when
+    /// the hub speaks TLS. The code then carries it ([`InviteCode::tls_pin`]) and the app joining
+    /// with it talks to that certificate only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_pin: Option<String>,
 }
 
 /// `POST /api/invites` answer.
@@ -181,12 +186,44 @@ pub fn invite_token_from_hex(hex: &str) -> Option<[u8; INVITE_TOKEN_LEN]> {
     Some(out)
 }
 
+/// v1.1 (T0): a TLS pin (SHA-256 of the hub's certificate) as the 64 lowercase hex digits the API
+/// and the saved settings carry.
+pub fn tls_pin_hex(pin: &[u8; 32]) -> String {
+    pin.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// [`tls_pin_hex`] back into bytes (`None`: not 64 hex digits).
+pub fn tls_pin_from_hex(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.trim();
+    // Audit (T0): hex digits only (`from_str_radix` alone also takes a sign: "+f").
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// v1.1 (T0): the "Código do servidor" people compare by eye (the app's "Segurança da conexão",
+/// the server console): Crockford base32 of the pin's first 10 bytes, in groups of four
+/// (`K7QM-2D9X-4HVA-PB1C`). 80 bits, for a person comparing two certificates; the app itself
+/// always compares the whole pin.
+pub fn tls_server_code(pin: &[u8; 32]) -> String {
+    let text = base32_encode(&pin[..10]);
+    let groups: Vec<&str> = (0..text.len()).step_by(4).map(|i| &text[i..(i + 4).min(text.len())]).collect();
+    groups.join("-")
+}
+
 // ---------------------------------------------------------------- the code
 
 /// What every code starts with ("vox", format 1).
 pub const INVITE_PREFIX: &str = "vox1-";
-/// The layout version inside the scrambled bytes.
+/// The layout version inside the scrambled bytes: 1, or (v1.1) 2 when the code carries the hub's
+/// TLS pin. A v1.0 app reads a layout-2 code as [`InviteCodeError::NewerVersion`] ("atualize").
 const LAYOUT_VERSION: u8 = 1;
+const LAYOUT_TLS: u8 = 2;
 /// Most addresses in one code.
 const MAX_ADDRS: usize = 6;
 
@@ -194,6 +231,8 @@ const TAG_PUBLIC_V4: u8 = 0x04;
 const TAG_PUBLIC_V6: u8 = 0x06;
 const TAG_LAN_V4: u8 = 0x14;
 const TAG_HOST: u8 = 0x48;
+/// v1.1 (layout 2): the SHA-256 of the hub's TLS certificate, 32 bytes, exactly once.
+const TAG_TLS_PIN: u8 = 0x50;
 
 /// One way to reach the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,6 +251,10 @@ pub struct InviteCode {
     pub token: [u8; INVITE_TOKEN_LEN],
     pub hub_port: u16,
     pub addrs: Vec<InviteAddr>,
+    /// v1.1: the SHA-256 of the hub's TLS certificate. With it the app talks to the hub over TLS
+    /// with exactly that certificate, never in the clear (layout 2); without it the code is the
+    /// layout 1 every app reads.
+    pub tls_pin: Option<[u8; 32]>,
 }
 
 /// Why a text is not a usable invite code.
@@ -249,8 +292,8 @@ pub fn looks_like_invite(text: &str) -> bool {
 impl InviteCode {
     /// `vox1-` + Crockford base32 of the scrambled payload and its CRC-32.
     pub fn encode(&self) -> String {
-        let mut plain = Vec::with_capacity(64);
-        plain.push(LAYOUT_VERSION);
+        let mut plain = Vec::with_capacity(100);
+        plain.push(if self.tls_pin.is_some() { LAYOUT_TLS } else { LAYOUT_VERSION });
         plain.extend_from_slice(&self.token);
         plain.extend_from_slice(&self.hub_port.to_be_bytes());
         for a in self.addrs.iter().take(MAX_ADDRS) {
@@ -279,6 +322,10 @@ impl InviteCode {
                 }
             }
         }
+        if let Some(pin) = &self.tls_pin {
+            plain.push(TAG_TLS_PIN);
+            plain.extend_from_slice(pin);
+        }
         scramble(&mut plain);
         let crc = crc32(&plain);
         plain.extend_from_slice(&crc.to_be_bytes());
@@ -302,7 +349,8 @@ impl InviteCode {
             return Err(InviteCodeError::Typo);
         }
         unscramble(&mut bytes);
-        if bytes[0] != LAYOUT_VERSION {
+        let layout = bytes[0];
+        if layout != LAYOUT_VERSION && layout != LAYOUT_TLS {
             return Err(InviteCodeError::NewerVersion);
         }
         let mut token = [0u8; INVITE_TOKEN_LEN];
@@ -319,11 +367,21 @@ impl InviteCode {
             Ok(s)
         };
         let mut addrs = Vec::new();
+        let mut tls_pin = None;
         while at < bytes.len() {
+            let tag = take(&mut at, 1)?[0];
+            if tag == TAG_TLS_PIN {
+                if layout != LAYOUT_TLS || tls_pin.is_some() {
+                    return Err(InviteCodeError::Damaged);
+                }
+                let mut pin = [0u8; 32];
+                pin.copy_from_slice(take(&mut at, 32)?);
+                tls_pin = Some(pin);
+                continue;
+            }
             if addrs.len() == MAX_ADDRS {
                 return Err(InviteCodeError::Damaged);
             }
-            let tag = take(&mut at, 1)?[0];
             let addr = match tag {
                 TAG_PUBLIC_V4 => {
                     let o = take(&mut at, 4)?;
@@ -354,10 +412,11 @@ impl InviteCode {
             };
             addrs.push(addr);
         }
-        if addrs.is_empty() {
+        // Layout 2 exists for the pin: one without it is not from a concord.
+        if addrs.is_empty() || (layout == LAYOUT_TLS) != tls_pin.is_some() {
             return Err(InviteCodeError::Damaged);
         }
-        Ok(InviteCode { token, hub_port, addrs })
+        Ok(InviteCode { token, hub_port, addrs, tls_pin })
     }
 
     pub fn token_hex(&self) -> String {
@@ -541,6 +600,7 @@ mod tests {
             token: [0x5a; INVITE_TOKEN_LEN],
             hub_port: 7990,
             addrs: vec![InviteAddr::Public("203.0.113.7".parse().unwrap()), InviteAddr::Lan(Ipv4Addr::new(192, 168, 0, 20), 24)],
+            tls_pin: None,
         }
     }
 
@@ -577,8 +637,94 @@ mod tests {
                 InviteAddr::Public("2001:db8::7".parse().unwrap()),
                 InviteAddr::Host("voxhub.example.org".into()),
             ],
+            tls_pin: None,
         };
         assert_eq!(InviteCode::decode(&all.encode()), Ok(all));
+    }
+
+    /// Encode raw (already laid out) plain bytes the way `encode` does.
+    fn raw_code(mut plain: Vec<u8>) -> String {
+        scramble(&mut plain);
+        let crc = crc32(&plain);
+        plain.extend_from_slice(&crc.to_be_bytes());
+        format!("vox1-{}", base32_encode(&plain))
+    }
+
+    /// v1.1 (T0): a pin makes a layout-2 code; without one the code is byte for byte layout 1.
+    #[test]
+    fn layouts_1_and_2() {
+        let plain = sample();
+        let v1 = plain.encode();
+        let pin: [u8; 32] = std::array::from_fn(|i| 0xa0 ^ i as u8);
+        let pinned = InviteCode { tls_pin: Some(pin), ..sample() };
+        let v2 = pinned.encode();
+        assert_ne!(v1, v2);
+        assert!(v2.len() < 120, "still pasteable: {} chars", v2.len());
+        assert_eq!(InviteCode::decode(&v1), Ok(plain.clone()));
+        assert_eq!(InviteCode::decode(&v2), Ok(pinned.clone()));
+        let unpack = |code: &str| {
+            let mut raw = base32_decode(&code[5..]).unwrap();
+            raw.truncate(raw.len() - 4);
+            unscramble(&mut raw);
+            raw
+        };
+        // Layout 1 is what every app reads; layout 2 ends with the pin.
+        assert_eq!(unpack(&v1)[0], 1);
+        let raw = unpack(&v2);
+        assert_eq!(raw[0], 2);
+        assert_eq!(raw[raw.len() - 33], TAG_TLS_PIN);
+        assert_eq!(&raw[raw.len() - 32..], &pin);
+        // The pin is under the CRC: a wrong character anywhere is caught.
+        let chars: Vec<char> = v2.chars().collect();
+        for i in 5..chars.len() {
+            let mut t = chars.clone();
+            t[i] = if t[i] == 'Z' { 'Y' } else { 'Z' };
+            assert!(InviteCode::decode(&t.into_iter().collect::<String>()).is_err(), "typo at {i} not caught");
+        }
+        // A pin in layout 1, two pins, a cut pin, or layout 2 without one: not from a concord.
+        let base = |layout: u8| {
+            let mut p = vec![layout];
+            p.extend_from_slice(&plain.token);
+            p.extend_from_slice(&plain.hub_port.to_be_bytes());
+            p.push(TAG_PUBLIC_V4);
+            p.extend_from_slice(&[203, 0, 113, 7]);
+            p
+        };
+        let with_pin = |mut p: Vec<u8>| {
+            p.push(TAG_TLS_PIN);
+            p.extend_from_slice(&pin);
+            p
+        };
+        assert_eq!(InviteCode::decode(&raw_code(with_pin(base(1)))), Err(InviteCodeError::Damaged));
+        assert_eq!(InviteCode::decode(&raw_code(with_pin(with_pin(base(2))))), Err(InviteCodeError::Damaged));
+        assert_eq!(InviteCode::decode(&raw_code(base(2))), Err(InviteCodeError::Damaged));
+        let mut cut = with_pin(base(2));
+        cut.pop();
+        assert_eq!(InviteCode::decode(&raw_code(cut)), Err(InviteCodeError::Damaged));
+        assert!(InviteCode::decode(&raw_code(with_pin(base(2)))).is_ok());
+        // Layout 3 is still "newer".
+        assert_eq!(InviteCode::decode(&raw_code(base(3))), Err(InviteCodeError::NewerVersion));
+    }
+
+    #[test]
+    fn pins_as_text_and_the_server_code() {
+        let pin: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(9));
+        let hex = tls_pin_hex(&pin);
+        assert_eq!(hex.len(), 64);
+        assert_eq!(tls_pin_from_hex(&hex), Some(pin));
+        assert_eq!(tls_pin_from_hex(&hex.to_uppercase()), Some(pin));
+        assert_eq!(tls_pin_from_hex(&hex[..62]), None);
+        assert_eq!(tls_pin_from_hex(&"zz".repeat(32)), None);
+        assert_eq!(tls_pin_from_hex(&format!("+f{}", &hex[2..])), None, "a sign is not a hex digit");
+        let code = tls_server_code(&pin);
+        assert_eq!(code.len(), 19, "{code}");
+        assert_eq!(code.matches('-').count(), 3, "{code}");
+        assert!(code.chars().all(|c| c == '-' || BASE32.contains(&(c as u8))), "{code}");
+        assert_eq!(tls_server_code(&[0u8; 32]), "0000-0000-0000-0000");
+        assert_eq!(tls_server_code(&[0xffu8; 32]), "ZZZZ-ZZZZ-ZZZZ-ZZZZ");
+        let mut other = pin;
+        other[9] ^= 1;
+        assert_ne!(tls_server_code(&other), code, "all of the first 10 bytes count");
     }
 
     #[test]
@@ -657,7 +803,7 @@ mod tests {
     #[test]
     fn another_layout_version_is_reported() {
         let c = sample();
-        let mut plain = vec![2u8];
+        let mut plain = vec![3u8];
         plain.extend_from_slice(&c.token);
         plain.extend_from_slice(&c.hub_port.to_be_bytes());
         scramble(&mut plain);

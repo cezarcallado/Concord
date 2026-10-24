@@ -291,6 +291,7 @@ async fn handle(s: &AppState, user: &User, ev: ClientEvent) -> Option<ServerEven
             None
         }
         ClientEvent::PlaySound { sound_id } => crate::sounds::play(s, user, sound_id).await,
+        ClientEvent::StopSound => crate::sounds::stop(s, user),
         ClientEvent::SendMessage { channel_id, content, mentions, reply_to, reply_mention } => {
             let content = content.trim();
             if content.is_empty() || content.chars().count() > MAX_CONTENT_CHARS {

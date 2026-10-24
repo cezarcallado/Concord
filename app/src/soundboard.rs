@@ -1,6 +1,11 @@
 //! Server soundboard UI: the "Sons" panel of the voice bar, adding / renaming / deleting sounds,
 //! the settings section, and the brief flash on the tile of whoever played a sound.
 //!
+//! v1.1: while a sound plays, the panel shows "Parar" (and the tile of a sound I am playing
+//! shows a stop sign: clicking it again stops it). Stopping cuts every sound playing here, with a
+//! short fade, and the ones I played for the whole room. A new sound while another plays is
+//! mixed with it, as before.
+//!
 //! The network and audio side lives in `backend/sounds.rs`: it keeps the list, downloads and
 //! caches the clips, and plays them through the voice session's mixer. This module only sends
 //! [`SoundCmd`]s and reacts to [`SoundEv`]s. The feature is hidden on a hub that predates it
@@ -24,9 +29,9 @@ use crate::theme::{self, ph, radius, size, space};
 use crate::ui_kit::{self, IconState, Kind, Size};
 
 /// Shown on a sound that has no emoji.
-const DEFAULT_EMOJI: &str = "🔊";
+pub(crate) const DEFAULT_EMOJI: &str = "🔊";
 /// A few emojis to pick from when adding or renaming (any emoji can be typed or pasted too).
-const QUICK_EMOJI: [&str; 20] = ["🎺", "🥁", "🎸", "😂", "🤣", "😎", "🔥", "💩", "👏", "😱", "🤔", "🙈", "🚨", "🔔", "💥", "👀", "🎉", "😭", "🐔", "🦆"];
+pub(crate) const QUICK_EMOJI: [&str; 20] = ["🎺", "🥁", "🎸", "😂", "🤣", "😎", "🔥", "💩", "👏", "😱", "🤔", "🙈", "🚨", "🔔", "💥", "👀", "🎉", "😭", "🐔", "🦆"];
 /// The tile of whoever played a sound lights up for this long.
 const FLASH_SECS: f32 = 2.5;
 /// Clicking sounds faster than this does nothing (the hub would refuse it anyway).
@@ -64,8 +69,10 @@ impl Default for SoundboardSettings {
 pub enum SoundCmd {
     /// What the backend needs to decide whether and how loud to play (sent whenever it changes).
     Prefs { volume_pct: u32, muted: bool, muted_sounds: Vec<SoundId> },
-    /// Ask the hub to play a sound for the room.
+    /// Ask the hub to play a sound for the room (it also starts here at once).
     Play(SoundId),
+    /// "Parar": stop every sound playing here, and mine for the whole room.
+    Stop,
     /// Hear a sound only here.
     Preview(SoundId),
     /// Decode, trim, normalise and upload an audio file. `trim`: only that part of the file (the
@@ -107,6 +114,8 @@ pub enum SoundEv {
     /// hub without a soundboard.
     List { supported: bool, sounds: Vec<Sound> },
     Played { sound_id: SoundId, by: User, heard: Heard },
+    /// Sounds stopped: those `by` played (`None`: everything playing here).
+    Stopped { by: Option<UserId> },
     /// An upload / rename / delete finished; the error is Portuguese, ready to show.
     Done { op: SoundOp, result: Result<(), String> },
     /// "Ouvir trecho" started (its length in ms) or could not (Portuguese text). In headless runs
@@ -114,6 +123,12 @@ pub enum SoundEv {
     ClipPreview(Result<u32, String>),
     /// Headless runs (`VOX_NO_PLAYBACK`): what the playback mixer produced for a sound.
     MixerHeard { sound_id: SoundId, rms_dbfs: f32, peak: f32, ms: u32 },
+}
+
+/// Is this hub error the refusal of a `PlaySound`?
+pub fn is_play_refusal(error: &str) -> bool {
+    use vox_proto::*;
+    [ERR_SOUND_RATE_LIMITED, ERR_SOUND_NOT_IN_VOICE, ERR_SOUND_UNKNOWN, ERR_SOUND_SERVER_MUTED].contains(&error)
 }
 
 /// A hub error text for a sound action, in Portuguese (anything else keeps the generic form).
@@ -166,6 +181,9 @@ pub struct SoundboardUi {
     /// By name.
     pub sounds: Vec<Sound>,
     pub open: bool,
+    /// The frame the popup was first drawn on, this time it is open (the click that opened it
+    /// does not close it again).
+    opened_frame: Option<u64>,
     /// The popup's search (cleared when it closes).
     pub search: String,
     pub add: Option<AddForm>,
@@ -175,6 +193,8 @@ pub struct SoundboardUi {
     pub busy: bool,
     pub message: Option<(bool, String)>,
     flashes: HashMap<UserId, Flash>,
+    /// Sounds playing now: (sound, player, until when).
+    playing: Vec<(SoundId, UserId, Instant)>,
     last_click: Option<Instant>,
     prefs_sent: Option<(u32, bool, Vec<SoundId>)>,
     /// Probes for the autotest.
@@ -186,6 +206,33 @@ pub struct SoundboardUi {
 impl SoundboardUi {
     pub fn find(&self, id: SoundId) -> Option<&Sound> {
         self.sounds.iter().find(|s| s.id == id)
+    }
+
+    /// Sounds playing right now (by anyone).
+    pub fn playing_now(&self) -> impl Iterator<Item = (SoundId, UserId)> + '_ {
+        let now = Instant::now();
+        self.playing.iter().filter(move |p| p.2 > now).map(|p| (p.0, p.1))
+    }
+
+    /// Is `id` playing, played by `by`?
+    pub fn is_playing(&self, id: SoundId, by: Option<UserId>) -> bool {
+        self.playing_now().any(|(s, u)| s == id && by.is_none_or(|b| b == u))
+    }
+
+    /// Keep the list of what plays from the backend's events.
+    fn track_playing(&mut self, ev: &SoundEv) {
+        let now = Instant::now();
+        self.playing.retain(|p| p.2 > now);
+        match ev {
+            SoundEv::Played { sound_id, by, heard: Heard::Playing | Heard::Downloading } => {
+                let ms = self.find(*sound_id).map_or(0, |s| s.duration_ms);
+                self.playing.retain(|p| !(p.0 == *sound_id && p.1 == by.id));
+                self.playing.push((*sound_id, by.id, now + Duration::from_millis(ms as u64)));
+            }
+            SoundEv::Stopped { by: Some(by) } => self.playing.retain(|p| p.1 != *by),
+            SoundEv::Stopped { by: None } => self.playing.clear(),
+            _ => {}
+        }
     }
 }
 
@@ -232,6 +279,7 @@ impl App {
     }
 
     pub fn on_sound_event(&mut self, ev: SoundEv) {
+        self.sb.track_playing(&ev);
         match ev {
             SoundEv::List { supported, mut sounds } => {
                 sounds.sort_by_key(|s| (s.name.to_lowercase(), s.id));
@@ -252,6 +300,10 @@ impl App {
                     (None, _) => (DEFAULT_EMOJI.to_string(), String::new()),
                 };
                 self.sb.flashes.insert(by.id, Flash { at: Instant::now(), emoji, name });
+                self.repaint.wake();
+            }
+            SoundEv::Stopped { by } => {
+                tracing::info!(?by, "soundboard: sounds stopped");
                 self.repaint.wake();
             }
             SoundEv::Done { op, result } => {
@@ -293,9 +345,14 @@ impl App {
 
     // ------------------------------------------------------------ actions
 
-    /// A click on a sound: ask the hub to play it for the room.
+    /// A click on a sound: ask the hub to play it for the room; a click on the sound I am
+    /// playing stops it.
     pub fn play_sound(&mut self, id: SoundId) {
         if self.voice.channel.is_none() {
+            return;
+        }
+        if self.my_id().is_some_and(|me| self.sb.is_playing(id, Some(me))) {
+            self.stop_sounds();
             return;
         }
         if self.sb.last_click.is_some_and(|t| t.elapsed() < CLICK_GAP) {
@@ -305,6 +362,12 @@ impl App {
         self.sb.last_click = Some(Instant::now());
         self.sb.message = None;
         self.backend.send(Cmd::Sound(SoundCmd::Play(id)));
+    }
+
+    /// "Parar": every sound playing here stops, and mine for the whole room.
+    pub fn stop_sounds(&mut self) {
+        self.sb.message = None;
+        self.backend.send(Cmd::Sound(SoundCmd::Stop));
     }
 
     pub fn preview_sound(&mut self, id: SoundId) {
@@ -362,8 +425,10 @@ impl App {
     /// "Adicionar".
     fn soundboard_panel(&mut self, ctx: &egui::Context) {
         if !self.sb.open {
+            self.sb.opened_frame = None;
             return;
         }
+        let opened = *self.sb.opened_frame.get_or_insert(ctx.cumulative_frame_nr());
         let mut close = false;
         let mut prefs_changed = false;
         let mut play = None;
@@ -372,10 +437,15 @@ impl App {
         let mut edit = None;
         let mut delete = None;
         let mut want_add = false;
+        let mut stop = false;
+        let me = self.my_id();
+        let any_playing = self.sb.playing_now().next().is_some();
         let screen = ctx.content_rect();
-        let w = PANEL_W.min(screen.width() - 32.0);
+        // In a small window at most half its width (and a shorter grid, below): the chat beside
+        // it stays usable.
+        let w = PANEL_W.min((screen.width() * 0.5).max(300.0)).min(screen.width() - 32.0);
         let style = ctx.global_style();
-        egui::Area::new(egui::Id::new("soundboard_panel"))
+        let area = egui::Area::new(egui::Id::new("soundboard_panel"))
             .order(egui::Order::Middle)
             .anchor(Align2::RIGHT_BOTTOM, [-16.0, -72.0])
             .constrain(true)
@@ -397,6 +467,13 @@ impl App {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui_kit::icon_button(ui, ph::X, "Fechar", IconState::Normal).clicked() {
                                 close = true;
+                            }
+                            if any_playing
+                                && ui_kit::button_sized(ui, Kind::Secondary, Size::Small, Some(ph::STOP), "Parar")
+                                    .on_hover_text("Para os sons que estão tocando (os seus param para todos na sala)")
+                                    .clicked()
+                            {
+                                stop = true;
                             }
                         });
                     });
@@ -421,7 +498,7 @@ impl App {
                     if shown.is_empty() && !self.sb.sounds.is_empty() {
                         ui.label(RichText::new("Nenhum som com esse nome.").color(theme::NEVOA));
                     }
-                    egui::ScrollArea::vertical().id_salt("soundboard_grid").auto_shrink([false, true]).max_height((screen.height() - 260.0).clamp(120.0, 330.0)).show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("soundboard_grid").auto_shrink([false, true]).max_height((screen.height() - 300.0).clamp(96.0, 330.0)).show(ui, |ui| {
                         let ctx = ui.ctx().clone();
                         let (cols, tile_w) = crate::sources::grid_layout(ui.available_width(), TILE_MIN_W, TILE_GAP);
                         ui.spacing_mut().item_spacing = Vec2::splat(TILE_GAP);
@@ -432,13 +509,15 @@ impl App {
                                     let muted_here = self.sound_is_muted(s.id);
                                     let can_edit = self.can_edit_sound(s);
                                     let emoji = shown_emoji(&ctx, &s.emoji);
-                                    let (tile, listen) = sound_tile(ui, tile_w, &emoji, &s.name, muted_here);
+                                    let mine_playing = me.is_some_and(|me| self.sb.is_playing(s.id, Some(me)));
+                                    let (tile, listen) = sound_tile(ui, tile_w, &emoji, &s.name, muted_here, mine_playing);
                                     let tile = tile.on_hover_text(format!(
-                                        "{}\npor {} · {}{}\nClique: toca para a sala · botão direito: mais opções",
+                                        "{}\npor {} · {}{}\n{}",
                                         s.name,
                                         s.uploader.shown_name(),
                                         dur_text(s.duration_ms),
-                                        if muted_here { "\n(silenciado só para você)" } else { "" }
+                                        if muted_here { "\n(silenciado só para você)" } else { "" },
+                                        if mine_playing { "Tocando: clique para parar" } else { "Clique: toca para a sala · botão direito: mais opções" }
                                     ));
                                     if listen {
                                         preview = Some(s.id);
@@ -487,7 +566,8 @@ impl App {
                             self.settings.soundboard.muted = !muted;
                             prefs_changed = true;
                         }
-                        ui.spacing_mut().slider_width = 110.0;
+                        // (I6: narrower in a narrow panel, so "Adicionar" keeps its room.)
+                        ui.spacing_mut().slider_width = (ui.available_width() - 190.0).clamp(48.0, 110.0);
                         ui.add_enabled_ui(!muted, |ui| {
                             prefs_changed |= ui.add(egui::Slider::new(&mut self.settings.soundboard.volume_pct, 0..=100).suffix("%")).on_hover_text("Volume do soundboard (só para você)").changed();
                         });
@@ -506,8 +586,23 @@ impl App {
         if !dialogs && ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !egui::Popup::is_any_open(ctx) {
             close = true;
         }
+        // So does a click anywhere else (the chat under it, the channel list), like the reaction
+        // picker: it is a layer over the chat that also takes the mouse wheel over its whole rect.
+        let click = ctx.input(|i| i.pointer.any_click()).then(|| ctx.pointer_interact_pos()).flatten();
+        if let Some(at) = click {
+            let layer = ctx.layer_id_at(at).map(|l| l.order);
+            close |= closes_panel(at, area.response.rect, layer, ctx.cumulative_frame_nr() > opened, dialogs);
+        }
         if want_add {
             self.open_add_sound();
+        }
+        if stop {
+            self.stop_sounds();
+        }
+        // "Parar" and the tiles' stop sign go away when the sounds end.
+        let now = Instant::now();
+        if let Some(next) = self.sb.playing.iter().map(|p| p.2).filter(|t| *t > now).min() {
+            ctx.request_repaint_after(next - now + Duration::from_millis(20));
         }
         if close {
             self.sb.open = false;
@@ -770,10 +865,14 @@ impl App {
     }
 }
 
-/// Does the UI font draw all of `s`? (egui's bundled emoji font is older than some emojis, and
-/// its `has_glyph` cannot tell: a glyph the font lacks is the one with no width.) Joiners and
+/// Can the UI draw all of `s`? Yes for an emoji with a colour picture (`theme::emoji`); otherwise
+/// the font must have it (egui's bundled emoji font is older than some emojis, and its
+/// `has_glyph` cannot tell: a glyph the font lacks is the one with no width). Joiners and
 /// variation selectors have no width by design.
 fn has_glyphs(ctx: &egui::Context, s: &str) -> bool {
+    if theme::emoji::has_image(s) {
+        return true;
+    }
     ctx.fonts_mut(|f| {
         let font = FontId::proportional(14.0);
         s.chars().all(|c| matches!(c, '\u{200d}' | '\u{fe0f}' | '\u{fe0e}') || f.glyph_width(&font, c) > 0.0)
@@ -827,10 +926,20 @@ fn emoji_row(ui: &mut egui::Ui, emoji: &mut String, disabled: bool) {
     });
 }
 
+/// Does a click at `at` close the popup drawn at `panel`? Only outside it, on whatever is under it
+/// (`layer`: the order of the layer there; a menu or tooltip in front, such as a tile's
+/// right-click menu, does not count), after the frame it opened on (`after_open`), and while no
+/// dialog of its own is open.
+fn closes_panel(at: Pos2, panel: Rect, layer: Option<egui::Order>, after_open: bool, dialogs: bool) -> bool {
+    after_open && !dialogs && !panel.contains(at) && layer.is_none_or(|o| o < egui::Order::Foreground)
+}
+
 /// One sound of the popup's grid: its emoji and name on [`theme::MOVEL`] (dimmed and struck
 /// through when silenced for me). On hover a small headphones button appears on the right ("Ouvir
 /// só aqui"). Returns the tile's response and whether that button was clicked.
-fn sound_tile(ui: &mut egui::Ui, w: f32, emoji: &str, name: &str, muted: bool) -> (egui::Response, bool) {
+/// While `playing` (a sound I played, still going), a stop sign replaces the emoji and the tile
+/// is outlined: a click stops it.
+fn sound_tile(ui: &mut egui::Ui, w: f32, emoji: &str, name: &str, muted: bool, playing: bool) -> (egui::Response, bool) {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, TILE_H), Sense::click());
     let listen_rect = Rect::from_center_size(Pos2::new(rect.right() - 18.0, rect.center().y), Vec2::splat(26.0));
     let hovered = resp.hovered() || ui.rect_contains_pointer(listen_rect);
@@ -847,7 +956,12 @@ fn sound_tile(ui: &mut egui::Ui, w: f32, emoji: &str, name: &str, muted: bool) -
         let p = ui.painter();
         p.rect_filled(rect, radius::BUTTON, fill);
         let fg = if muted { theme::NEVOA } else { theme::GIZ };
-        p.text(Pos2::new(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER, emoji, FontId::proportional(17.0), fg);
+        if playing {
+            p.rect_stroke(rect, radius::BUTTON, Stroke::new(theme::stroke::SPEAKING, theme::ABAJUR), egui::StrokeKind::Inside);
+            p.text(Pos2::new(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER, ph::STOP, theme::body(17.0), theme::ABAJUR);
+        } else {
+            p.text(Pos2::new(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER, emoji, FontId::proportional(17.0), fg);
+        }
         let name_x = rect.left() + 38.0;
         let right = if hovered { listen_rect.left() - 4.0 } else { rect.right() - 8.0 };
         let mut job = egui::text::LayoutJob::single_section(name.to_string(), egui::TextFormat::simple(theme::semibold(size::BUTTON), fg));
@@ -928,6 +1042,49 @@ mod tests {
         assert_eq!((old.soundboard.volume_pct, old.soundboard.muted), (50, false));
         let round: SoundboardSettings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(round.volume_pct, 50);
+    }
+
+    fn user(id: UserId) -> User {
+        User::new(id, "x")
+    }
+
+    #[test]
+    fn the_playing_list_follows_plays_stops_and_the_clip_length() {
+        let mut sb = SoundboardUi::default();
+        let s = |id, ms| Sound { id, name: "s".into(), emoji: String::new(), uploader: user(1), created_at_ms: 0, duration_ms: ms, size: 1, hash: "h".into() };
+        sb.sounds = vec![s(1, 5000), s(2, 1)];
+        sb.track_playing(&SoundEv::Played { sound_id: 1, by: user(7), heard: Heard::Playing });
+        sb.track_playing(&SoundEv::Played { sound_id: 1, by: user(8), heard: Heard::Downloading });
+        sb.track_playing(&SoundEv::Played { sound_id: 2, by: user(7), heard: Heard::Playing });
+        sb.track_playing(&SoundEv::Played { sound_id: 1, by: user(9), heard: Heard::Muted });
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(sb.is_playing(1, Some(7)) && sb.is_playing(1, Some(8)) && !sb.is_playing(1, Some(9)), "a muted play is not playing here");
+        assert!(!sb.is_playing(2, None), "a 1 ms clip has ended");
+        sb.track_playing(&SoundEv::Stopped { by: Some(7) });
+        assert!(!sb.is_playing(1, Some(7)) && sb.is_playing(1, None));
+        sb.track_playing(&SoundEv::Stopped { by: None });
+        assert_eq!(sb.playing_now().count(), 0);
+    }
+
+    #[test]
+    fn a_click_elsewhere_closes_the_panel() {
+        use egui::Order;
+        let panel = Rect::from_min_size(Pos2::new(340.0, 60.0), Vec2::new(404.0, 300.0));
+        let chat = Pos2::new(200.0, 200.0);
+        assert!(closes_panel(chat, panel, Some(Order::Background), true, false), "on the chat beside it");
+        assert!(closes_panel(chat, panel, None, true, false));
+        assert!(closes_panel(chat, panel, Some(Order::Middle), true, false), "on another window");
+        assert!(!closes_panel(Pos2::new(500.0, 200.0), panel, Some(Order::Middle), true, false), "inside it (a tile, Parar)");
+        assert!(!closes_panel(chat, panel, Some(Order::Background), false, false), "the click that opened it");
+        assert!(!closes_panel(chat, panel, Some(Order::Background), true, true), "a dialog of its own is open");
+        assert!(!closes_panel(chat, panel, Some(Order::Foreground), true, false), "a tile's menu over the chat");
+        assert!(!closes_panel(chat, panel, Some(Order::Tooltip), true, false));
+    }
+
+    #[test]
+    fn play_refusals_are_recognised() {
+        assert!(is_play_refusal(vox_proto::ERR_SOUND_RATE_LIMITED) && is_play_refusal(vox_proto::ERR_SOUND_SERVER_MUTED));
+        assert!(!is_play_refusal("invalid event"));
     }
 
     #[test]

@@ -97,6 +97,10 @@ pub struct ReplyRef {
     /// The original was deleted: show "mensagem apagada".
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deleted: bool,
+    /// E2: the original is an end-to-end encrypted DM line: no excerpt from the hub, the app fills
+    /// it from the line it decrypted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sealed: bool,
 }
 
 impl ReplyRef {
@@ -344,7 +348,7 @@ mod tests {
     #[test]
     fn a_plain_message_is_byte_identical_to_v070() {
         assert_eq!(serde_json::to_string(&msg()).unwrap(), r#"{"id":9,"channel_id":2,"author":{"id":3,"username":"Tati"},"content":"@Joao olha","created_at_ms":4}"#);
-        let line = DmMessage { id: 1, dm_id: 2, author: User::new(3, "a"), content: "oi".into(), created_at_ms: 4, kind: DmMessageKind::Text, call_secs: 0, attachments: vec![], reply: None, reactions: vec![] };
+        let line = DmMessage { id: 1, dm_id: 2, author: User::new(3, "a"), content: "oi".into(), created_at_ms: 4, kind: DmMessageKind::Text, call_secs: 0, attachments: vec![], reply: None, reactions: vec![], sealed: None, sealed_attachments: vec![] };
         assert_eq!(serde_json::to_string(&line).unwrap(), r#"{"id":1,"dm_id":2,"author":{"id":3,"username":"a"},"content":"oi","created_at_ms":4}"#);
         assert_eq!(
             serde_json::to_string(&crate::ClientEvent::SendMessage { channel_id: 1, content: "oi".into(), mentions: vec![], reply_to: None, reply_mention: false }).unwrap(),
@@ -402,7 +406,7 @@ mod tests {
         let mut m = msg();
         m.mentions = vec![5, 6];
         m.mention_everyone = true;
-        m.reply = Some(ReplyRef { id: 3, author: Some(User::new(5, "Joao")), excerpt: "oi".into(), images: 1, deleted: false });
+        m.reply = Some(ReplyRef { id: 3, author: Some(User::new(5, "Joao")), excerpt: "oi".into(), images: 1, deleted: false, sealed: false });
         m.reactions = vec![Reaction { emoji: "👍".into(), users: vec![5] }];
         let json = serde_json::to_string(&ServerEvent::MessageCreated { message: m.clone() }).unwrap();
         assert!(json.contains(r#""mentions":[5,6],"mention_everyone":true,"reply":{"id":3,"author":{"id":5,"username":"Joao"},"excerpt":"oi","images":1},"reactions":[{"emoji":"👍","users":[5]}]"#), "{json}");
@@ -413,7 +417,7 @@ mod tests {
         assert!(message.mentions_me(5) && message.mentions_me(7), "@todos reaches everybody");
         assert!(!message.mentions_me(3), "never my own message");
         // A DM reply reads as a plain line in the old app.
-        let line = DmMessage { id: 1, dm_id: 2, author: User::new(3, "a"), content: "oi".into(), created_at_ms: 4, kind: DmMessageKind::Text, call_secs: 0, attachments: vec![], reply: Some(ReplyRef::gone(7)), reactions: vec![] };
+        let line = DmMessage { id: 1, dm_id: 2, author: User::new(3, "a"), content: "oi".into(), created_at_ms: 4, kind: DmMessageKind::Text, call_secs: 0, attachments: vec![], reply: Some(ReplyRef::gone(7)), reactions: vec![], sealed: None, sealed_attachments: vec![] };
         let json = serde_json::to_string(&ServerEvent::DmMessageCreated { message: line }).unwrap();
         assert!(json.contains(r#""reply":{"id":7,"deleted":true}"#), "{json}");
         assert!(matches!(serde_json::from_str::<v070::ServerEvent>(&json), Ok(v070::ServerEvent::DmMessageCreated { .. })));
@@ -431,7 +435,7 @@ mod tests {
             r#"{"type":"reaction_changed","channel_id":1,"message_id":2,"emoji":"🎉","user_id":3,"added":true}"#
         );
         // `Ready` with the feature flags still parses in the old shape.
-        let ready = ServerEvent::Ready { user: User::new(1, "a"), channels: vec![], online: vec![], voice: vec![], account: None, chat: Some(ChatFeatures::ALL), server_id: None };
+        let ready = ServerEvent::Ready { user: User::new(1, "a"), channels: vec![], online: vec![], voice: vec![], account: None, chat: Some(ChatFeatures::ALL), server_id: None, stream_previews: false, e2ee: false };
         let json = serde_json::to_string(&ready).unwrap();
         assert!(json.contains(r#""chat":{"mentions":true,"replies":true,"reactions":true,"private_channels":true}"#), "{json}");
         assert!(matches!(serde_json::from_str::<v070::ServerEvent>(&json), Ok(v070::ServerEvent::Ready { .. })));

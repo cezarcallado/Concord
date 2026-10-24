@@ -12,6 +12,7 @@ pub mod host;
 pub mod pattern;
 pub mod publish;
 pub mod share_preview;
+pub mod thumbnail;
 pub mod viewer;
 #[cfg(windows)]
 mod viewer_native;

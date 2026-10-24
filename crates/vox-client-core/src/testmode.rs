@@ -21,6 +21,26 @@ pub fn background() -> bool {
     *ON.get_or_init(|| std::env::var(ENV).is_ok_and(|v| v == "1"))
 }
 
+/// In test mode, a Go Live may only capture the `test_window` example, this app's own window or a
+/// synthetic source (pattern, file, tone): never a real screen, the PC's sound or somebody's app.
+/// `VOX_TEST_ALLOW_REAL_CAPTURE=1` lifts that for a person running a test by hand at their PC.
+pub const ALLOW_REAL_CAPTURE_ENV: &str = "VOX_TEST_ALLOW_REAL_CAPTURE";
+
+/// Must a test refuse real screens, real windows and the PC's sound right now?
+pub fn guards_real_capture() -> bool {
+    background() && !std::env::var(ALLOW_REAL_CAPTURE_ENV).is_ok_and(|v| v == "1")
+}
+
+/// The exe names (lowercase, without `.exe`) a test may capture besides this process.
+pub const TEST_CAPTURE_EXES: &[&str] = &["test_window"];
+
+/// Is `exe_name` (`chrome.exe`, `test_window`...) one of [`TEST_CAPTURE_EXES`]?
+pub fn is_test_capture_exe(exe_name: &str) -> bool {
+    let n = exe_name.trim().to_lowercase();
+    let n = n.strip_suffix(".exe").unwrap_or(&n);
+    TEST_CAPTURE_EXES.contains(&n)
+}
+
 /// Make a top-level window one that never activates, and put it behind every other window (no
 /// activation, position and size kept). `taskbar`: keep its taskbar button (`WS_EX_APPWINDOW`).
 #[cfg(windows)]

@@ -571,8 +571,16 @@ impl App {
 
     // ------------------------------------------------------------ drawing
 
-    /// The menu's content. Also usable inside any menu-like `Ui`.
+    /// The menu's content. Also usable inside any menu-like `Ui`. I6: it scrolls when the app's
+    /// window is shorter than the menu (a stage card's menu is long), so no item is out of reach.
     pub(crate) fn person_menu_ui(&mut self, ui: &mut egui::Ui, user: &User, origin: Origin, lead: Lead, pos: Pos2) {
+        let max_h = (ui.ctx().content_rect().height() - 24.0).max(120.0);
+        egui::ScrollArea::vertical().id_salt("person_menu_scroll").max_height(max_h).auto_shrink([true, true]).show(ui, |ui| {
+            self.person_menu_body(ui, user, origin, lead, pos);
+        });
+    }
+
+    fn person_menu_body(&mut self, ui: &mut egui::Ui, user: &User, origin: Origin, lead: Lead, pos: Pos2) {
         let f = self.menu_facts(user, origin, lead);
         let mut list = rows(&f);
         ui.set_min_width(250.0);

@@ -180,7 +180,7 @@ impl App {
         }
         // Camera.
         let (icon, text, look, hover, enabled) = match &self.voice.camera {
-            CameraUi::Off if crate::platform::camera_soon() => (ph::VIDEO_CAMERA_SLASH, "", Look::Normal, format!("Câmera: {}", crate::platform::SOON_MAC.to_lowercase()), false),
+            CameraUi::Off if crate::platform::camera_soon() => (ph::VIDEO_CAMERA_SLASH, "", Look::Normal, format!("Câmera: {}", crate::platform::SOON_MAC_LC), false),
             CameraUi::Off => (ph::VIDEO_CAMERA_SLASH, "", Look::Normal, "Ligar a câmera (escolha a câmera e a qualidade em Configurações)".to_string(), true),
             CameraUi::Starting => (ph::VIDEO_CAMERA, "Ligando...", Look::Normal, String::new(), false),
             CameraUi::On { encoder, info } => (ph::VIDEO_CAMERA, "", Look::On, format!("Câmera ligada: {info} · {}\nClique para desligar", encoder_label(encoder)), true),
@@ -193,7 +193,7 @@ impl App {
             Share::Off => {
                 let text = if fold >= 1 { "" } else { "Transmitir" };
                 let soon = crate::platform::screen_soon();
-                let hover = if soon { format!("Transmitir: {}", crate::platform::SOON_MAC.to_lowercase()) } else { "Transmitir uma janela, a tela inteira ou só o áudio de um app".to_string() };
+                let hover = if soon { format!("Transmitir: {}", crate::platform::SOON_MAC_LC) } else { "Transmitir uma janela, a tela inteira ou só o áudio de um app".to_string() };
                 if dock_button(ui, ph::SCREENCAST, text, Look::Primary, !soon, &hover).clicked() {
                     self.open_golive();
                 }

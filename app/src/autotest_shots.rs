@@ -1,7 +1,8 @@
 //! Screenshots for design review (v1.0), a child module of `autotest`.
 //!
 //! - `kit`: no server; the `ui_kit` gallery fills the window (saved twice: the top, then
-//!   scrolled to the end), held for `--hold` seconds. Also `--autotest idle --show kit` (connected, the gallery over it).
+//!   scrolled to the end), then Configurações → Notificações (`settings-notificacoes`), and the
+//!   gallery again, held for `--hold` seconds. Also `--autotest idle --show kit` (connected, the gallery over it).
 //! - `shots`: the main screens one after the other: the home screen, the call view (with whoever
 //!   else is in the first voice room, e.g. a `cam-a` partner with its camera on), a text channel's
 //!   chat with a few messages, and the settings dialog. Passes once it has gone through them.
@@ -42,11 +43,11 @@ fn log(what: &str) {
 /// screens at another window size or display scale, see [`window`].)
 pub(super) fn save(app: &App, name: &str) {
     let Some(dir) = std::env::var_os("VOX_AUTOTEST_SHOT_DIR") else { return };
-    let Some(hwnd) = app.video.parent else { return log("no window yet") };
+    let prefix = std::env::var("VOX_AUTOTEST_SHOT_PREFIX").unwrap_or_default();
+    let path = std::path::Path::new(&dir).join(format!("{prefix}{name}.png"));
     #[cfg(windows)]
     {
-        let prefix = std::env::var("VOX_AUTOTEST_SHOT_PREFIX").unwrap_or_default();
-        let path = std::path::Path::new(&dir).join(format!("{prefix}{name}.png"));
+        let Some(hwnd) = app.video.parent else { return log("no window yet") };
         match super::cliptest::capture::client(hwnd, false) {
             Some(img) => match img.save(&path) {
                 Ok(()) => log(&format!("saved {}", path.display())),
@@ -55,8 +56,49 @@ pub(super) fn save(app: &App, name: &str) {
             None => log(&format!("{name}: the capture failed")),
         }
     }
+    // macOS: `screencapture` needs the Screen Recording permission (a prompt), so the app keeps
+    // egui's picture of its own last frame ([`collect`]): what is on the screen now, before this
+    // pass changes anything (as the Windows capture sees it).
     #[cfg(not(windows))]
-    let _ = (dir, hwnd, name);
+    {
+        let _ = app;
+        let last = LAST_FRAME.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let Some(image) = last else { return log(&format!("{name}: no window picture yet")) };
+        let [w, h] = image.size;
+        let bytes: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
+        match image::RgbaImage::from_raw(w as u32, h as u32, bytes).map(|img| img.save(&path)) {
+            Some(Ok(())) => log(&format!("saved {}", path.display())),
+            Some(Err(e)) => log(&format!("could not save {}: {e}", path.display())),
+            None => log(&format!("{name}: the picture has the wrong size")),
+        }
+    }
+}
+
+/// macOS: the tag of the every-frame window picture (other modules' pictures carry a name).
+#[cfg(not(windows))]
+struct FrameShot;
+
+/// macOS: the window's last frame, as egui handed it back.
+#[cfg(not(windows))]
+static LAST_FRAME: std::sync::Mutex<Option<std::sync::Arc<egui::ColorImage>>> = std::sync::Mutex::new(None);
+
+/// macOS, every pass of an autotest with `VOX_AUTOTEST_SHOT_DIR`: keep the picture of the frame
+/// just shown and ask for the next one (see [`save`]).
+#[cfg(not(windows))]
+pub(super) fn collect(ctx: &egui::Context) {
+    if std::env::var_os("VOX_AUTOTEST_SHOT_DIR").is_none() {
+        return;
+    }
+    let got = ctx.input(|i| {
+        i.raw.events.iter().rev().find_map(|e| match e {
+            egui::Event::Screenshot { user_data, image, .. } if user_data.data.as_ref().is_some_and(|d| d.downcast_ref::<FrameShot>().is_some()) => Some(image.clone()),
+            _ => None,
+        })
+    });
+    if let Some(image) = got {
+        *LAST_FRAME.lock().unwrap_or_else(|p| p.into_inner()) = Some(image);
+    }
+    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(FrameShot)));
 }
 
 /// The window for design-review screenshots: its inner size in points (`VOX_AUTOTEST_WINDOW=900x600`,
@@ -105,9 +147,18 @@ impl Auto {
             }
             2 if self.shot_waited(2.0) => {
                 save(app, "kit-2");
-                self.shot_next(3, "holding the gallery");
+                // v1.1: Configurações → Notificações too ("Som dos avisos"; nothing is clicked).
+                app.kit = None;
+                app.open_settings_at(crate::app::SettingsPage::Notifications);
+                self.shot_next(3, "settings: Notificações");
             }
-            3 if self.shot_waited(self.args.hold_secs as f32) => return self.pass(),
+            3 if self.shot_waited(2.0) => {
+                save(app, "settings-notificacoes");
+                app.settings_ui.open = false;
+                app.kit = Some(Default::default());
+                self.shot_next(4, "holding the gallery");
+            }
+            4 if self.shot_waited(self.args.hold_secs as f32) => return self.pass(),
             _ => {}
         }
         None

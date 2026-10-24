@@ -181,10 +181,12 @@ impl Auto {
                 if together && Self::saw_message(app, &self.menu_tag("ready")) {
                     self.menu.cam = fake_camera() && app.voice.cameras.contains(&peer.to_string());
                     app.center = Center::Call;
-                    // (For a screenshot the live is this window, never the desktop.)
-                    let pick = match (self.menu_hold() > 0, app.video.parent) {
-                        (true, Some(hwnd)) => Pick::Window(hwnd),
-                        _ => Pick::Monitor(0),
+                    // (For a screenshot the live is this window; otherwise the gate's test window
+                    // (`--hwnd`). Never the person's desktop.)
+                    let pick = match (self.menu_hold() > 0, app.video.parent, self.args.hwnd) {
+                        (true, Some(hwnd), _) => Pick::Window(hwnd),
+                        (_, _, Some(hwnd)) => Pick::Window(hwnd),
+                        _ => return self.fail("no test window to share (--hwnd)"),
                     };
                     app.start_share(pick, Preset::P1080p30, false);
                     self.goto(3, "B is live in my room; sharing the screen");

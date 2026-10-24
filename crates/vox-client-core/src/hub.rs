@@ -21,13 +21,17 @@ use vox_proto::{
 
 mod attachments;
 mod dms;
+mod e2ee;
 mod invites;
 mod profile;
 mod sounds;
+mod stream_preview;
 pub use attachments::{AttachmentsReply, MAX_ATTACHMENT_DOWNLOAD_BYTES};
 pub use dms::DmsReply;
+pub use e2ee::RegisterReply as E2eeRegisterReply;
 pub use profile::ProfileReply;
 pub use sounds::{HttpStatusError, SoundsReply, MAX_SOUND_DOWNLOAD_BYTES};
+pub use stream_preview::{StreamPreviewData, StreamPreviewReply, UploadReply, MAX_STREAM_PREVIEW_ANSWER};
 
 /// A thumbnail is at most 400x225 JPEG (a few tens of KB); anything much bigger is not from a
 /// hub that follows the contract, and is not loaded.
@@ -65,28 +69,61 @@ pub struct HubClient {
     base: Url,
     http: reqwest::Client,
     token: RwLock<Option<String>>,
+    /// v1.1 (T0): pinned TLS (the pin, and the configuration the event socket uses too).
+    tls: Option<(crate::tls::Pin, std::sync::Arc<rustls::ClientConfig>)>,
 }
 
 impl HubClient {
+    /// A client for `base` as given (`http://` in the clear; an `https://` URL with the system's
+    /// certificate authorities). The app talks to hubs with [`HubClient::new_pinned`] whenever it
+    /// knows the hub's certificate.
     pub fn new(base: &str) -> Result<Self> {
+        Self::build(base, None)
+    }
+
+    /// v1.1 (T0): pinned TLS to the hub at `base` (saved as `http://host:port`: the scheme becomes
+    /// `https`, the event socket `wss`). Only the certificate whose SHA-256 is `pin` is accepted,
+    /// by every connection of this client (HTTP and the event socket); no redirects.
+    pub fn new_pinned(base: &str, pin: crate::tls::Pin) -> Result<Self> {
+        Self::build(base, Some(pin))
+    }
+
+    fn build(base: &str, pin: Option<crate::tls::Pin>) -> Result<Self> {
         let mut base = Url::parse(base).with_context(|| format!("invalid hub url {base:?}"))?;
         if !base.path().ends_with('/') {
             let p = format!("{}/", base.path());
             base.set_path(&p);
         }
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
             // The hub closes connections idle for 20 s (v0.6.2+): drop ours first, so a request
             // never goes out on a socket the hub is closing.
-            .pool_idle_timeout(Duration::from_secs(15))
-            .build()
-            .context("build http client")?;
-        Ok(Self { base, http, token: RwLock::new(None) })
+            .pool_idle_timeout(Duration::from_secs(15));
+        let tls = match pin {
+            Some(pin) => {
+                if base.scheme() == "http" {
+                    base.set_scheme("https").map_err(|_| anyhow!("cannot use TLS for {base}"))?;
+                }
+                if base.scheme() != "https" {
+                    bail!("pinned TLS needs an http(s) hub url, not {base}");
+                }
+                builder = builder.use_preconfigured_tls(crate::tls::client_config(pin)).https_only(true).redirect(reqwest::redirect::Policy::none());
+                Some((pin, std::sync::Arc::new(crate::tls::client_config(pin))))
+            }
+            None => None,
+        };
+        let http = builder.build().context("build http client")?;
+        Ok(Self { base, http, token: RwLock::new(None), tls })
     }
 
     pub fn base_url(&self) -> &Url {
         &self.base
+    }
+
+    /// v1.1 (T0): the pinned certificate, when this client talks TLS ([`HubClient::new_pinned`]).
+    pub fn tls_pin(&self) -> Option<crate::tls::Pin> {
+        self.tls.as_ref().map(|(p, _)| *p)
     }
 
     pub fn token(&self) -> Option<String> {
@@ -238,6 +275,19 @@ impl HubClient {
         self.post::<_, OkResponse>("channel access", &format!("api/admin/channels/{id}/access"), &ChannelAccessRequest { private }).await.map(|_| ())
     }
 
+    /// v1.1 (E1): `GET /api/channels/{id}/e2ee` (Admin and up): whether the voice channel's calls
+    /// are end-to-end encrypted and who could not enter (no device with keys).
+    pub async fn channel_e2ee(&self, id: ChannelId) -> Result<vox_proto::ChannelE2eeResponse> {
+        let resp = self.auth(self.http.get(self.url(&format!("api/channels/{id}/e2ee"))?))?.send().await.context("channel e2ee request")?;
+        Self::parse("channel e2ee", resp).await
+    }
+
+    /// v1.1 (E1): `POST /api/channels/{id}/e2ee`: turn them on or off. Only in an empty room: the
+    /// error then contains [`vox_proto::ERR_ROOM_OCCUPIED`].
+    pub async fn set_channel_e2ee(&self, id: ChannelId, on: bool) -> Result<vox_proto::ChannelE2eeResponse> {
+        self.post("channel e2ee", &format!("api/channels/{id}/e2ee"), &vox_proto::ChannelE2eeRequest { on }).await
+    }
+
     /// `POST /api/admin/channels/{id}/rename`
     pub async fn rename_channel(&self, id: ChannelId, name: &str) -> Result<()> {
         self.post::<_, OkResponse>("rename channel", &format!("api/admin/channels/{id}/rename"), &ChannelRenameRequest { name: name.to_string() })
@@ -367,7 +417,15 @@ impl HubClient {
 
     /// `POST /api/voice/{channel_id}/join`
     pub async fn voice_join(&self, channel: ChannelId) -> Result<VoiceJoinResponse> {
-        let url = self.url(&format!("api/voice/{channel}/join"))?;
+        self.voice_join_with(channel, false).await
+    }
+
+    /// v1.1 (E1): [`HubClient::voice_join`] saying whether this app can encrypt the room's media
+    /// (`?e2ee=1`); an encrypted room refuses a join without it (`403`
+    /// [`vox_proto::ERR_E2EE_REQUIRED`]) and answers [`VoiceJoinResponse::e2ee`] with it.
+    pub async fn voice_join_with(&self, channel: ChannelId, e2ee: bool) -> Result<VoiceJoinResponse> {
+        let q = if e2ee { "?e2ee=1" } else { "" };
+        let url = self.url(&format!("api/voice/{channel}/join{q}"))?;
         let resp = self.auth(self.http.post(url))?.send().await.context("voice join request")?;
         Self::parse("voice join", resp).await
     }
@@ -388,7 +446,7 @@ impl HubClient {
         let url = self.ws_url()?;
         let (out_tx, out_rx) = mpsc::channel::<ClientEvent>(64);
         let (ev_tx, ev_rx) = mpsc::channel::<HubEvent>(256);
-        tokio::spawn(ws_loop(url, out_rx, ev_tx));
+        tokio::spawn(ws_loop(url, out_rx, ev_tx, self.tls.as_ref().map(|(_, c)| c.clone())));
         Ok((HubSender { tx: out_tx }, ev_rx))
     }
 }
@@ -456,7 +514,7 @@ impl Backoff {
 const PING_EVERY: Duration = Duration::from_secs(20);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(65);
 
-async fn ws_loop(url: Url, mut out_rx: mpsc::Receiver<ClientEvent>, ev_tx: mpsc::Sender<HubEvent>) {
+async fn ws_loop(url: Url, mut out_rx: mpsc::Receiver<ClientEvent>, ev_tx: mpsc::Sender<HubEvent>, tls: Option<std::sync::Arc<rustls::ClientConfig>>) {
     let mut backoff = Backoff::new(Duration::from_millis(500), Duration::from_secs(30));
     let safe_url = {
         let mut u = url.clone();
@@ -464,8 +522,15 @@ async fn ws_loop(url: Url, mut out_rx: mpsc::Receiver<ClientEvent>, ev_tx: mpsc:
         u.to_string()
     };
     loop {
+        // v1.1 (T0): over pinned TLS, never the default (web PKI) connector.
+        let connecting = async {
+            match &tls {
+                Some(cfg) => tokio_tungstenite::connect_async_tls_with_config(url.as_str(), None, true, Some(tokio_tungstenite::Connector::Rustls(cfg.clone()))).await,
+                None => tokio_tungstenite::connect_async(url.as_str()).await,
+            }
+        };
         let attempt = tokio::select! {
-            r = tokio_tungstenite::connect_async(url.as_str()) => r,
+            r = connecting => r,
             _ = ev_tx.closed() => return,
         };
         match attempt {

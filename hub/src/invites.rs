@@ -345,6 +345,8 @@ fn hints(s: &AppState, headers: &HeaderMap) -> InviteHints {
         public_host: if useless { String::new() } else { public.to_string() },
         lan_ipv4: lan.map(|(ip, _)| ip),
         lan_prefix: lan.map_or(0, |(_, p)| p),
+        // v1.1 (T0): the code carries the certificate's pin (layout 2).
+        tls_pin: s.tls_pin.get().map(vox_proto::tls_pin_hex),
     }
 }
 

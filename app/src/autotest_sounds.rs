@@ -9,6 +9,13 @@
 //!   RMS is logged), that being deafened or having the soundboard muted plays nothing, that it sees
 //!   the rename, and that it is not allowed to delete A's sound.
 //!
+//! - v1.1, both: the ring and the stop. A plays the remaining sound; A's own ring and B's ring
+//!   for A stay lit for about the clip's length (nobody has a microphone here: only the
+//!   soundboard can light them). Then A plays it again and presses "Parar" 300 ms in: A's ring and
+//!   B's go off at once, and both mixers (pulled in real time) stop well before the clip's end.
+//!   Last, A opens the "Sons" panel: a click on it keeps it open, one on the chat beside it
+//!   closes it (it lies over the chat and takes its mouse wheel).
+//!
 //! - `sound-trim`: one process, the trim editor. It generates a 20 s file of tone bursts, opens the
 //!   "Adicionar som" dialog on it, checks the editor's read (duration, the default selection is
 //!   the loudest 5 s), selects 3.2 s inside a burst (5 s is the most a selection can ever be),
@@ -24,6 +31,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use eframe::egui;
 use vox_proto::SoundId;
 
 use super::Auto;
@@ -51,7 +59,14 @@ pub struct State {
     add_shown: bool,
     /// `sound-trim`: how many sounds the hub had before the upload.
     base: usize,
+    /// v1.1 ring / stop phase: when the ring (A's own, or A's as B sees it) came on.
+    lit_at: Option<Instant>,
 }
+
+/// The ring of a 0.9 s clip stays lit for about that long (100 ms ticks, event delivery).
+const RING_MS: std::ops::RangeInclusive<u128> = 600..=2000;
+/// A clip stopped 300 ms in: the ring and the mix end well before its 0.9 s.
+const STOPPED_MS: u32 = 750;
 
 /// The mixer has no device: the backend measures what it mixes (`SoundEv::MixerHeard`).
 fn headless() -> bool {
@@ -60,6 +75,29 @@ fn headless() -> bool {
 
 fn log(what: &str) {
     tracing::info!(target: "autotest", "AUTOTEST soundboard: {what}");
+}
+
+/// A primary click at `at`, handed to egui on its next pass as if the window had it: never
+/// through the system, so the user's real pointer and the foreground are untouched.
+#[derive(Default)]
+struct Clicks(Vec<egui::Event>);
+
+impl egui::Plugin for Clicks {
+    fn debug_name(&self) -> &'static str {
+        "sound_clicks"
+    }
+
+    fn input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        input.events.append(&mut self.0);
+    }
+}
+
+fn click(ctx: &egui::Context, at: egui::Pos2) {
+    let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+    // (Added once: a second add is ignored.)
+    ctx.add_plugin(Clicks::default());
+    ctx.with_plugin(|p: &mut Clicks| p.0.extend([egui::Event::PointerMoved(at), button(true), button(false)]));
+    ctx.request_repaint();
 }
 
 /// 0.4 s of silence, 0.9 s of a 440 Hz sine, 0.4 s of silence; 44.1 kHz, stereo with different
@@ -328,10 +366,102 @@ impl Auto {
                     if name != "bipe novo" {
                         return self.fail(&format!("the remaining sound is {name:?}"));
                     }
-                    self.snd_say(app, "a-done");
-                    self.goto(15, "done");
+                    self.goto(30, "ring and stop phase");
                 } else if self.waited(40) {
                     return self.fail("B never saw the delete");
+                }
+            }
+            30 => {
+                if self.snd_saw(app, "b-ring-ready") && self.snd_can_play() {
+                    let id = self.sound.ids[0];
+                    self.snd_play(app, id);
+                    self.sound.lit_at = None;
+                    self.goto(31, "played; my ring must stay lit for the whole sound");
+                } else if self.waited(40) {
+                    return self.fail("B never got ready for the ring check");
+                }
+            }
+            31 => {
+                let lit = app.sending_voice();
+                match (lit, self.sound.lit_at) {
+                    (true, None) => self.sound.lit_at = Some(Instant::now()),
+                    (false, Some(t)) => {
+                        let ms = t.elapsed().as_millis();
+                        log(&format!("my own ring was lit for {ms} ms (clip 0.9 s)"));
+                        if !RING_MS.contains(&ms) {
+                            return self.fail(&format!("my ring was lit for {ms} ms, expected {RING_MS:?}"));
+                        }
+                        self.goto(32, "own ring ok");
+                    }
+                    _ => {}
+                }
+                if self.waited(10) {
+                    return self.fail(&format!("my ring did not follow my sound (lit at {:?})", self.sound.lit_at));
+                }
+            }
+            32 => {
+                if self.snd_saw(app, "b-ring-ok") && self.snd_can_play() {
+                    self.sound.mix_before = app.sb.mixer_heard.len();
+                    let id = self.sound.ids[0];
+                    self.snd_play(app, id);
+                    self.sound.lit_at = None;
+                    self.goto(33, "played again; stopping it 300 ms in");
+                } else if self.waited(40) {
+                    return self.fail("B never confirmed my ring");
+                }
+            }
+            33 => {
+                if app.sending_voice() && self.step_at.elapsed() >= Duration::from_millis(300) {
+                    app.stop_sounds();
+                    self.sound.lit_at = Some(Instant::now());
+                    self.goto(34, "pressed Parar");
+                } else if self.waited(5) {
+                    return self.fail("my ring did not light for the second play");
+                }
+            }
+            34 => {
+                let off = !app.sending_voice();
+                let mine = app.sb.mixer_heard.get(self.sound.mix_before).copied();
+                let mix_done = !headless() || mine.is_some();
+                if off && mix_done && self.snd_saw(app, "b-stopped") {
+                    if let Some(h) = mine {
+                        log(&format!("my mixer played {} ms of the stopped 0.9 s clip", h.3));
+                        if h.3 > STOPPED_MS {
+                            return self.fail(&format!("the stopped clip played {} ms here", h.3));
+                        }
+                    }
+                    if app.sb.playing_now().next().is_some() {
+                        return self.fail("the panel still lists a playing sound after Parar");
+                    }
+                    app.sb.open = true;
+                    self.goto(35, "panel open; a click inside keeps it, one beside it closes it");
+                } else if self.waited(20) {
+                    return self.fail(&format!("stop not confirmed: ring off {off}, my mix {mine:?}, B stopped {}", self.snd_saw(app, "b-stopped")));
+                }
+            }
+            35 | 36 if self.step_at.elapsed() >= Duration::from_millis(500) => {
+                let ctx = app.repaint_ctx();
+                let Some(panel) = ctx.memory(|m| m.area_rect(egui::Id::new("soundboard_panel"))) else {
+                    return self.fail("the panel is not on screen");
+                };
+                if self.step == 35 {
+                    // On its title (no button there), then the chat just left of it.
+                    click(&ctx, panel.left_top() + egui::vec2(30.0, 22.0));
+                    self.goto(36, "clicked inside the panel");
+                } else if !app.sb.open {
+                    return self.fail("a click inside the panel closed it");
+                } else {
+                    click(&ctx, egui::pos2(panel.left() - 24.0, panel.center().y));
+                    self.goto(37, "clicked beside the panel");
+                }
+            }
+            37 => {
+                if !app.sb.open {
+                    log("a click beside the soundboard panel closed it; one inside did not");
+                    self.snd_say(app, "a-done");
+                    self.goto(15, "done");
+                } else if self.waited(5) {
+                    return self.fail("a click beside the soundboard panel did not close it");
                 }
             }
             // `--show panel`: five sounds in the panel, open, with a play every few seconds (the
@@ -534,9 +664,63 @@ impl Auto {
             15 => {
                 if app.sb.sounds.len() == 1 {
                     self.snd_say(app, "b-sees-delete");
-                    self.goto(16, "saw the delete; waiting for A");
+                    self.goto(30, "saw the delete; the ring and stop phase");
                 } else if self.waited(60) {
                     return self.fail("A's delete never arrived");
+                }
+            }
+            30 => {
+                self.sound.lit_at = None;
+                self.snd_say(app, "b-ring-ready");
+                self.goto(31, "waiting for A's sound to light A's ring");
+            }
+            31 | 33 => {
+                let a = app.sb.sounds.first().map(|s| s.uploader.id.to_string()).unwrap_or_default();
+                let lit = app.voice.speaking.contains(&a);
+                match (lit, self.sound.lit_at) {
+                    (true, None) => {
+                        self.sound.lit_at = Some(Instant::now());
+                        // The measurement of the first play is long done: what comes next is this one's.
+                        self.sound.mix_before = app.sb.mixer_heard.len();
+                    }
+                    (false, Some(t)) => {
+                        let ms = t.elapsed().as_millis();
+                        if self.step == 31 {
+                            log(&format!("A's ring was lit here for {ms} ms (clip 0.9 s)"));
+                            if !RING_MS.contains(&ms) {
+                                return self.fail(&format!("A's ring was lit for {ms} ms, expected {RING_MS:?}"));
+                            }
+                            self.sound.lit_at = None;
+                            self.snd_say(app, "b-ring-ok");
+                            self.goto(33, "A's ring ok; waiting for the play A stops");
+                        } else {
+                            log(&format!("A's stopped sound: ring lit here for {ms} ms"));
+                            if ms > STOPPED_MS as u128 {
+                                return self.fail(&format!("A stopped the sound but the ring stayed {ms} ms"));
+                            }
+                            self.goto(34, "A's ring went off with the stop");
+                        }
+                    }
+                    _ => {}
+                }
+                if self.waited(20) {
+                    return self.fail(&format!("A's ring did not follow A's sound (step {}, lit at {:?})", self.step, self.sound.lit_at));
+                }
+            }
+            34 => {
+                // The measurement of the stopped clip (the first one's ended long ago).
+                let last = app.sb.mixer_heard.last().copied().filter(|_| app.sb.mixer_heard.len() > self.sound.mix_before);
+                if !headless() || last.is_some() {
+                    if let Some(h) = last {
+                        log(&format!("my mixer played {} ms of A's stopped 0.9 s clip", h.3));
+                        if h.3 > STOPPED_MS {
+                            return self.fail(&format!("A stopped the sound but {} ms of it played here", h.3));
+                        }
+                    }
+                    self.snd_say(app, "b-stopped");
+                    self.goto(16, "the stop reached me; waiting for A");
+                } else if self.waited(20) {
+                    return self.fail("the stopped sound was never measured");
                 }
             }
             16 => {

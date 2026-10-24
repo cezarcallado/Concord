@@ -78,8 +78,26 @@ fn is_openable(url: &str) -> bool {
         && !url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"')
 }
 
-/// Render a chat message: plain text and clickable links, wrapping like a normal label.
+/// Render text with clickable links (a profile's bio), wrapping like a normal label. A right
+/// click on a link opens its own small menu (Copiar link / Abrir link).
 pub fn message(ui: &mut egui::Ui, content: &str) {
+    text_with_links(ui, content, Within::Alone);
+}
+
+/// Render a chat message: like [`message`], but a right click on a link is left to the message's
+/// own menu, which then offers that link (`take_right_clicked`).
+pub fn chat_message(ui: &mut egui::Ui, content: &str) {
+    text_with_links(ui, content, Within::Message);
+}
+
+/// Where a link is drawn: on its own (its own menu) or in a chat message (the message's menu).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Within {
+    Alone,
+    Message,
+}
+
+fn text_with_links(ui: &mut egui::Ui, content: &str, within: Within) {
     if find_link_start(content).is_none() {
         ui.label(content);
         return;
@@ -93,15 +111,74 @@ pub fn message(ui: &mut egui::Ui, content: &str) {
                         ui.label(t);
                     }
                     Segment::Link { shown, url } => {
-                        let resp = ui.link(shown).on_hover_text(&url);
-                        if resp.clicked() {
-                            open_url(&url);
-                        }
+                        link(ui, shown, &url, within);
                     }
                 }
             }
         });
     }
+}
+
+/// One link: a click opens it; a right click opens its menu ([`Within::Alone`]) or tells the
+/// message's menu which link it was opened on ([`Within::Message`]).
+pub fn link(ui: &mut egui::Ui, shown: &str, url: &str, within: Within) -> egui::Response {
+    let resp = ui.link(shown).on_hover_text(url);
+    if resp.clicked() {
+        open_url(url);
+    }
+    match within {
+        Within::Message => {
+            if resp.secondary_clicked() {
+                note_right_clicked(ui.ctx(), url);
+            }
+        }
+        Within::Alone => {
+            egui::Popup::context_menu(&resp).frame(crate::ui_kit::popup_frame(ui.style())).style(crate::ui_kit::menu_style).show(|ui| {
+                ui.set_min_width(200.0);
+                ui.set_max_width(230.0);
+                menu_items(ui, url);
+            });
+        }
+    }
+    resp
+}
+
+/// The link entries of a menu: "Copiar link" and "Abrir link".
+pub fn menu_items(ui: &mut egui::Ui, url: &str) {
+    use crate::theme::ph;
+    use crate::ui_kit::menu_row;
+    if menu_row(ui, ph::LINK, "Copiar link", false).on_hover_text(url).clicked() {
+        ui.ctx().copy_text(url.to_string());
+        tracing::info!("link menu: link copied");
+        ui.close();
+    }
+    if menu_row(ui, ph::ARROW_SQUARE_OUT, "Abrir link", false).clicked() {
+        open_url(url);
+        ui.close();
+    }
+}
+
+fn right_clicked_id() -> egui::Id {
+    egui::Id::new("chat_link_right_clicked")
+}
+
+/// A link in a chat message was right-clicked this frame (its message's menu offers it).
+pub fn note_right_clicked(ctx: &egui::Context, url: &str) {
+    let frame = ctx.cumulative_frame_nr();
+    ctx.data_mut(|d| d.insert_temp(right_clicked_id(), (url.to_string(), frame)));
+}
+
+/// The link right-clicked this frame, if any (taken: the message's menu opening now gets it).
+pub fn take_right_clicked(ctx: &egui::Context) -> Option<String> {
+    let frame = ctx.cumulative_frame_nr();
+    ctx.data_mut(|d| {
+        let v = d.get_temp::<(String, u64)>(right_clicked_id());
+        if v.is_some() {
+            d.remove::<(String, u64)>(right_clicked_id());
+        }
+        // (Only this frame's: an older one belongs to a menu that never opened.)
+        v.filter(|(_, f)| *f == frame).map(|(u, _)| u)
+    })
 }
 
 /// The distinct links of a message, in order, at most `max` (the preview cards under it).

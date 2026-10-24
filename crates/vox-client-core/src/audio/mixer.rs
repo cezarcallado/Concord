@@ -131,6 +131,23 @@ struct UiVoice {
     samples: Arc<[i16]>,
     pos: usize,
     gain: f32,
+    /// A soundboard preview ("Ouvir só aqui"), which "Parar" stops; alerts are never stopped.
+    preview: bool,
+    /// Frames left of a stop's fade-out.
+    fade: Option<usize>,
+}
+
+/// Who started a soundboard clip: the player's user id (the hub's `SoundPlayed::by`), so a stop
+/// can name whose sounds end.
+pub type SoundTag = i64;
+/// The tag of a clip nobody is known to have started.
+pub const NO_TAG: SoundTag = i64::MIN;
+/// A stopped clip fades out over this many frames (5 ms at 48 kHz) instead of being cut: no click.
+pub const STOP_FADE_FRAMES: usize = 240;
+
+/// Gain of frame `i` of a block for a fade-out with `left` frames to go (1.0 down to 1/FADE).
+fn fade_gain(left: usize, i: usize) -> f32 {
+    left.saturating_sub(i) as f32 / STOP_FADE_FRAMES as f32
 }
 
 /// At most this many alert sounds overlap; further ones are dropped (a flood cannot pile up).
@@ -142,6 +159,9 @@ struct SoundVoice {
     channels: usize,
     /// Next frame to play.
     pos: usize,
+    tag: SoundTag,
+    /// Frames left of a stop's fade-out ([`Mixer::stop_sounds`]).
+    fade: Option<usize>,
 }
 
 impl SoundVoice {
@@ -239,8 +259,30 @@ impl Mixer {
         if g.ui.len() >= MAX_UI_VOICES || samples.is_empty() {
             return false;
         }
-        g.ui.push(UiVoice { samples, pos: 0, gain: clamp_gain(gain) });
+        g.ui.push(UiVoice { samples, pos: 0, gain: clamp_gain(gain), preview: false, fade: None });
         true
+    }
+
+    /// A soundboard preview: an alert-like sound (it survives deafen) that
+    /// [`Mixer::stop_previews`] can stop.
+    pub fn play_preview(&self, samples: Arc<[i16]>, gain: f32) -> bool {
+        let mut g = self.inner.lock();
+        if g.ui.len() >= MAX_UI_VOICES || samples.is_empty() {
+            return false;
+        }
+        g.ui.push(UiVoice { samples, pos: 0, gain: clamp_gain(gain), preview: true, fade: None });
+        true
+    }
+
+    /// Fade out every playing preview (5 ms). Returns how many were playing.
+    pub fn stop_previews(&self) -> usize {
+        let mut g = self.inner.lock();
+        let mut n = 0;
+        for v in g.ui.iter_mut().filter(|v| v.preview && v.fade.is_none()) {
+            v.fade = Some(STOP_FADE_FRAMES);
+            n += 1;
+        }
+        n
     }
 
     /// The soundboard's volume and mute (flipped from any thread; the mix ramps to the change).
@@ -253,6 +295,11 @@ impl Mixer {
     /// is dropped when it ends. Returns false (and plays nothing) for an empty clip, another
     /// channel count, or when [`MAX_SOUND_VOICES`] are already playing.
     pub fn play_sound(&self, samples: Arc<[i16]>, channels: usize) -> bool {
+        self.play_sound_by(samples, channels, NO_TAG)
+    }
+
+    /// [`Mixer::play_sound`] for a clip started by `tag` (see [`Mixer::stop_sounds`]).
+    pub fn play_sound_by(&self, samples: Arc<[i16]>, channels: usize, tag: SoundTag) -> bool {
         let mut g = self.inner.lock();
         if !(1..=2).contains(&channels) || samples.len() < channels || !samples.len().is_multiple_of(channels) || g.sounds.len() >= MAX_SOUND_VOICES {
             return false;
@@ -261,8 +308,42 @@ impl Mixer {
             // The first clip starts at the current gain (no fade-in from silence).
             g.sound_applied = self.sound_gain.effective();
         }
-        g.sounds.push(SoundVoice { samples, channels, pos: 0 });
+        g.sounds.push(SoundVoice { samples, channels, pos: 0, tag, fade: None });
         true
+    }
+
+    /// Stop the soundboard clips of `tag` (`None`: all of them): each fades out over
+    /// [`STOP_FADE_FRAMES`] in the next mix and is gone after it. Returns how many were playing.
+    pub fn stop_sounds(&self, tag: Option<SoundTag>) -> usize {
+        let mut g = self.inner.lock();
+        let mut n = 0;
+        for v in g.sounds.iter_mut().filter(|v| v.fade.is_none() && tag.is_none_or(|t| v.tag == t)) {
+            v.fade = Some(STOP_FADE_FRAMES);
+            n += 1;
+        }
+        n
+    }
+
+    /// Stop (5 ms fade) the newest playing copy of `samples` that `tag` started, and only it (a
+    /// play the hub refused, while an older sound of the same player goes on). Returns whether
+    /// one was playing.
+    pub fn stop_clip(&self, samples: &Arc<[i16]>, tag: SoundTag) -> bool {
+        let mut g = self.inner.lock();
+        match g.sounds.iter_mut().filter(|v| v.tag == tag && v.fade.is_none() && Arc::ptr_eq(&v.samples, samples)).min_by_key(|v| v.pos) {
+            Some(v) => {
+                v.fade = Some(STOP_FADE_FRAMES);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// How much longer the clips of `tag` play (the longest; `None`: none is playing or they
+    /// are all being stopped).
+    pub fn sound_left(&self, tag: SoundTag) -> Option<std::time::Duration> {
+        let g = self.inner.lock();
+        let frames = g.sounds.iter().filter(|v| v.tag == tag && v.fade.is_none()).map(|v| v.frames() - v.pos).max()?;
+        Some(std::time::Duration::from_millis((frames as u64 * 1000).div_ceil(MIX_RATE as u64)))
     }
 
     /// Soundboard clips still playing.
@@ -290,12 +371,25 @@ impl Mixer {
             return false;
         }
         for v in g.ui.iter_mut() {
-            let n = out.len().min(v.samples.len() - v.pos);
-            for (o, s) in out[..n].iter_mut().zip(&v.samples[v.pos..v.pos + n]) {
-                let mixed = *o as i32 + (*s as f32 * v.gain).round() as i32;
+            let mut n = out.len().min(v.samples.len() - v.pos);
+            if let Some(left) = v.fade {
+                n = n.min(left * MIX_CHANNELS);
+            }
+            for (k, (o, s)) in out[..n].iter_mut().zip(&v.samples[v.pos..v.pos + n]).enumerate() {
+                let gain = match v.fade {
+                    Some(left) => v.gain * fade_gain(left, k / MIX_CHANNELS),
+                    None => v.gain,
+                };
+                let mixed = *o as i32 + (*s as f32 * gain).round() as i32;
                 *o = mixed.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             }
             v.pos += n;
+            if let Some(left) = v.fade.as_mut() {
+                *left = left.saturating_sub(n / MIX_CHANNELS);
+                if *left == 0 {
+                    v.pos = v.samples.len();
+                }
+            }
         }
         g.ui.retain(|v| v.pos < v.samples.len());
         true
@@ -354,15 +448,27 @@ impl Mixer {
             let frames = out.len() / MIX_CHANNELS;
             let step = (to - from) / frames.max(1) as f32;
             for v in sounds.iter_mut() {
-                let n = frames.min(v.frames() - v.pos);
+                let mut n = frames.min(v.frames() - v.pos);
+                if let Some(left) = v.fade {
+                    n = n.min(left);
+                }
                 for i in 0..n {
-                    let gain = if from == to { to } else { from + step * i as f32 };
+                    let mut gain = if from == to { to } else { from + step * i as f32 };
+                    if let Some(left) = v.fade {
+                        gain *= fade_gain(left, i);
+                    }
                     let at = (v.pos + i) * v.channels;
                     let (l, r) = (v.samples[at] as f32, v.samples[at + v.channels - 1] as f32);
                     acc[i * MIX_CHANNELS] += (l * gain).round() as i32;
                     acc[i * MIX_CHANNELS + 1] += (r * gain).round() as i32;
                 }
                 v.pos += n;
+                if let Some(left) = v.fade.as_mut() {
+                    *left -= n;
+                    if *left == 0 {
+                        v.pos = v.frames();
+                    }
+                }
             }
             sounds.retain(|v| v.pos < v.frames());
         } else {
@@ -679,6 +785,84 @@ mod tests {
         let mut out = vec![0i16; MIX_10MS];
         m.mix(&mut out);
         assert!(out.iter().all(|&s| s == i16::MAX));
+    }
+
+    #[test]
+    fn a_stopped_clip_fades_out_in_5_ms_and_only_the_named_players_clips_stop() {
+        let m = Mixer::new();
+        assert!(m.play_sound_by(clip(10_000, 4800, 1), 1, 7));
+        assert!(m.play_sound_by(clip(100, 4800, 1), 1, 8));
+        let mut out = vec![0i16; MIX_10MS];
+        m.mix(&mut out);
+        assert!(out.iter().all(|&s| s == 10_100));
+        assert_eq!(m.sound_left(7), Some(std::time::Duration::from_millis(90)));
+        assert_eq!(m.stop_sounds(Some(7)), 1);
+        assert!(m.sound_left(7).is_none() && m.sound_left(8).is_some());
+        assert_eq!(m.stop_sounds(Some(7)), 0, "already stopping");
+        m.mix(&mut out);
+        // Frame by frame: from the clip's level down to about nothing over 240 frames, never up.
+        let left: Vec<i16> = out.chunks(2).map(|f| f[0]).collect();
+        assert!(left[0] >= 10_000, "starts at the clip's level: {}", left[0]);
+        assert!(left[..STOP_FADE_FRAMES].windows(2).all(|w| w[1] <= w[0]), "monotonic fade");
+        assert!(left[STOP_FADE_FRAMES - 1] <= 100 + 10_000 / STOP_FADE_FRAMES as i16 + 1, "{}", left[STOP_FADE_FRAMES - 1]);
+        assert!(left[STOP_FADE_FRAMES..].iter().all(|&s| s == 100), "then only the other player's clip");
+        assert_eq!(m.sounds_active(), 1, "the stopped clip is gone");
+        // Stop everything.
+        assert_eq!(m.stop_sounds(None), 1);
+        m.mix(&mut out);
+        m.mix(&mut out);
+        assert!(out.iter().all(|&s| s == 0));
+        assert_eq!(m.sounds_active(), 0);
+    }
+
+    #[test]
+    fn a_refused_play_stops_only_its_own_clip() {
+        // 7 played a long clip; later the same clip again and another one, which the hub refused.
+        let m = Mixer::new();
+        let (long, short) = (clip(1000, 48_000, 1), clip(10, 9600, 1));
+        assert!(m.play_sound_by(long.clone(), 1, 7));
+        let mut out = vec![0i16; MIX_10MS];
+        m.mix(&mut out);
+        assert!(m.play_sound_by(long.clone(), 1, 7));
+        assert!(m.play_sound_by(short.clone(), 1, 7));
+        assert!(m.stop_clip(&long, 7), "the newest copy");
+        assert!(m.stop_clip(&short, 7));
+        assert!(!m.stop_clip(&short, 7) && !m.stop_clip(&short, 8));
+        for _ in 0..2 {
+            m.mix(&mut out);
+        }
+        // Only the first play goes on, untouched.
+        assert!(out.iter().all(|&s| s == 1000), "{:?}", &out[..4]);
+        assert_eq!(m.sounds_active(), 1);
+        assert_eq!(m.sound_left(7), Some(std::time::Duration::from_millis(970)));
+    }
+
+    #[test]
+    fn previews_stop_with_a_fade_and_alerts_do_not() {
+        let m = Mixer::new();
+        assert!(m.play_preview(ui_buf(8000, 4800), 1.0));
+        assert!(m.play_ui(ui_buf(10, 4800), 1.0));
+        assert_eq!(m.stop_previews(), 1);
+        let mut out = vec![0i16; MIX_10MS];
+        m.mix_ui(&mut out);
+        let last = out[2 * (STOP_FADE_FRAMES - 1)];
+        assert!(out[0] >= 8000 && last <= 50, "{} -> {last}", out[0]);
+        assert!(out[2 * STOP_FADE_FRAMES..].iter().all(|&s| s == 10), "the alert keeps playing");
+        assert_eq!(m.ui_active(), 1);
+    }
+
+    #[test]
+    fn a_clip_is_heard_in_the_very_next_block() {
+        // No priming, no queueing delay: the first frame of the next mix is the clip's first.
+        let m = Mixer::new();
+        let v = m.add_source();
+        m.push(v, &filled(0, 4 * MIX_10MS));
+        let mut out = vec![0i16; MIX_10MS];
+        m.mix(&mut out);
+        let samples: Arc<[i16]> = Arc::from((1..=480i16).collect::<Vec<_>>());
+        m.play_sound(samples, 1);
+        m.mix(&mut out);
+        assert_eq!(&out[..4], &[1, 1, 2, 2]);
     }
 
     #[test]

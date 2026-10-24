@@ -9,7 +9,8 @@ use std::path::PathBuf;
 
 use image::{DynamicImage, RgbaImage};
 
-/// What the clipboard holds that the chat can attach.
+/// What the clipboard holds that the chat can attach (macOS reads text only so far).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub enum Clip {
     Nothing,
     /// Text only: egui pastes it into the box, nothing to attach.
@@ -228,6 +229,32 @@ mod win {
         Clip::Nothing
     }
 
+    /// What "Colar" would paste (the formats are only looked at, the clipboard is not opened), in
+    /// [`read`]'s order, so the menu does what Ctrl+V does: files, then text, then a picture.
+    pub fn paste_kind() -> super::PasteKind {
+        // SAFETY: plain queries.
+        let has = |f: u32| unsafe { IsClipboardFormatAvailable(f) } != 0;
+        if has(u32::from(CF_HDROP)) {
+            return super::PasteKind::Image;
+        }
+        if has(u32::from(CF_UNICODETEXT)) {
+            return super::PasteKind::Text;
+        }
+        let png = png_format();
+        if (png != 0 && has(png)) || has(u32::from(CF_DIB)) || has(u32::from(CF_DIBV5)) {
+            return super::PasteKind::Image;
+        }
+        super::PasteKind::Nothing
+    }
+
+    /// The text on the clipboard.
+    pub fn read_text(owner: isize) -> Option<String> {
+        let _open = Open::new(owner)?;
+        let bytes = read_format(u32::from(CF_UNICODETEXT))?;
+        let wide: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).take(super::PASTE_MAX_UNITS).collect();
+        Some(String::from_utf16_lossy(&wide))
+    }
+
     /// Put a moveable global copy of `data` on the clipboard as `format`.
     fn put(format: u32, data: &[u8]) -> bool {
         // SAFETY: a fresh allocation of the right size, filled while locked; ownership passes to
@@ -290,6 +317,53 @@ pub fn read(owner: isize) -> Clip {
     }
 }
 
+/// What "Colar" in a text box's menu would paste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum PasteKind {
+    Nothing,
+    /// Text (it goes into the box, as Ctrl+V does).
+    Text,
+    /// A picture or files (they go to the chat's attachments, as Ctrl+V does).
+    Image,
+}
+
+/// What the clipboard would paste now (cheap: run when a text box's menu opens).
+pub fn paste_kind() -> PasteKind {
+    #[cfg(windows)]
+    return win::paste_kind();
+    #[cfg(target_os = "macos")]
+    return if mac_text().is_some_and(|t| !t.is_empty()) { PasteKind::Text } else { PasteKind::Nothing };
+    #[cfg(not(any(windows, target_os = "macos")))]
+    PasteKind::Nothing
+}
+
+/// "Colar" takes at most this much text (UTF-16 units; a message holds far less): a huge clipboard
+/// must not freeze the text box.
+#[cfg(any(windows, target_os = "macos"))]
+const PASTE_MAX_UNITS: usize = 100_000;
+
+/// The text on the clipboard ("Colar" in a text box's menu), at most [`PASTE_MAX_UNITS`].
+pub fn read_text(owner: isize) -> Option<String> {
+    #[cfg(windows)]
+    return win::read_text(owner);
+    #[cfg(not(windows))]
+    {
+        let _ = owner;
+        #[cfg(target_os = "macos")]
+        return mac_text().map(|t| t.chars().take(PASTE_MAX_UNITS).collect());
+        #[cfg(not(target_os = "macos"))]
+        None
+    }
+}
+
+/// macOS: the pasteboard's text, through `pbpaste`.
+#[cfg(target_os = "macos")]
+fn mac_text() -> Option<String> {
+    let out = std::process::Command::new("/usr/bin/pbpaste").stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// "Copiar": the picture as a bitmap (every app) and as PNG (keeps transparency).
 pub fn write_image(owner: isize, img: &RgbaImage) -> Result<(), String> {
     let dib = image_to_dib(img);
@@ -300,7 +374,7 @@ pub fn write_image(owner: isize, img: &RgbaImage) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         let _ = (owner, dib, png);
-        Err(format!("Copiar imagem: {}.", crate::platform::SOON_MAC.to_lowercase()))
+        Err(format!("Copiar imagem: {}.", crate::platform::SOON_MAC_LC))
     }
 }
 

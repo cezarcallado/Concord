@@ -7,7 +7,7 @@
 use eframe::egui::{self, Color32, RichText, Sense, Vec2};
 use vox_client_core::hub::HubClient;
 use vox_proto::{
-    Account, AuditEntry, ChannelId, ChannelKind, ClaimOwnerResponse, MemberInfo, MessageId, ModAction, PrivateAccess, ResetPasswordResponse, Role, ServerEvent,
+    Account, AuditEntry, ChannelE2eeResponse, ChannelId, ChannelKind, ClaimOwnerResponse, MemberInfo, MessageId, ModAction, PrivateAccess, ResetPasswordResponse, Role, ServerEvent,
     SetPasswordRequest, SetPasswordResponse, User, UserId, PERSONAL_PASSWORD_MAX, PERSONAL_PASSWORD_MIN,
 };
 
@@ -83,6 +83,7 @@ fn audit_action_pt(action: &str) -> String {
         vox_proto::AUDIT_CHANNEL_DELETE => "apagou o canal".into(),
         vox_proto::AUDIT_CHANNEL_REORDER => "reordenou os canais".into(),
         vox_proto::AUDIT_CHANNEL_ACCESS => "mudou o acesso do canal".into(),
+        vox_proto::AUDIT_CHANNEL_E2EE => "mudou a criptografia de ponta a ponta do canal".into(),
         vox_proto::AUDIT_REMOVE_AVATAR => "removeu a foto de perfil de".into(),
         vox_proto::AUDIT_CLEAR_PROFILE => "limpou o perfil de".into(),
         vox_proto::AUDIT_CLAIM_OWNER => "virou o Dono do servidor".into(),
@@ -171,6 +172,9 @@ pub enum AdminCmd {
     ClaimOwner { code: String },
     /// "Transferir posse do servidor" (owner only).
     TransferOwner { user: User },
+    /// v1.1 (E1): a voice channel's "Chamada criptografada de ponta a ponta" (and who is left out).
+    ChannelE2ee { id: ChannelId },
+    SetChannelE2ee { id: ChannelId, on: bool },
 }
 
 #[derive(Debug)]
@@ -181,6 +185,7 @@ pub enum AdminReply {
     Audit(Vec<AuditEntry>),
     ResetCode(ResetPasswordResponse),
     Claimed(ClaimOwnerResponse),
+    E2ee(ChannelE2eeResponse),
 }
 
 pub async fn run_admin(hub: &HubClient, cmd: &AdminCmd) -> Result<AdminReply, String> {
@@ -203,6 +208,8 @@ pub async fn run_admin(hub: &HubClient, cmd: &AdminCmd) -> Result<AdminReply, St
         C::ReorderChannels { ids } => hub.reorder_channels(ids).await.map(|_| AdminReply::Done),
         C::ClaimOwner { code } => hub.claim_owner(&code).await.map(AdminReply::Claimed),
         C::TransferOwner { user } => hub.transfer_owner(user.id).await.map(|_| AdminReply::Done),
+        C::ChannelE2ee { id } => hub.channel_e2ee(id).await.map(AdminReply::E2ee),
+        C::SetChannelE2ee { id, on } => hub.set_channel_e2ee(id, on).await.map(AdminReply::E2ee),
     };
     r.map_err(|e| {
         // Passwords and codes never go to the log: only which call failed.
@@ -253,6 +260,9 @@ pub fn admin_error(e: &anyhow::Error) -> String {
         "A pessoa não tem acesso a esse canal privado.".into()
     } else if l.contains("already in that channel") {
         "A pessoa já está nesse canal.".into()
+    } else if l.contains(vox_proto::ERR_ROOM_OCCUPIED) {
+        // v1.1 (E1): the encryption of a voice channel changes only while nobody is in it.
+        E2EE_OCCUPIED.into()
     } else if l.contains("last text channel") {
         "O último canal de texto não pode ser apagado.".into()
     } else if l.contains("channel name must be") {
@@ -267,6 +277,21 @@ pub fn admin_error(e: &anyhow::Error) -> String {
 }
 
 // ---------------------------------------------------------------- UI state
+
+/// v1.1 (E1): the channel setting and its texts.
+pub const E2EE_SETTING: &str = "Chamada criptografada de ponta a ponta";
+pub const E2EE_SETTING_HINT: &str = "Nem o servidor consegue ver ou ouvir. Quem usa o app antigo (1.0) não entra nesta sala.";
+pub const E2EE_OCCUPIED: &str = "Esvazie a sala para mudar isso.";
+
+/// v1.1 (E1): the encryption panel open under one voice channel.
+#[derive(Debug, Clone, Default)]
+pub struct E2eeEdit {
+    pub id: ChannelId,
+    /// The hub's answer (the flag and who is left out), once it came.
+    pub info: Option<ChannelE2eeResponse>,
+    pub busy: bool,
+    pub error: Option<String>,
+}
 
 /// The pages of the server window ("Servidor").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -309,6 +334,8 @@ pub struct RolesUi {
     pub new_access: AccessDraft,
     /// The access editor open under one channel (v0.9).
     pub editing_access: Option<(ChannelId, AccessDraft)>,
+    /// v1.1 (E1): the encryption panel open under one voice channel.
+    pub editing_e2ee: Option<E2eeEdit>,
     pub confirm_delete: Option<ChannelId>,
     pub confirm_reset: Option<User>,
     /// "Transferir posse do servidor": waiting for the owner's confirmation for this person.
@@ -646,6 +673,12 @@ impl App {
                 self.roles.claim_busy = false;
                 self.roles.claim_msg = Some(err);
             }
+            AdminCmd::ChannelE2ee { id } | AdminCmd::SetChannelE2ee { id, .. } if self.roles.editing_e2ee.as_ref().is_some_and(|e| e.id == id) => {
+                if let Some(e) = self.roles.editing_e2ee.as_mut() {
+                    e.busy = false;
+                    e.error = Some(err);
+                }
+            }
             _ if self.roles.server_open => self.roles.server_error = Some(err),
             _ => self.notice = Some(err),
         }
@@ -717,6 +750,13 @@ impl App {
             }
             (AdminCmd::SetChannelAccess { id, .. }, _) if self.roles.editing_access.as_ref().is_some_and(|(e, _)| *e == id) => self.roles.editing_access = None,
             (AdminCmd::RenameChannel { .. }, _) => self.roles.renaming = None,
+            (AdminCmd::ChannelE2ee { id } | AdminCmd::SetChannelE2ee { id, .. }, AdminReply::E2ee(info)) => {
+                if let Some(e) = self.roles.editing_e2ee.as_mut().filter(|e| e.id == id) {
+                    e.busy = false;
+                    e.error = None;
+                    e.info = Some(info);
+                }
+            }
             _ => {}
         }
         if self.roles.server_open && self.roles.tab == ServerTab::Audit {
@@ -866,7 +906,7 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .frame(ui_kit::dialog_frame(&ctx.global_style()))
             .show(ctx, |ui| {
-                ui.set_width(ui_kit::DIALOG_W);
+                ui.set_width(ui_kit::dialog_w(ctx, ui_kit::DIALOG_W));
                 ui.spacing_mut().item_spacing.y = 6.0;
                 ui_kit::dialog_title(ui, "Defina sua senha pessoal");
                 let why = if role > Role::Member {
@@ -878,14 +918,17 @@ impl App {
                 } else {
                     "Sua senha pessoal foi redefinida. Escolha uma nova para continuar protegendo seu nome.".to_string()
                 };
-                ui_kit::body_text(ui, why);
-                ui.add_space(space::S);
-                self.owner_code_field(ui);
-                if self.pw_fields(ui, false) {
-                    let new = self.roles.pw_new.clone();
-                    self.set_personal_password(None, Some(new));
-                }
-                self.pw_message(ui);
+                // (I6: the body scrolls in a short window; "Agora não" always shows.)
+                ui_kit::dialog_scroll(ui, "pw_prompt_body", ui_kit::DIALOG_RESERVE, |ui| {
+                    ui_kit::body_text(ui, why);
+                    ui.add_space(space::S);
+                    self.owner_code_field(ui);
+                    if self.pw_fields(ui, false) {
+                        let new = self.roles.pw_new.clone();
+                        self.set_personal_password(None, Some(new));
+                    }
+                    self.pw_message(ui);
+                });
                 ui.add_space(space::S);
                 if ui_kit::button_sized(ui, Kind::Ghost, Size::Small, None, "Agora não")
                     .on_hover_text("As permissões do cargo ficam desligadas até a senha ser definida (em Configurações)")
@@ -919,21 +962,25 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .frame(ui_kit::dialog_frame(&ctx.global_style()))
             .show(ctx, |ui| {
-                ui.set_width(ui_kit::DIALOG_W + 20.0);
+                ui.set_width(ui_kit::dialog_w(ctx, ui_kit::DIALOG_W + 20.0));
                 ui.spacing_mut().item_spacing.y = 6.0;
                 ui_kit::dialog_title(ui, "Reivindicar servidor");
-                ui_kit::body_text(
-                    ui,
-                    "Este servidor ainda não tem dono. Quem hospeda vira dono sozinho ao entrar no app pelo próprio PC do servidor \
-                     (endereço 127.0.0.1). Se você não está nele, digite o código que a janela do servidor mostra:",
-                );
-                ui_kit::field_label(ui, "Código do servidor");
-                let r = ui.add(ui_kit::field(&mut self.roles.claim_code).hint_text("XXXX-XXXX").font(egui::TextStyle::Monospace).desired_width(160.0));
-                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if let Some(msg) = &self.roles.claim_msg {
-                    ui_kit::result_text(ui, false, msg);
-                }
-                ui_kit::hint(ui, "Depois você define uma senha pessoal, que protege o seu nome e liga as permissões de Dono.");
+                // (I6: the body scrolls in a short window; the buttons always show.)
+                let enter = ui_kit::dialog_scroll(ui, "claim_body", ui_kit::DIALOG_RESERVE, |ui| {
+                    ui_kit::body_text(
+                        ui,
+                        "Este servidor ainda não tem dono. Quem hospeda vira dono sozinho ao entrar no app pelo próprio PC do servidor \
+                         (endereço 127.0.0.1). Se você não está nele, digite o código que a janela do servidor mostra:",
+                    );
+                    ui_kit::field_label(ui, "Código do servidor");
+                    let r = ui.add(ui_kit::field(&mut self.roles.claim_code).hint_text("XXXX-XXXX").font(egui::TextStyle::Monospace).desired_width(160.0));
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if let Some(msg) = &self.roles.claim_msg {
+                        ui_kit::result_text(ui, false, msg);
+                    }
+                    ui_kit::hint(ui, "Depois você define uma senha pessoal, que protege o seu nome e liga as permissões de Dono.");
+                    enter
+                });
                 ui.add_space(space::L);
                 ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 32.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let can = !self.roles.claim_busy && !self.roles.claim_code.trim().is_empty();
@@ -1007,15 +1054,18 @@ impl App {
             esc,
             |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                ui.horizontal(|ui| {
-                    ui.add_space(space::M);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label(RichText::new(format!("{}  Servidor", ph::WRENCH)).font(theme::body(12.5)).color(theme::NEVOA));
-                        ui.add(egui::Label::new(RichText::new(&name).font(theme::display(size::TITLE)).color(theme::GIZ)).truncate().selectable(false));
+                // (The narrow list of a small window: the pages' icons only, no title.)
+                if !ui_kit::nav_compact(ui) {
+                    ui.horizontal(|ui| {
+                        ui.add_space(space::M);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.label(RichText::new(format!("{}  Servidor", ph::WRENCH)).font(theme::body(12.5)).color(theme::NEVOA));
+                            ui.add(egui::Label::new(RichText::new(&name).font(theme::display(size::TITLE)).color(theme::GIZ)).truncate().selectable(false));
+                        });
                     });
-                });
-                ui.add_space(space::L);
+                    ui.add_space(space::L);
+                }
                 let pages: Vec<(&str, &str)> = SERVER_PAGES.iter().map(|(_, icon, label)| (*icon, *label)).collect();
                 let at = SERVER_PAGES.iter().position(|(t, _, _)| *t == tab).unwrap_or(0);
                 if let Some(i) = ui_kit::nav_list(ui, &pages, at) {
@@ -1179,27 +1229,12 @@ impl App {
         if resp.hovered() {
             ui.painter().rect_filled(rect, radius::ROW, theme::ROW_HOVER);
         }
-        let mut row = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(Vec2::new(8.0, 0.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
-        let ui = &mut row;
-        ui.spacing_mut().item_spacing.x = space::M;
         let user = self.known_user(m.user.id).unwrap_or_else(|| m.user.clone());
-        crate::avatars::avatar_widget(&mut self.avatars.store, ui, &user, 32.0, crate::avatars::Surface::Online);
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                ui.label(role_name(user.shown_name(), theirs, Some(theme::GIZ)).font(theme::semibold(13.5)));
-                role_badge(ui, theirs);
-                if m.has_password {
-                    ui.label(RichText::new(ph::LOCK_SIMPLE).font(theme::body(13.0)).color(theme::NEVOA)).on_hover_text("Nome protegido por senha pessoal");
-                }
-                if me {
-                    ui.label(RichText::new("(você)").font(theme::body(12.0)).color(theme::NEVOA));
-                }
-            });
-            ui.label(RichText::new(format!("@{}", user.username)).font(theme::body(12.0)).color(theme::NEVOA));
-        });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        // (I6: the controls first, right to left; the name gets what they leave, clipped.)
+        let inner = rect.shrink2(Vec2::new(8.0, 0.0));
+        let mut right = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::right_to_left(egui::Align::Center)));
+        {
+            let ui = &mut right;
             ui.spacing_mut().item_spacing.x = 6.0;
             // "⋯": the admin's own items, then the person's usual menu (moderation included).
             let more = ui_kit::icon_button(ui, ph::DOTS_THREE, "Mais opções", IconState::Normal);
@@ -1258,6 +1293,27 @@ impl App {
             } else {
                 ui_kit::pill(ui, role_label(theirs), theme::MOVEL, role_color(theirs).unwrap_or(theme::NEVOA));
             }
+        }
+        let left = egui::Rect::from_min_max(inner.min, egui::pos2((right.min_rect().left() - space::M).max(inner.left()), inner.bottom()));
+        let mut row = ui.new_child(egui::UiBuilder::new().max_rect(left).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        row.set_clip_rect(left.intersect(ui.clip_rect()));
+        let ui = &mut row;
+        ui.spacing_mut().item_spacing.x = space::M;
+        crate::avatars::avatar_widget(&mut self.avatars.store, ui, &user, 32.0, crate::avatars::Surface::Online);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(role_name(user.shown_name(), theirs, Some(theme::GIZ)).font(theme::semibold(13.5)));
+                role_badge(ui, theirs);
+                if m.has_password {
+                    ui.label(RichText::new(ph::LOCK_SIMPLE).font(theme::body(13.0)).color(theme::NEVOA)).on_hover_text("Nome protegido por senha pessoal");
+                }
+                if me {
+                    ui.label(RichText::new("(você)").font(theme::body(12.0)).color(theme::NEVOA));
+                }
+            });
+            ui.label(RichText::new(format!("@{}", user.username)).font(theme::body(12.0)).color(theme::NEVOA));
         });
     }
 
@@ -1316,6 +1372,10 @@ impl App {
         if self.channel_row_line(&mut row, c, up, down, &mut reorder) {
             return None;
         }
+        // v1.1 (E1): "Chamada criptografada de ponta a ponta" of this voice channel, under its row.
+        if self.roles.editing_e2ee.as_ref().is_some_and(|e| e.id == c.id) {
+            self.channel_e2ee_panel(ui, c);
+        }
         // "Canal privado" of this channel (v0.9), right under its row.
         let mine = self.roles.editing_access.as_ref().is_some_and(|(id, _)| *id == c.id);
         if let Some((id, mut draft)) = self.roles.editing_access.take_if(|_| mine) {
@@ -1343,6 +1403,56 @@ impl App {
         reorder
     }
 
+    /// v1.1 (E1): does the hub keep the device directory (so it knows encrypted rooms)?
+    pub fn e2ee_hub(&self) -> bool {
+        !matches!(self.privacy.view.status, crate::backend::e2ee::E2eeStatus::Unsupported | crate::backend::e2ee::E2eeStatus::Off)
+    }
+
+    /// v1.1 (E1): the panel of "Chamada criptografada de ponta a ponta" under a voice channel: the
+    /// switch (only while the room is empty), what it means, and who is left out.
+    fn channel_e2ee_panel(&mut self, ui: &mut egui::Ui, c: &vox_proto::Channel) {
+        let Some(mut edit) = self.roles.editing_e2ee.take() else { return };
+        let occupied = self.voice_members.values().any(|m| m.channel_id == Some(c.id));
+        let mut close = false;
+        egui::Frame::new().fill(theme::NOITE).corner_radius(radius::ROW).inner_margin(egui::Margin::symmetric(14, 10)).outer_margin(egui::Margin { left: 28, right: 4, top: 2, bottom: 6 }).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 6.0;
+            let mut on = c.e2ee;
+            let enabled = !occupied && !edit.busy;
+            let r = ui.add_enabled(enabled, egui::Checkbox::new(&mut on, format!("{}  {E2EE_SETTING}", ph::LOCK_SIMPLE)));
+            if r.changed() {
+                edit.busy = true;
+                edit.error = None;
+                self.admin(AdminCmd::SetChannelE2ee { id: c.id, on });
+            }
+            crate::layout::probe(ui.ctx(), "channel_e2ee_switch", r.rect);
+            ui.add(egui::Label::new(RichText::new(E2EE_SETTING_HINT).size(12.0).color(theme::NEVOA)).wrap());
+            if occupied {
+                ui.label(RichText::new(format!("{}  {E2EE_OCCUPIED}", ph::INFO)).size(12.0).color(theme::AVISO));
+            }
+            if let Some(info) = &edit.info {
+                if info.outdated.is_empty() {
+                    ui.label(RichText::new(format!("{}  Todos com acesso a esta sala já usam o concord 1.1.", ph::CHECK)).size(12.0).color(theme::ONLINE));
+                } else {
+                    let names: Vec<String> = info.outdated.iter().map(|u| u.shown_name().to_string()).collect();
+                    let lead = if c.e2ee { "Não entram nesta sala (app antigo):" } else { "Não entrariam nesta sala (app antigo):" };
+                    ui.add(egui::Label::new(RichText::new(format!("{}  {lead} {}", ph::WARNING, names.join(", "))).size(12.0).color(theme::AVISO)).wrap());
+                }
+            } else if edit.busy {
+                ui.label(RichText::new("Carregando...").size(12.0).color(theme::NEVOA));
+            }
+            if let Some(err) = &edit.error {
+                ui.label(RichText::new(err).size(12.0).color(theme::AO_VIVO));
+            }
+            if ui_kit::button_sized(ui, Kind::Ghost, Size::Small, None, "Fechar").clicked() {
+                close = true;
+            }
+        });
+        if !close && self.roles.editing_e2ee.is_none() {
+            self.roles.editing_e2ee = Some(edit);
+        }
+    }
+
     /// The line of [`App::channel_row`]; true while it shows the rename field.
     fn channel_row_line(&mut self, ui: &mut egui::Ui, c: &vox_proto::Channel, up: Option<Vec<ChannelId>>, down: Option<Vec<ChannelId>>, reorder: &mut Option<Vec<ChannelId>>) -> bool {
         let private_ok = self.chatx.features.private_channels;
@@ -1368,12 +1478,25 @@ impl App {
             }
             return true;
         }
-        ui.add(egui::Label::new(RichText::new(&c.name).color(theme::GIZ)).truncate().selectable(false));
+        // (The buttons first, right to left: the name gets what they leave, cut with "…".)
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let hover = if c.kind == ChannelKind::Text { "Apagar canal (e todas as mensagens dele)" } else { "Apagar sala (quem estiver nela sai da voz)" };
             if ui_kit::icon_button(ui, ph::TRASH, hover, IconState::Normal).clicked() {
                 self.roles.confirm_delete = Some(c.id);
+            }
+            // v1.1 (E1): end-to-end encrypted calls (a hub with the device directory).
+            if c.kind == ChannelKind::Voice && self.e2ee_hub() {
+                let open = self.roles.editing_e2ee.as_ref().is_some_and(|e| e.id == c.id);
+                let state = if open { IconState::On } else { IconState::Normal };
+                if ui_kit::icon_button(ui, ph::SHIELD, E2EE_SETTING, state).clicked() {
+                    self.roles.editing_e2ee = if open {
+                        None
+                    } else {
+                        self.admin(AdminCmd::ChannelE2ee { id: c.id });
+                        Some(E2eeEdit { id: c.id, busy: true, ..Default::default() })
+                    };
+                }
             }
             let editing = self.roles.editing_access.as_ref().is_some_and(|(id, _)| *id == c.id);
             if private_ok {
@@ -1394,6 +1517,12 @@ impl App {
             if c.private.is_some() {
                 ui_kit::pill(ui, "privado", theme::MOVEL, theme::NEVOA);
             }
+            if c.e2ee {
+                ui_kit::pill(ui, "criptografada", theme::MOVEL, theme::ONLINE);
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(RichText::new(&c.name).color(theme::GIZ)).truncate().selectable(false));
+            });
         });
         false
     }

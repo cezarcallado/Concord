@@ -1,6 +1,6 @@
 # Consumo da v1.0: medição antes e depois (fase 1, 2026-10-17)
 
-Regra número 1 do plano da v1.0 (documento interno): RAM no máximo +10% por cenário, processador igual em
+Regra número 1 do plano (docs/PLANO-v1.0.md): RAM no máximo +10% por cenário, processador igual em
 repouso, placa de vídeo igual. Esta é a medição da **fase 1** (tema, fontes, ícones, componentes,
 aplicados no app sem mudar as telas) contra a **v0.9.1** (o `voxhub.exe` do zip de
 releases\v0.9.1, idêntico ao compilado da tag).

@@ -1,6 +1,7 @@
 //! Windows implementation: shared helpers + target enumeration.
 
 mod adapters;
+mod appinfo;
 mod audio;
 pub mod bench;
 mod camctl;
@@ -17,6 +18,7 @@ pub use audio::{start_audio, AudioInner};
 pub use camera::{camera_diagnostics, list_camera_formats, list_cameras, start_camera, CameraInner, CameraOutput};
 pub use dshow::camera_property_pages;
 pub use adapters::{encoder_candidates, list_gpus};
+pub use appinfo::window_app;
 pub use encode::{available_encoders, self_test_encoders, start_video_encoded, EncodedInner};
 pub use enumerate::{list_monitors, list_windows};
 pub use icon::{is_window_minimized, window_icon};

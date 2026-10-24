@@ -1,7 +1,7 @@
 //! The four ports of a hosted server, and the free block chosen when the usual ones are taken
 //! (for example by the classic `concord-server.exe` running on this same PC).
 
-use std::net::{Ipv4Addr, TcpListener, UdpSocket};
+use std::net::{Ipv4Addr, UdpSocket};
 
 /// One server's ports: the hub (TCP), LiveKit's signal (TCP), and LiveKit's media over TCP and UDP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,13 +57,27 @@ pub fn choose(saved: Option<PortBlock>, first: u16, is_free: impl Fn(&PortBlock)
 /// loopback: Windows lets `127.0.0.1:7890` be bound while another program listens on
 /// `0.0.0.0:7890`, and the two would then split this PC's connections between them.
 pub fn block_is_free(block: &PortBlock, ip: Ipv4Addr) -> bool {
-    let tcp_ok = |p: u16| [Ipv4Addr::UNSPECIFIED, Ipv4Addr::LOCALHOST, ip].iter().all(|a| TcpListener::bind((*a, p)).is_ok());
+    let tcp_ok = |p: u16| [Ipv4Addr::UNSPECIFIED, Ipv4Addr::LOCALHOST, ip].iter().all(|a| tcp_bindable(*a, p));
     block.tcp().iter().all(|p| tcp_ok(*p)) && UdpSocket::bind((ip, block.rtc_udp)).is_ok()
+}
+
+/// A TCP socket can be bound on `ip:port` (bound only, never listening: a probe on every
+/// interface must not make the Windows Firewall ask about this program; the port conflict is
+/// decided at bind time anyway). Same address-reuse rule as `std::net::TcpListener::bind`.
+fn tcp_bindable(ip: Ipv4Addr, port: u16) -> bool {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let Ok(s) = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)) else { return false };
+    #[cfg(not(windows))]
+    if s.set_reuse_address(true).is_err() {
+        return false;
+    }
+    s.bind(&std::net::SocketAddr::from((ip, port)).into()).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
 
     #[test]
     fn blocks() {
@@ -111,9 +125,11 @@ mod tests {
         let b = PortBlock { hub: p, signal: p.wrapping_add(1).max(1024), rtc_tcp: p.wrapping_add(2).max(1024), rtc_udp: p.wrapping_add(3).max(1024) };
         assert!(!block_is_free(&b, Ipv4Addr::LOCALHOST));
         drop(l);
-        // Taken on every interface by another program: busy for a loopback bind too.
-        let any = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
-        let p = any.local_addr().unwrap().port();
+        // Taken on every interface by another program: busy for a loopback bind too. (Bound, not
+        // listening: a test never listens on every interface, so no firewall prompt.)
+        let any = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        any.bind(&std::net::SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)).into()).unwrap();
+        let p = any.local_addr().unwrap().as_socket().unwrap().port();
         let b = PortBlock { hub: p, ..b };
         assert!(!block_is_free(&b, Ipv4Addr::LOCALHOST));
     }

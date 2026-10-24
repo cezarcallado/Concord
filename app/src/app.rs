@@ -4,7 +4,6 @@
 //! ...); `--autotest` drives those same methods (see `autotest.rs`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 
 use eframe::egui::{self, Color32, RichText};
@@ -20,7 +19,6 @@ use crate::call::{watch_allowed, watch_limit_text, CallUi, VideoUi, WATCH_PENDIN
 use crate::backend::{Backend, Cmd, Ev, Repaint, VoiceOpts};
 use crate::meter::MeterWatch;
 use crate::previews::{self, PreviewStore};
-use crate::ptt::{self, PttHook, PttMsg};
 use crate::settings::{Preset, Settings, UserAudioPref};
 use crate::theme::ph;
 
@@ -55,13 +53,26 @@ mod home;
 /// Configurações (v1.0, phase 3a): the sections on the left, the chosen one on the right.
 #[path = "settings_ui.rs"]
 pub mod settings_ui;
+
+// "Apoie o concord": the Pix popup and settings page (v1.1, `donate.rs` has the rules).
+#[path = "donate_ui.rs"]
+pub mod donate_ui;
 pub(crate) use settings_ui::{set_log_dir, SettingsPage};
 /// The Go Live source picker window (v1.0, phase 3a).
 #[path = "golive_ui.rs"]
 mod golive_ui;
+/// "Atalhos de teclado" (v1.1): the settings page, the keyboard hook and what each shortcut does.
+#[path = "keybinds_ui.rs"]
+pub mod keybinds_ui;
 /// The Calladex easter egg (v1.0.1): `/calladex` in a chat input, or "calladex" typed on the home screen.
 #[path = "calladex.rs"]
 pub mod calladex;
+// v1.1 (T0): the connection's lock, "Segurança da conexão" and the TLS dialogs.
+#[path = "tls_ui.rs"]
+pub mod tls_ui;
+// v1.1 (E0): Configurações → Privacidade → "Seus aparelhos".
+#[path = "privacy_ui.rs"]
+pub mod privacy_ui;
 
 // Icons (Phosphor, `theme::ph`; v1.0).
 pub(crate) const ICON_MUTED: &str = ph::MICROPHONE_SLASH;
@@ -274,6 +285,12 @@ pub struct VoiceUi {
     pub camera: CameraUi,
     /// Other participants (identities) whose camera is on.
     pub cameras: HashSet<String>,
+    /// v1.1 (E1): the room's media is end-to-end encrypted ("Criptografada de ponta a ponta").
+    pub e2ee: bool,
+    /// v1.1 (E1): how each other person's media decrypts here (only what is not "ok" is shown).
+    pub e2ee_states: HashMap<String, vox_client_core::MediaE2eeState>,
+    /// v1.1 (E1): a DM call that could not be encrypted because the other person's app is older.
+    pub e2ee_plain_call: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -359,9 +376,8 @@ pub struct App {
     pub repaint: Repaint,
     pub settings: Settings,
     pub persist: bool,
-    ptt_hook: Option<PttHook>,
-    ptt_tx: std_mpsc::Sender<PttMsg>,
-    ptt_rx: std_mpsc::Receiver<PttMsg>,
+    /// Keyboard shortcuts and push-to-talk (`keybinds_ui.rs`).
+    pub keys: keybinds_ui::KeysUi,
 
     pub screen: Screen,
     pub form: ConnectForm,
@@ -388,6 +404,8 @@ pub struct App {
     pub sidebar_rows: Vec<notify::DrawnRow>,
     /// Link-preview cards under chat messages (item 10).
     pub previews: PreviewStore,
+    /// Go Live hover cards (v1.1, `stream_cards.rs`).
+    pub stream_cards: crate::stream_cards::StreamCards,
     /// Profile pictures: the cache of what the hub sent, and the settings section.
     pub avatars: crate::avatars::Avatars,
 
@@ -454,11 +472,16 @@ pub struct App {
     pub calladex: Option<calladex::Calladex>,
     /// The last letters typed on the home screen with no field focused (the "calladex" sequence).
     pub calladex_keys: String,
+    /// v1.1 (T0): the session's TLS (the lock) and its dialogs (`tls_ui.rs`).
+    pub tls: tls_ui::TlsUi,
+    /// v1.1 (E0): my devices on the server's list of encryption keys (`privacy_ui.rs`).
+    pub privacy: privacy_ui::PrivacyUi,
+    /// v1.1 (D1): the donation popup, its QR code and the usage counter (`donate_ui.rs`).
+    pub donate: donate_ui::DonateUi,
 }
 
 impl App {
     pub fn new(backend: Backend, repaint: Repaint, settings: Settings, persist: bool, auto: Option<Auto>) -> Self {
-        let (ptt_tx, ptt_rx) = std_mpsc::channel();
         let mut form = ConnectForm {
             url: settings.server.clone(),
             user: settings.username.clone(),
@@ -484,9 +507,7 @@ impl App {
             repaint,
             settings,
             persist,
-            ptt_hook: None,
-            ptt_tx,
-            ptt_rx,
+            keys: Default::default(),
             screen: Screen::Connect,
             form,
             server_name: String::new(),
@@ -506,6 +527,7 @@ impl App {
             channel_epochs: HashMap::new(),
             sidebar_rows: Vec::new(),
             previews: PreviewStore::default(),
+            stream_cards: Default::default(),
             avatars: Default::default(),
             voice: VoiceUi::default(),
             center: Center::Chat,
@@ -545,14 +567,21 @@ impl App {
             stage_fullscreen: false,
             calladex: None,
             calladex_keys: String::new(),
+            tls: Default::default(),
+            privacy: Default::default(),
+            donate: donate_ui::DonateUi::new(persist),
         };
         app.center_mode = app.settings.layout.center_mode;
         app.apply_gate_config();
         app.init_video_encoders();
-        app.sync_ptt_hook();
+        app.keybinds_init();
         // The camera list tells which camera "Padrão" is, so its saved setup is found even when
         // the settings were never opened.
         app.backend.send(Cmd::ListCameras);
+        // Whether my live's still picture may go to the server (before any Go Live can start).
+        app.backend.send(Cmd::StreamPreviewUpload(app.settings.share_hover_preview));
+        // v1.1: the alert palette the user chose ("Som dos avisos"), for every sound from now on.
+        alerts::apply_palette(&app.settings.alerts);
         app
     }
 
@@ -596,6 +625,12 @@ impl App {
         let typed = crate::backend::normalize_url(&url);
         let token_at = if manual { None } else { std::iter::once(typed.clone()).chain(urls.iter().cloned()).find_map(|u| self.settings.device_token(&u, &user).map(|t| (u, t))) };
         let guard = self.saved_guard(&typed, &user, token_at.as_ref().map(|(u, _)| u.as_str()), manual);
+        // v1.1 (T0): the certificate this server must have (saved entry, saved login token, my own
+        // hosted server), and whether it is a saved address (the trust rules).
+        let key = crate::servers::server_key(&typed, &user);
+        let entry = self.servers.joining.and_then(|id| self.settings.server_entry(id)).or_else(|| self.settings.servers.servers.iter().find(|e| e.key() == key)).cloned();
+        let token_pin = token_at.as_ref().and_then(|(u, _)| self.settings.device_token_pin(u, &user));
+        let tls = self.tls_plan(&typed, entry.as_ref().and_then(|e| e.tls_pin()), token_pin, entry.is_some() || token_at.is_some());
         let device_token = token_at.map(|(_, t)| t);
         self.servers_login_started(device_token.is_some(), None);
         tracing::info!(url = %url, user = %user, personal = personal.is_some(), device_token = device_token.is_some(), saved_password = guard.password.is_some(), manual, addresses = urls.len().max(1), "connecting");
@@ -608,6 +643,7 @@ impl App {
             remember_device: self.form.remember_device,
             invite: (!urls.is_empty()).then_some(crate::host::InviteJoin { token: None, urls }),
             guard,
+            tls,
         });
     }
 
@@ -620,12 +656,18 @@ impl App {
         let key = crate::servers::server_key(typed, user);
         let entry = self.servers.joining.and_then(|id| self.settings.server_entry(id)).or_else(|| self.settings.servers.servers.iter().find(|e| e.key() == key)).cloned();
         let entry_id = entry.as_ref().and_then(|e| e.server_id());
-        let token = token_at.map(|at| Binding { home: at.to_string(), server_id: self.settings.device_token_server(at, user).or_else(|| entry_id.clone()) });
+        // v1.1 (T0): and with which certificate (the token's own, else the entry's).
+        let entry_pin = entry.as_ref().and_then(|e| e.tls_pin());
+        let token = token_at.map(|at| Binding {
+            home: at.to_string(),
+            server_id: self.settings.device_token_server(at, user).or_else(|| entry_id.clone()),
+            tls_pin: self.settings.device_token_pin(at, user).or(entry_pin),
+        });
         // The password in the form is a saved one when it is the entry's (or v0.9.0's single one).
         let pw = &self.form.password;
         let legacy = self.settings.saved_password().filter(|_| crate::servers::server_key(&self.settings.server, &self.settings.username) == key);
         let saved_pw = !manual && !pw.is_empty() && (entry.as_ref().and_then(|e| self.settings.server_password(e)).as_ref() == Some(pw) || legacy.as_ref() == Some(pw));
-        let password = saved_pw.then(|| Binding { home: entry.as_ref().map_or_else(|| typed.to_string(), |e| crate::backend::normalize_url(&e.url)), server_id: entry_id.clone() });
+        let password = saved_pw.then(|| Binding { home: entry.as_ref().map_or_else(|| typed.to_string(), |e| crate::backend::normalize_url(&e.url)), server_id: entry_id.clone(), tls_pin: entry_pin });
         Guard { token, password, confirmed: Some(typed.to_string()) }
     }
 
@@ -640,6 +682,8 @@ impl App {
         self.me = None;
         self.session_url.clear();
         self.session_server_id = None;
+        self.tls.session = None;
+        self.tls.security_open = false;
         self.ready = false;
         self.hub_up = true;
         self.channels.clear();
@@ -809,6 +853,9 @@ impl App {
         self.voice.others_muted = false;
         self.voice.camera = CameraUi::Off;
         self.voice.cameras.clear();
+        self.voice.e2ee = false;
+        self.voice.e2ee_states.clear();
+        self.voice.e2ee_plain_call = false;
         self.gate_voice.clear_outputs();
     }
 
@@ -818,6 +865,11 @@ impl App {
         let cfg = self.settings.input_gate.sanitized();
         self.gate_voice.set_config(cfg);
         self.gate_test.set_config(cfg);
+    }
+
+    /// The microphone in the settings changed: a call in progress follows it at once.
+    pub fn apply_input_device(&self) {
+        self.backend.send(Cmd::SetInputDevice(self.settings.input_device.clone()));
     }
 
     pub fn start_mic_test(&mut self) {
@@ -865,14 +917,15 @@ impl App {
         }
     }
 
-    /// Whether my own voice is going out right now (gate open or push-to-talk held); drives my
-    /// own speaking highlight instead of the raw mic activity.
+    /// Whether my own voice is going out right now (gate open or push-to-talk held), or one of
+    /// my soundboard sounds is playing for the room (v1.1: the core puts my identity in the
+    /// speaking set only for that); drives my own speaking highlight.
     pub fn sending_voice(&self) -> bool {
-        self.voice.channel.is_some() && self.gate_voice.is_open()
+        self.voice.channel.is_some() && (self.gate_voice.is_open() || self.voice.speaking.contains(&self.voice.identity))
     }
 
     pub fn ptt_active(&self) -> bool {
-        self.settings.ptt_enabled && self.settings.ptt_vk != 0
+        self.settings.ptt_enabled && crate::platform::global_ptt() && crate::keybinds::has_ptt(&self.settings.keybinds)
     }
 
     pub fn toggle_mute(&mut self) {
@@ -1267,16 +1320,7 @@ impl App {
             self.save_settings();
             self.notice = Some(format!("{ICON_WARN} {NOISE_FALLBACK_TEXT}"));
         }
-        while let Ok(msg) = self.ptt_rx.try_recv() {
-            if let PttMsg::Captured { vk, name } = msg {
-                self.settings.ptt_vk = vk;
-                self.settings.ptt_name = name;
-                self.settings_ui.capturing_key = false;
-                ptt::set_key(vk);
-                self.sync_ptt_hook();
-                self.save_settings();
-            }
-        }
+        self.keybinds_pump();
     }
 
     fn on_event(&mut self, ev: Ev) {
@@ -1313,6 +1357,8 @@ impl App {
                     self.save_settings();
                 }
             }
+            Ev::TlsMismatch { url, expected, got } => self.on_tls_mismatch(url, expected, got),
+            Ev::PlainPrompt { url } => self.on_plain_prompt(url),
             Ev::Admin { cmd, result } => self.on_admin_reply(cmd, result),
             Ev::Invite(ev) => self.on_invite_event(ev),
             Ev::LoggedIn {
@@ -1323,6 +1369,8 @@ impl App {
                 device_token,
                 server_id,
                 pin,
+                tls_pin,
+                tls_learned,
             } => {
                 self.form.busy = false;
                 self.form.error = None;
@@ -1331,21 +1379,32 @@ impl App {
                 self.me = Some(user.clone());
                 self.livekit_ok = livekit_ok;
                 self.screen = Screen::Main;
+                // v1.1 (T0): the certificate is kept when it was the pinned one, or (first use) when
+                // this login confirmed the server.
+                let keep_pin = tls_pin.filter(|_| !tls_learned || pin);
                 if let Some(t) = device_token {
-                    // v1.0.1: a token belongs to the server that issued it.
+                    // v1.0.1: a token belongs to the server that issued it (v1.1: and to the
+                    // certificate it came through).
                     self.settings.set_device_token(&url, &user.username, Some(&t));
                     self.settings.set_device_token_server(&url, &user.username, server_id.as_deref());
+                    self.settings.set_device_token_pin(&url, &user.username, tls_pin);
                 } else if pin && self.settings.device_token_server(&url, &user.username).is_none() {
                     // A token saved before v1.0.1, just accepted here: it is this server's.
                     self.settings.set_device_token_server(&url, &user.username, server_id.as_deref());
                 }
+                if self.settings.device_token_pin(&url, &user.username).is_none() {
+                    self.settings.set_device_token_pin(&url, &user.username, keep_pin);
+                }
+                self.tls.session = tls_pin;
+                self.tls.plain_ok_for = None;
+                tracing::info!(tls = tls_pin.is_some(), first_use = tls_learned, kept = keep_pin.is_some(), "logged in");
                 let personal_typed = !self.form.personal.is_empty();
                 self.form.personal.clear();
                 self.form.need_personal = false;
                 self.roles.prompt_later = false;
                 // v0.9.1: the saved server list (which also keeps v0.9.0's single-server fields).
                 let confirmed = server_id.as_deref().filter(|_| pin);
-                self.servers_logged_in(&url, &user.username, &self.server_name.clone(), personal_typed, confirmed);
+                self.servers_logged_in(&url, &user.username, &self.server_name.clone(), personal_typed, confirmed, keep_pin);
                 self.session_url = url;
                 self.session_server_id = server_id;
                 self.save_settings();
@@ -1383,6 +1442,8 @@ impl App {
                 self.chat_on_history(target);
             }
             Ev::Avatar(ev) => self.on_avatar_event(ev),
+            Ev::StreamCard(ev) => self.on_stream_card_event(ev),
+            Ev::E2ee(ev) => self.on_e2ee_event(ev),
             Ev::Profile(ev) => self.on_profile_event(ev),
             Ev::Dm(ev) => self.on_dm_event(ev),
             Ev::Image(ev) => {
@@ -1406,9 +1467,30 @@ impl App {
                 identity,
                 warning,
                 no_mic,
+                e2ee,
             } => {
                 self.voice.joining = None;
                 self.voice.joining_since = None;
+                self.voice.e2ee = e2ee;
+                self.voice.e2ee_states.clear();
+                // v1.1 (E1): a DM call this computer could have encrypted, but the other side's app
+                // is older (the hub decided it plain).
+                let plain_call = channel == dms::DM_CALL_CHANNEL && !e2ee && self.privacy.view.status == crate::backend::e2ee::E2eeStatus::Active;
+                self.voice.e2ee_plain_call = plain_call;
+                let warning = if plain_call {
+                    let peer = self.dms.voice_dm.and_then(|dm| self.dms.conv(dm).map(|c| (c.peer.id, c.peer.shown_name().to_string())));
+                    let peer_has_device = peer.as_ref().is_some_and(|(id, _)| self.privacy.view.devices_of.get(id).is_some_and(|d| !d.is_empty()));
+                    let name = peer.map(|(_, n)| n).unwrap_or_else(|| "a outra pessoa".into());
+                    // (Audit: "uses an old version" only when that is what we know.)
+                    let note = crate::call::e2ee_plain_call_note(&name, self.privacy.view.directory_read, peer_has_device);
+                    self.toast(format!("{} {note}", ph::LOCK_SIMPLE_OPEN));
+                    Some(match warning {
+                        Some(w) => format!("{w} · {note}"),
+                        None => note,
+                    })
+                } else {
+                    warning
+                };
                 self.voice.warning = warning;
                 self.voice.no_mic = no_mic;
                 self.voice.channel = Some(channel);
@@ -1434,6 +1516,10 @@ impl App {
                 self.voice_cleared();
             }
             Ev::Voice(ev) => self.on_voice(ev),
+            Ev::CallNewDevice { identity } => {
+                let who = identity.parse::<UserId>().map(|id| self.name_of(id)).unwrap_or(identity);
+                self.toast(format!("{} {who} entrou de um aparelho novo", ph::SHIELD));
+            }
             Ev::LocalVoice { muted, deafened } => {
                 self.voice.muted = muted;
                 self.voice.deafened = deafened;
@@ -1692,7 +1778,9 @@ impl App {
                 ServerEvent::Pong { .. } => {}
                 ServerEvent::Error { error } => self.notice = Some(crate::soundboard::server_error_text(&error)),
                 // The soundboard is handled by the backend, which reports it as `Ev::Sound`.
-                ServerEvent::SoundPlayed { .. } | ServerEvent::SoundsChanged { .. } => {}
+                ServerEvent::SoundPlayed { .. } | ServerEvent::SoundStopped { .. } | ServerEvent::SoundsChanged { .. } => {}
+                // v1.1 (E0): the device directory is the backend's too (`Ev::E2ee`).
+                ServerEvent::E2eeDevicesChanged { .. } => {}
                 // Item 12: deleted messages, channel changes, roles, moderation.
                 ev @ (ServerEvent::MessageDeleted { .. }
                 | ServerEvent::ChannelsChanged { .. }
@@ -1767,6 +1855,19 @@ impl App {
                 self.notice = Some(format!("{ICON_CAMERA} Sua câmera desligou: {reason}"));
             }
             VoiceEvent::ServerMuted { muted } => self.roles.session_server_muted = muted,
+            VoiceEvent::Mic(status) => {
+                tracing::info!(?status, "own microphone changed");
+                match crate::backend::mic_status_text(&status) {
+                    Some(text) => self.notice = Some(text),
+                    // A new choice: what was said about the old one no longer applies.
+                    None if self.notice.as_deref().is_some_and(crate::backend::is_mic_notice) => self.notice = None,
+                    None => {}
+                }
+            }
+            VoiceEvent::MicAvailable => {
+                self.voice.no_mic = false;
+                self.voice.warning = self.voice.warning.take().and_then(crate::backend::warning_without_mic);
+            }
             VoiceEvent::EncoderSwitched { camera, label, backend } => {
                 tracing::warn!(camera, %label, %backend, "own video switched encoder (unstable video)");
                 if camera {
@@ -1778,7 +1879,13 @@ impl App {
                 }
                 self.notice = Some(format!("Vídeo instável: trocando para {label}"));
             }
-            VoiceEvent::Connected { .. }
+            VoiceEvent::E2eeState { identity, state } => {
+                if identity != self.voice.identity {
+                    self.voice.e2ee_states.insert(identity, state);
+                }
+            }
+            VoiceEvent::E2eePeerDevice { .. }
+            | VoiceEvent::Connected { .. }
             | VoiceEvent::ParticipantJoined { .. }
             | VoiceEvent::ParticipantLeft { .. }
             | VoiceEvent::ShareStarted { .. }
@@ -1788,36 +1895,10 @@ impl App {
 
     // ------------------------------------------------------------ push-to-talk
 
-    /// The hook runs only while push-to-talk is on (or a key is being captured).
-    pub fn sync_ptt_hook(&mut self) {
-        let want = self.ptt_active() || self.settings_ui.capturing_key;
-        if want && self.ptt_hook.is_none() {
-            let tx = self.backend.tx.clone();
-            let ptt_tx = self.ptt_tx.clone();
-            let repaint = self.repaint.clone();
-            self.ptt_hook = PttHook::start(move |m| match m {
-                PttMsg::Down => {
-                    let _ = tx.send(Cmd::PttKey(true));
-                }
-                PttMsg::Up => {
-                    let _ = tx.send(Cmd::PttKey(false));
-                }
-                captured => {
-                    let _ = ptt_tx.send(captured);
-                    repaint.wake();
-                }
-            });
-            if self.ptt_hook.is_none() {
-                tracing::warn!("cannot install the push-to-talk keyboard hook");
-            }
-        } else if !want {
-            self.ptt_hook = None;
-        }
-        ptt::set_key(if self.ptt_active() { self.settings.ptt_vk } else { 0 });
-    }
-
+    /// Push-to-talk or a shortcut changed: the hook and the matcher follow (`keybinds_ui.rs`),
+    /// the voice session hears about push-to-talk, and the settings are saved.
     fn ptt_settings_changed(&mut self) {
-        self.sync_ptt_hook();
+        self.sync_keybinds();
         if self.voice.channel.is_some() {
             let on = self.ptt_active();
             self.backend.send(Cmd::SetPtt(on));
@@ -1946,6 +2027,7 @@ impl eframe::App for App {
         self.notify_tick(ctx);
         self.sync_streams_visible(ctx, false);
         self.pause_share_preview_when_minimized(ctx);
+        self.donate_tick(ctx);
         self.auto_tick(ctx);
     }
 
@@ -1966,6 +2048,8 @@ impl eframe::App for App {
             }
         }
         self.video.want.clear();
+        // Shortcuts: whether a text field has the focus; the window's own keys without the hook.
+        self.keybinds_frame(ui.ctx());
         // macOS: the new video frames go into their textures before anything is drawn.
         #[cfg(target_os = "macos")]
         self.mac_video_upload(ui.ctx(), frame);
@@ -1982,6 +2066,7 @@ impl eframe::App for App {
         self.settings_window(&ctx);
         self.camera_window(&ctx);
         self.host_windows(&ctx);
+        self.tls_windows(&ctx);
         // The easter egg (`calladex.rs`): nothing at all while it is closed.
         if self.calladex.is_some() {
             self.calladex_window(&ctx);
@@ -1996,13 +2081,16 @@ impl eframe::App for App {
             self.person_menu_layer(&ctx);
             self.menu_confirm_window(&ctx);
             self.image_viewer(&ctx);
+            // Last: it looks at what the others left open.
+            self.donate_window(&ctx);
         }
         self.sync_video(&ctx);
         self.pump_avatars();
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.ptt_hook = None;
+        self.keybinds_exit();
+        self.donate_on_exit();
         self.notify_on_exit();
         self.drop_video();
         self.backend.shutdown();

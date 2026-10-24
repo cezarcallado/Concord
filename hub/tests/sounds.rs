@@ -530,6 +530,48 @@ async fn a_sound_reaches_only_the_players_voice_channel() {
 }
 
 #[tokio::test]
+async fn a_player_stops_their_sound_for_the_room() {
+    let env = setup().await;
+    let ana = env.login("ana", None).await;
+    let bia = env.login("bia", None).await;
+    let caio = env.login("caio", None).await;
+    let (room1, room2) = voice_ids(&env.channels(&ana).await);
+    let s = env.upload(&ana, "buzina").await;
+    let (mut wa, mut wb, mut wc) = (env.ws(&ana).await, env.ws(&bia).await, env.ws(&caio).await);
+    wa.voice(Some(room1), false).await;
+    wb.voice(Some(room1), false).await;
+    wc.voice(Some(room2), false).await;
+    wc.wait_placed(vec![(ana.user.id, room1), (bia.user.id, room1), (caio.user.id, room2)]).await;
+    let stopped = |e: &ServerEvent| matches!(e, ServerEvent::SoundStopped { .. });
+
+    // Nothing played yet: a stop goes nowhere (and is not an error).
+    wa.send(&ClientEvent::StopSound).await;
+    assert!(!wb.drain(Duration::from_millis(300)).await.iter().any(stopped));
+    assert!(!wa.drain(Duration::from_millis(100)).await.iter().any(|e| matches!(e, ServerEvent::Error { .. })));
+
+    // This hub relays stops, and says so on every play.
+    wa.play(s.id).await;
+    let ev = wb.wait_for("played", is_played(s.id)).await;
+    assert!(matches!(ev, ServerEvent::SoundPlayed { stoppable: true, .. }), "{ev:?}");
+    wa.send(&ClientEvent::StopSound).await;
+    let ev = wb.wait_for("stopped", stopped).await;
+    let ServerEvent::SoundStopped { by, channel_id } = ev else { unreachable!() };
+    assert_eq!((by, channel_id), (ana.user.id, room1));
+    wa.wait_for("the player gets it too", stopped).await;
+    assert!(!wc.drain(Duration::from_millis(300)).await.iter().any(stopped), "another room is not told");
+    // One stop per play: more stops are not relayed.
+    wa.send(&ClientEvent::StopSound).await;
+    assert!(!wb.drain(Duration::from_millis(300)).await.iter().any(stopped));
+    // Somebody else cannot stop ana's sound: a stop only ever names its sender.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    wa.play(s.id).await;
+    wb.wait_for("played again", is_played(s.id)).await;
+    wb.send(&ClientEvent::StopSound).await;
+    assert!(!wa.drain(Duration::from_millis(300)).await.iter().any(stopped), "bia played nothing: her stop goes nowhere");
+    env.server.shutdown().await;
+}
+
+#[tokio::test]
 async fn playing_is_refused_outside_voice_for_unknown_sounds_and_when_server_muted() {
     let env = setup().await;
     let (owner, _admin, moder) = env.staff().await;
@@ -622,10 +664,21 @@ async fn old_clients_are_not_bothered_by_the_new_events() {
         Pong { nonce: u64 },
         Error { error: String },
     }
-    let played = serde_json::to_string(&ServerEvent::SoundPlayed { sound_id: 3, by: User::new(1, "ana"), channel_id: 2 }).unwrap();
+    let played = serde_json::to_string(&ServerEvent::SoundPlayed { sound_id: 3, by: User::new(1, "ana"), channel_id: 2, stoppable: false }).unwrap();
     let changed = serde_json::to_string(&ServerEvent::SoundsChanged { sounds: vec![] }).unwrap();
+    let stopped = serde_json::to_string(&ServerEvent::SoundStopped { by: 1, channel_id: 2 }).unwrap();
     assert!(serde_json::from_str::<V041Event>(&played).is_err() && serde_json::from_str::<V041Event>(&changed).is_err());
+    assert!(serde_json::from_str::<V041Event>(&stopped).is_err());
     assert_eq!(played, r#"{"type":"sound_played","sound_id":3,"by":{"id":1,"username":"ana"},"channel_id":2}"#);
     assert_eq!(serde_json::to_string(&ClientEvent::PlaySound { sound_id: 3 }).unwrap(), r#"{"type":"play_sound","sound_id":3}"#);
+    // v1.1 (no protocol bump): a hub that relays stops says so on each play; a v1.0 client
+    // ignores the field, and a v1.1 client reading a v1.0 hub's play sees `false` (it then stops
+    // the sound only for itself and never sends `StopSound`, which that hub would not know).
+    let new_play = serde_json::to_string(&ServerEvent::SoundPlayed { sound_id: 3, by: User::new(1, "ana"), channel_id: 2, stoppable: true }).unwrap();
+    assert_eq!(new_play, r#"{"type":"sound_played","sound_id":3,"by":{"id":1,"username":"ana"},"channel_id":2,"stoppable":true}"#);
+    let old_play: ServerEvent = serde_json::from_str(r#"{"type":"sound_played","sound_id":3,"by":{"id":1,"username":"ana"},"channel_id":2}"#).unwrap();
+    assert!(matches!(old_play, ServerEvent::SoundPlayed { stoppable: false, .. }));
+    assert_eq!(stopped, r#"{"type":"sound_stopped","by":1,"channel_id":2}"#);
+    assert_eq!(serde_json::to_string(&ClientEvent::StopSound).unwrap(), r#"{"type":"stop_sound"}"#);
     // A hub too old for it answers a PlaySound with the generic parse error, and keeps the socket.
 }

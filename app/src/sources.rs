@@ -44,6 +44,8 @@ const WATCHDOG_TICK: Duration = Duration::from_millis(750);
 const ICON_MAX: u32 = 64;
 
 const CARD_MIN_W: f32 = 200.0;
+/// I6: the grid keeps at least this height in a short window (the dialog's body scrolls instead).
+const GRID_MIN_H: f32 = 140.0;
 /// The audio-only picker's cards are smaller (an icon, not a picture).
 const AUDIO_CARD_MIN_W: f32 = 170.0;
 const CARD_GAP: f32 = 10.0;
@@ -534,7 +536,7 @@ fn show_audio(ui: &mut egui::Ui, picker: &mut Picker, inp: GridInput<'_>) -> Gri
         ui.label(egui::RichText::new(format!("{}", apps.len())).font(theme::body(size::SMALL)).color(theme::NEVOA));
     });
     ui.add_space(space::S);
-    egui::ScrollArea::vertical().max_height(inp.max_height).auto_shrink([false, true]).show(ui, |ui| {
+    egui::ScrollArea::vertical().max_height(inp.max_height).min_scrolled_height(inp.max_height.min(GRID_MIN_H)).auto_shrink([false, true]).show(ui, |ui| {
         let (cols, card_w) = grid_layout(ui.available_width() - 12.0, AUDIO_CARD_MIN_W, CARD_GAP);
         ui.spacing_mut().item_spacing = Vec2::splat(CARD_GAP);
         let mut items: Vec<(Pick, String, String)> =
@@ -670,7 +672,7 @@ pub fn show(ui: &mut egui::Ui, picker: &mut Picker, inp: GridInput<'_>) -> GridO
         );
         return out;
     }
-    egui::ScrollArea::vertical().max_height(inp.max_height).auto_shrink([false, true]).show(ui, |ui| {
+    egui::ScrollArea::vertical().max_height(inp.max_height).min_scrolled_height(inp.max_height.min(GRID_MIN_H)).auto_shrink([false, true]).show(ui, |ui| {
         let (cols, card_w) = grid_layout(ui.available_width() - 12.0, CARD_MIN_W, CARD_GAP);
         ui.spacing_mut().item_spacing = Vec2::splat(CARD_GAP);
         let items: Vec<(Pick, String, String)> = match picker.tab {

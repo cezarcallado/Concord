@@ -291,6 +291,12 @@ async fn a_session_reconnecting_from_the_server_pc_claims_it_too() {
 #[tokio::test]
 async fn a_login_from_a_non_loopback_address_does_not_claim() {
     // The real thing: connect to this machine's LAN address, so the TCP peer is not loopback.
+    // It must listen on every interface, so the firewall asks about every new test build: only
+    // with VOX_TEST_LAN=1 (the decision itself is unit-tested in hub/src/owner.rs).
+    if std::env::var_os("VOX_TEST_LAN").is_none() {
+        eprintln!("skipped: listens on the LAN (set VOX_TEST_LAN=1 to run it)");
+        return;
+    }
     let Some(lan) = lan_address() else {
         eprintln!("skipped: no non-loopback address on this machine (the decision is unit-tested in hub/src/owner.rs)");
         return;

@@ -70,6 +70,44 @@ pub fn button(ui: &mut Ui, kind: Kind, icon: Option<&str>, text: &str) -> Respon
 
 /// [`button`] of any [`Size`].
 pub fn button_sized(ui: &mut Ui, kind: Kind, sz: Size, icon: Option<&str>, text: &str) -> Response {
+    paint_button(ui, sz, icon, text, |h, p| button_colors(kind, h, p), None, kind == Kind::Ghost)
+}
+
+/// Fill, text and border of a [`card_button`] (`primary`: the lamp; else a raised grey that stands
+/// out on a card's [`theme::MOVEL`]).
+pub fn card_button_colors(primary: bool, hovered: bool, pressed: bool) -> (Color32, Color32, Color32) {
+    let pick = |idle, hover, down| if pressed { down } else if hovered { hover } else { idle };
+    if primary {
+        (pick(theme::ABAJUR, theme::ABAJUR_HOVER, theme::ABAJUR_PRESSED), theme::ABAJUR_TINTA, theme::ABAJUR_PRESSED)
+    } else {
+        (pick(theme::CAIXA, theme::CAIXA_HOVER, theme::MOVEL_PRESSED), theme::GIZ, theme::RISCO)
+    }
+}
+
+/// A button placed on a video card or the stage ("Assistir transmissão", "Ouvir o áudio", "Parar
+/// de ouvir"...): the card is [`theme::MOVEL`], the same as a [`Kind::Secondary`] button, which
+/// would read as plain text there. `primary` is the lamp (the card's one action); otherwise a
+/// raised grey. Both have a border, hover, pressed and disabled states and an optional icon.
+pub fn card_button(ui: &mut Ui, primary: bool, sz: Size, icon: Option<&str>, text: &str) -> Response {
+    let border = std::cell::Cell::new(theme::RISCO);
+    paint_button(
+        ui,
+        sz,
+        icon,
+        text,
+        |h, p| {
+            let (fill, fg, line) = card_button_colors(primary, h, p);
+            border.set(line);
+            (fill, fg)
+        },
+        Some(&border),
+        false,
+    )
+}
+
+/// The one painter behind every text button: size, icon, label, colours by state, an optional
+/// border (`border` is read after `colors` ran), the focus ring and the disabled look.
+fn paint_button(ui: &mut Ui, sz: Size, icon: Option<&str>, text: &str, colors: impl Fn(bool, bool) -> (Color32, Color32), border: Option<&std::cell::Cell<Color32>>, ghost: bool) -> Response {
     let h = sz.height();
     let painter = ui.painter();
     let label = (!text.is_empty()).then(|| painter.layout_no_wrap(text.to_owned(), theme::semibold(size::BUTTON), Color32::PLACEHOLDER));
@@ -81,14 +119,19 @@ pub fn button_sized(ui: &mut Ui, kind: Kind, sz: Size, icon: Option<&str>, text:
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
     if ui.is_rect_visible(rect) {
         let pressed = resp.is_pointer_button_down_on();
-        let (mut fill, mut fg) = button_colors(kind, resp.hovered(), pressed);
+        let (mut fill, mut fg) = colors(resp.hovered(), pressed);
+        let mut line = border.map(std::cell::Cell::get);
         if !ui.is_enabled() {
             // Disabled: every kind goes quiet the same way (readable, clearly not clickable).
-            fill = if kind == Kind::Ghost { Color32::TRANSPARENT } else { theme::MOVEL_PRESSED };
+            fill = if ghost { Color32::TRANSPARENT } else { theme::MOVEL_PRESSED };
             fg = theme::NEVOA.gamma_multiply(0.7);
+            line = line.map(|_| theme::RISCO);
         }
         let painter = ui.painter();
         painter.rect_filled(rect, radius::BUTTON, fill);
+        if let Some(l) = line {
+            painter.rect_stroke(rect, radius::BUTTON, Stroke::new(stroke::HAIRLINE, l), StrokeKind::Inside);
+        }
         if resp.has_focus() {
             painter.rect_stroke(rect, radius::BUTTON, Stroke::new(stroke::FOCUS, theme::GIZ), StrokeKind::Inside);
         }
@@ -285,6 +328,18 @@ pub fn paint_speaking_ring(painter: &egui::Painter, center: Pos2, r: f32, bg: Co
     paint_ring(painter, center, r, bg, theme::ABAJUR);
 }
 
+/// How far the speaking ring of an avatar of radius `r` reaches from its center (the gap, the ring
+/// and a point for the anti-aliasing).
+pub fn speaking_ring_reach(r: f32) -> f32 {
+    r + stroke::RING_GAP + stroke::SPEAKING + 1.0
+}
+
+/// The square the speaking ring of an avatar of radius `r` at `center` needs (paint it with a clip
+/// rect at least this big, or it is cut).
+pub fn speaking_ring_rect(center: Pos2, r: f32) -> Rect {
+    Rect::from_center_size(center, Vec2::splat(2.0 * speaking_ring_reach(r)))
+}
+
 /// A ring like the speaking one in another colour (the ringing window's caller, in chalk: the lamp
 /// is only for whoever speaks).
 pub fn paint_ring(painter: &egui::Painter, center: Pos2, r: f32, bg: Color32, color: Color32) {
@@ -307,6 +362,66 @@ pub fn avatar_initial(ui: &mut Ui, side: f32, initial: &str, color: Color32, spe
         }
     }
     resp
+}
+
+// ---------------------------------------------------------------- scroll probes (autotests)
+
+/// The key of the sidebar's channel list probe.
+pub const SIDEBAR_SCROLL: &str = "sidebar";
+
+/// What an autotest reads of a scroll area: its id, where it is on screen (to put the pointer
+/// over it), how tall its content is, how much of it shows and where it is scrolled to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollProbe {
+    pub id: egui::Id,
+    pub rect: Rect,
+    pub content_h: f32,
+    pub view_h: f32,
+    pub offset: f32,
+}
+
+impl ScrollProbe {
+    pub fn of<R>(out: &egui::scroll_area::ScrollAreaOutput<R>) -> Self {
+        ScrollProbe { id: out.id, rect: out.inner_rect, content_h: out.content_size.y, view_h: out.inner_rect.height(), offset: out.state.offset.y }
+    }
+
+    /// The content is taller than what shows: there is something to scroll.
+    pub fn scrolls(&self) -> bool {
+        self.content_h > self.view_h + 1.0
+    }
+
+    /// The furthest it scrolls.
+    pub fn max_offset(&self) -> f32 {
+        (self.content_h - self.view_h).max(0.0)
+    }
+}
+
+/// Autotests only (the caller checks): remember what a scroll area showed this frame under `key`.
+pub fn note_scroll<R>(ctx: &egui::Context, key: &str, out: &egui::scroll_area::ScrollAreaOutput<R>) {
+    note_scroll_probe(ctx, key, ScrollProbe::of(out));
+}
+
+pub fn note_scroll_probe(ctx: &egui::Context, key: &str, probe: ScrollProbe) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(("scroll_probe", key)), probe));
+}
+
+/// What [`note_scroll`] saw last.
+pub fn scroll_probe(ctx: &egui::Context, key: &str) -> Option<ScrollProbe> {
+    ctx.data(|d| d.get_temp(egui::Id::new(("scroll_probe", key))))
+}
+
+/// Autotests: scroll the area noted under `key` by `delta` points (positive: towards the end),
+/// as the mouse wheel would; done by [`apply_scroll_request`] the next time it is drawn.
+pub fn scroll_request(ctx: &egui::Context, key: &str, delta: f32) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(("scroll_request", key)), delta));
+}
+
+/// Autotests only (the caller checks): inside the scroll area's content, do the scroll asked for.
+pub fn apply_scroll_request(ui: &Ui, key: &str) {
+    let id = egui::Id::new(("scroll_request", key));
+    if let Some(delta) = ui.data_mut(|d| d.remove_temp::<f32>(id)) {
+        ui.scroll_with_delta_animation(Vec2::new(0.0, -delta), egui::style::ScrollAnimation::none());
+    }
 }
 
 // ---------------------------------------------------------------- fields, frames
@@ -386,6 +501,15 @@ pub fn menu_row(ui: &mut Ui, icon: &str, text: &str, danger: bool) -> Response {
 /// [`menu_row`] with an icon colour of its own (a presence dot) and, for a submenu, a caret on the
 /// right (`caret`; kept lit while the submenu is open).
 pub fn menu_row_ex(ui: &mut Ui, icon: &str, icon_color: Option<Color32>, text: &str, danger: bool, caret: bool) -> Response {
+    menu_row_full(ui, icon, icon_color, text, danger, caret, None)
+}
+
+/// [`menu_row`] with its keyboard shortcut quiet on the right ("Ctrl+V").
+pub fn menu_row_hint(ui: &mut Ui, icon: &str, text: &str, hint: &str) -> Response {
+    menu_row_full(ui, icon, None, text, false, false, Some(hint))
+}
+
+fn menu_row_full(ui: &mut Ui, icon: &str, icon_color: Option<Color32>, text: &str, danger: bool, caret: bool, hint: Option<&str>) -> Response {
     let w = ui.available_width().max(160.0);
     let id = ui.next_auto_id();
     let open = caret && egui::containers::menu::MenuState::from_ui(ui, |s, _| s.open_item == Some(egui::containers::menu::SubMenu::id_from_widget_id(id)));
@@ -408,6 +532,10 @@ pub fn menu_row_ex(ui: &mut Ui, icon: &str, icon_color: Option<Color32>, text: &
         p.text(Pos2::new(rect.left() + 34.0, rect.center().y), Align2::LEFT_CENTER, text, theme::body(13.5), fg);
         if caret {
             p.text(Pos2::new(rect.right() - 8.0, rect.center().y), Align2::RIGHT_CENTER, ph::CARET_RIGHT, theme::body(14.0), theme::NEVOA);
+        }
+        if let Some(h) = hint {
+            let c = if on { theme::NEVOA } else { theme::NEVOA.gamma_multiply(0.5) };
+            p.text(Pos2::new(rect.right() - 8.0, rect.center().y), Align2::RIGHT_CENTER, h, theme::body(12.0), c);
         }
     }
     resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), text));
@@ -525,6 +653,39 @@ pub fn notice_text(ui: &mut Ui, kind: Notice, text: &str) {
 
 /// Width of a confirmation dialog's content.
 pub const DIALOG_W: f32 = 380.0;
+/// What a [`dialog_frame`] dialog keeps outside its body's [`dialog_scroll`]: the title, a row
+/// of buttons, the margins and a gap around the dialog.
+pub const DIALOG_RESERVE: f32 = 170.0;
+
+/// v1.1 I6: a dialog's content width, `want` or less so the dialog (its margins and a gap around
+/// it) stays inside a small or zoomed-in window.
+pub fn dialog_w(ctx: &egui::Context, want: f32) -> f32 {
+    want.min(ctx.content_rect().width() - 72.0).max(160.0)
+}
+
+/// v1.1 I6: a window's size, `want` or less so it stays inside the app's window with `gap` around
+/// it; `min` only while the window has room for it.
+pub fn fit_size(ctx: &egui::Context, want: Vec2, min: Vec2, gap: f32) -> Vec2 {
+    let room = ctx.content_rect().size() - Vec2::splat(2.0 * gap);
+    want.min(room).max(min.min(room))
+}
+
+/// v1.1 I6: a dialog's body, in a vertical scroll once the app's window is too short for it (a
+/// small or zoomed-in window): `reserve` is what the dialog keeps outside the scroll (its title,
+/// its buttons, its margins and a gap around it), so those always show.
+pub fn dialog_scroll<R>(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, reserve: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let max_h = (ui.ctx().content_rect().height() - reserve).max(60.0);
+    egui::ScrollArea::vertical().id_salt(id).max_height(max_h).auto_shrink([false, true]).show(ui, add).inner
+}
+
+/// The quiet text after a header's title ("3 pessoas · 1 em foco", "@nome"): cut with "…" to the
+/// room left, and left out when there is hardly any (never drawn under the header's buttons, which
+/// are laid out first).
+pub fn header_extra(ui: &mut Ui, text: Option<String>, size: f32) {
+    if let Some(t) = text.filter(|_| ui.available_width() >= 48.0) {
+        ui.add(egui::Label::new(RichText::new(t).font(theme::body(size)).color(theme::NEVOA)).truncate().selectable(false));
+    }
+}
 
 /// The frame of a dialog: [`theme::PAREDE`], hairline outline, radius 10, roomy margins and the
 /// popup shadow (a dialog floats like a popup).
@@ -576,11 +737,11 @@ pub fn confirm(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug, 
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
         .frame(dialog_frame(&ctx.global_style()))
         .show(ctx, |ui| {
-            ui.set_width(DIALOG_W);
+            ui.set_width(dialog_w(ctx, DIALOG_W));
             ui.spacing_mut().item_spacing.y = 6.0;
             dialog_title(ui, title);
             ui.add_space(space::S);
-            body(ui);
+            dialog_scroll(ui, "kit_confirm_body", DIALOG_RESERVE, body);
             ui.add_space(space::XL);
             // One row high (a bare right-to-left layout would take the window's whole height).
             ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), Size::Normal.height()), egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -616,6 +777,18 @@ pub fn info_row<R>(ui: &mut Ui, label_w: f32, label: &str, value: impl FnOnce(&m
 /// Returns the page clicked.
 pub fn nav_list(ui: &mut Ui, pages: &[(&str, &str)], open: usize) -> Option<usize> {
     let mut picked = None;
+    if nav_compact(ui) {
+        // I6, a narrow window: the pages as icons (their names on hover).
+        ui.vertical_centered(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            for (i, (icon, name)) in pages.iter().enumerate() {
+                if icon_button(ui, icon, name, if i == open { IconState::On } else { IconState::Normal }).clicked() {
+                    picked = Some(i);
+                }
+            }
+        });
+        return picked;
+    }
     for (i, (icon, name)) in pages.iter().enumerate() {
         let (r, _) = sidebar_row(ui, Row { icon, name, label: name, selected: i == open, unread: false, count: 0, mentions: 0, hover: None });
         if r.clicked() {
@@ -627,14 +800,23 @@ pub fn nav_list(ui: &mut Ui, pages: &[(&str, &str)], open: usize) -> Option<usiz
 
 /// Width of the page list of a [`settings_window`].
 pub const NAV_W: f32 = 236.0;
+/// I6: its width in a narrow window (the pages as icons).
+pub const NAV_ICONS_W: f32 = 52.0;
+/// The narrowest page beside the page list with its names (else the list goes to icons).
+pub const PAGE_MIN_W: f32 = 440.0;
+
+/// The page list of a [`settings_window`] is the narrow one (icons only): its `ui` is that narrow.
+pub fn nav_compact(ui: &Ui) -> bool {
+    ui.available_width() < 120.0
+}
 
 /// A settings-like window (the server window...): no title bar, the page list on the left on
 /// [`theme::PAREDE`] (`nav`) and the open page on the right on [`theme::NOITE`] (`page`, in a
 /// vertical scroll, with a close button in its corner). `size` is clamped to the app's window.
 /// Returns false once the close button (or Esc, when `esc` is true) closed it.
 pub fn settings_window(ctx: &egui::Context, id: &str, size: Vec2, esc: bool, nav: impl FnOnce(&mut Ui), page: impl FnOnce(&mut Ui)) -> bool {
-    let screen = ctx.content_rect();
-    let size = Vec2::new(size.x.min(screen.width() - 32.0).max(480.0), size.y.min(screen.height() - 32.0).max(320.0));
+    // (I6: the minimum only while the window has room: never past its edges.)
+    let size = fit_size(ctx, size, Vec2::new(480.0, 320.0), 16.0);
     let mut open = !(esc && ctx.input(|i| i.key_pressed(egui::Key::Escape)));
     let frame = Frame::new().fill(theme::PAREDE).stroke(Stroke::new(stroke::HAIRLINE, theme::RISCO)).corner_radius(radius::POPUP).shadow(ctx.global_style().visuals.popup_shadow);
     egui::Window::new(id)
@@ -648,12 +830,15 @@ pub fn settings_window(ctx: &egui::Context, id: &str, size: Vec2, esc: bool, nav
         .show(ctx, |ui| {
             let full = Rect::from_min_size(ui.max_rect().min, size);
             ui.allocate_rect(full, Sense::hover());
-            let nav_rect = Rect::from_min_max(full.min, Pos2::new(full.left() + NAV_W, full.bottom()));
+            let nav_w = if size.x - NAV_W >= PAGE_MIN_W { NAV_W } else { NAV_ICONS_W };
+            let nav_rect = Rect::from_min_max(full.min, Pos2::new(full.left() + nav_w, full.bottom()));
             let page_rect = Rect::from_min_max(Pos2::new(nav_rect.right(), full.top()), full.max);
             let r = radius::POPUP;
             ui.painter().rect_filled(page_rect, CornerRadius { nw: 0, sw: 0, ne: r, se: r }, theme::NOITE);
             ui.painter().vline(page_rect.left(), page_rect.y_range(), Stroke::new(stroke::HAIRLINE, theme::RISCO));
-            let mut nav_ui = ui.new_child(egui::UiBuilder::new().max_rect(nav_rect.shrink2(Vec2::new(10.0, 14.0))).layout(egui::Layout::top_down(egui::Align::Min)));
+            let nav_inner = nav_rect.shrink2(Vec2::new(if nav_w < NAV_W { 6.0 } else { 10.0 }, 14.0));
+            let mut nav_ui = ui.new_child(egui::UiBuilder::new().max_rect(nav_inner).layout(egui::Layout::top_down(egui::Align::Min)));
+            nav_ui.set_clip_rect(nav_rect.intersect(ui.clip_rect()));
             nav(&mut nav_ui);
             let close = Rect::from_min_size(Pos2::new(page_rect.right() - 44.0, page_rect.top() + 12.0), Vec2::splat(30.0));
             let inner = Rect::from_min_max(page_rect.min + Vec2::new(28.0, 22.0), page_rect.max - Vec2::new(12.0, 8.0));
@@ -722,6 +907,15 @@ pub fn gallery(ui: &mut Ui, g: &mut Gallery) {
                     button_sized(ui, kind, Size::Large, Some(icon), "");
                 }
                 button_sized(ui, Kind::Primary, Size::Large, Some(ph::SCREENCAST), "Transmitir");
+            });
+            // v1.1: the buttons that sit on a video card ("Assistir transmissão", "Ouvir o áudio").
+            Frame::new().fill(theme::MOVEL).corner_radius(radius::CARD).inner_margin(Margin::same(10)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    card_button(ui, true, Size::Normal, Some(ph::PLAY), "Assistir transmissão");
+                    card_button(ui, true, Size::Small, Some(ph::SPEAKER_HIGH), "Ouvir o áudio");
+                    card_button(ui, false, Size::Small, None, "Parar de ouvir");
+                    ui.add_enabled_ui(false, |ui| card_button(ui, true, Size::Small, Some(ph::PLAY), "Assistir"));
+                });
             });
             ui.horizontal(|ui| {
                 icon_button(ui, ph::MICROPHONE, "Mutar", IconState::Normal);

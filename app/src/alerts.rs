@@ -12,7 +12,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use vox_client_core::audio::alerts::Palette;
 use vox_client_core::AlertKind;
 use vox_proto::{ChannelId, User, UserId, VoiceMember};
 
@@ -70,12 +71,50 @@ pub struct AlertSettings {
     /// "Mensagem nova em outro canal": the soft sound of a channel message (and, from v0.8, the
     /// brighter one of a mention). On by default; older settings files get the default.
     pub chat: bool,
+    /// v1.1: "Som dos avisos", the palette every alert plays, saved as its stable key
+    /// ("atual" | "madeira" | "gota" | "sino_suave"). Missing (every file from before v1.1) or
+    /// unknown (a newer app's palette): Sino suave.
+    #[serde(serialize_with = "palette_to_key", deserialize_with = "palette_from_key")]
+    pub palette: Palette,
 }
 
 impl Default for AlertSettings {
     fn default() -> Self {
-        Self { enabled: true, volume_pct: 60, presence: false, room: true, streams: true, own_state: true, dms: true, calls: true, chat: true }
+        Self { enabled: true, volume_pct: 60, presence: false, room: true, streams: true, own_state: true, dms: true, calls: true, chat: true, palette: Palette::SinoSuave }
     }
+}
+
+fn palette_to_key<S: Serializer>(p: &Palette, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(p.key())
+}
+
+/// Never fails: anything but a known key (another type included) is Sino suave, so a bad value
+/// cannot cost the rest of the settings file.
+fn palette_from_key<'de, D: Deserializer<'de>>(d: D) -> Result<Palette, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_str().and_then(Palette::from_key).unwrap_or(Palette::SinoSuave))
+}
+
+/// "Som dos avisos" (Configurações → Notificações), in the order shown.
+pub const PALETTE_CHOICES: [(Palette, &str); 4] = [
+    (Palette::SinoSuave, "Sino suave (padrão)"),
+    (Palette::Gota, "Gota"),
+    (Palette::Madeira, "Madeira"),
+    (Palette::Atual, "Clássico (1.0)"),
+];
+
+/// The label of `p` in "Som dos avisos".
+pub fn palette_label(p: Palette) -> &'static str {
+    PALETTE_CHOICES.iter().find(|(q, _)| *q == p).map_or("", |(_, l)| *l)
+}
+
+/// "Ouvir": what the preview of a palette plays, and when (seconds after the click). Someone
+/// arriving, a direct message, a mention: the low, the middle and the brightest of the family.
+pub const PALETTE_PREVIEW: [(f64, AlertKind); 3] = [(0.0, AlertKind::Join), (0.7, AlertKind::DirectMessage), (1.4, AlertKind::Mention)];
+
+/// Apply the saved choice to every alert of this process (startup, and each change).
+pub fn apply_palette(settings: &AlertSettings) {
+    vox_client_core::audio::alerts::set_palette(settings.palette);
 }
 
 impl AlertSettings {
@@ -321,7 +360,7 @@ mod tests {
 
     #[test]
     fn every_alert_belongs_to_one_category_and_the_switches_work() {
-        let all_off = AlertSettings { enabled: true, volume_pct: 60, presence: false, room: false, streams: false, own_state: false, dms: false, calls: false, chat: false };
+        let all_off = AlertSettings { enabled: true, volume_pct: 60, presence: false, room: false, streams: false, own_state: false, dms: false, calls: false, chat: false, ..AlertSettings::default() };
         for k in AlertKind::ALL {
             assert!(!all_off.allows(k), "{k:?}");
         }
@@ -371,6 +410,63 @@ mod tests {
         assert!(s.chat, "a settings file from before the chat sounds gets them on");
         let back: AlertSettings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn the_palette_defaults_to_sino_suave_for_new_and_old_settings_files() {
+        assert_eq!(AlertSettings::default().palette, Palette::SinoSuave);
+        // A settings file from v1.0 (an `alerts` block without the field) and one with no alerts
+        // at all: both get the new sound.
+        let old = r#"{"server":"http://x:7890","username":"ana","alerts":{"enabled":true,"volume_pct":40,"presence":true,"room":true,"streams":true,"own_state":true,"dms":true,"calls":true,"chat":true}}"#;
+        let s: crate::settings::Settings = serde_json::from_str(old).unwrap();
+        assert_eq!((s.alerts.palette, s.alerts.volume_pct, s.alerts.presence), (Palette::SinoSuave, 40, true));
+        let s: crate::settings::Settings = serde_json::from_str(r#"{"server":"x"}"#).unwrap();
+        assert_eq!(s.alerts.palette, Palette::SinoSuave);
+        let s: crate::settings::Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.alerts.palette, Palette::SinoSuave);
+    }
+
+    #[test]
+    fn the_palette_is_saved_as_a_stable_key_and_unknown_values_fall_back() {
+        for p in Palette::ALL {
+            let s = AlertSettings { palette: p, ..AlertSettings::default() };
+            let json = serde_json::to_value(s).unwrap();
+            assert_eq!(json["palette"], p.key(), "{p:?}");
+            assert_eq!(serde_json::from_value::<AlertSettings>(json).unwrap(), s);
+        }
+        let key = |v: &str| serde_json::from_str::<AlertSettings>(&format!(r#"{{"palette":{v}}}"#)).unwrap().palette;
+        assert_eq!(key(r#""atual""#), Palette::Atual);
+        assert_eq!(key(r#""madeira""#), Palette::Madeira);
+        assert_eq!(key(r#""gota""#), Palette::Gota);
+        assert_eq!(key(r#""sino_suave""#), Palette::SinoSuave);
+        // A palette from a newer app, a renamed label, a wrong type: Sino suave, and the rest of
+        // the file still loads.
+        for v in [r#""cristal""#, r#""Sino suave""#, r#"" ""#, "3", "null", "true", "[]", r#"{"a":1}"#] {
+            assert_eq!(key(v), Palette::SinoSuave, "{v}");
+        }
+        let s: crate::settings::Settings = serde_json::from_str(r#"{"username":"ana","alerts":{"palette":7,"volume_pct":35}}"#).unwrap();
+        assert_eq!((s.username.as_str(), s.alerts.volume_pct, s.alerts.palette), ("ana", 35, Palette::SinoSuave));
+        // An app from before v1.1 reading a new file just ignores the field.
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct OldAlerts {
+            enabled: bool,
+            volume_pct: u32,
+        }
+        let new = serde_json::to_string(&AlertSettings { palette: Palette::Gota, ..AlertSettings::default() }).unwrap();
+        assert!(serde_json::from_str::<OldAlerts>(&new).is_ok());
+    }
+
+    #[test]
+    fn the_palette_choices_cover_every_palette_once_with_sino_suave_first() {
+        assert_eq!(PALETTE_CHOICES[0], (Palette::SinoSuave, "Sino suave (padrão)"));
+        assert_eq!(palette_label(Palette::Atual), "Clássico (1.0)");
+        for p in Palette::ALL {
+            assert_eq!(PALETTE_CHOICES.iter().filter(|(q, _)| *q == p).count(), 1, "{p:?}");
+            assert!(!palette_label(p).is_empty());
+        }
+        // The preview is short and in order.
+        assert!(PALETTE_PREVIEW.windows(2).all(|w| w[0].0 < w[1].0) && PALETTE_PREVIEW[2].0 < 2.0);
     }
 
     #[test]

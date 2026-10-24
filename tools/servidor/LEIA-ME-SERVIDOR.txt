@@ -1,4 +1,4 @@
-CONCORD - SERVIDOR DEDICADO (v1.0.2)
+CONCORD - SERVIDOR DEDICADO (v1.1)
 ====================================
 
 Dica: o jeito mais fácil de hospedar é pelo próprio app (concord.exe >
@@ -37,6 +37,17 @@ PASSO A PASSO
      apontando para este PC (não funciona se a operadora usar CGNAT).
    Depois, no app, use "Convidar" para gerar um código e mande para eles.
 
+ATUALIZANDO DE UMA VERSÃO ANTERIOR (1.0.x)
+1. Feche a janela do servidor (Ctrl+C).
+2. Copie o bin\concord-server.exe deste zip por cima do antigo. Não
+   mexa na pasta "data": mensagens, contas e senha continuam lá.
+3. Ligue de novo pelo iniciar-servidor.bat.
+O config.toml antigo serve como está: sem a linha tls, o servidor usa
+tls = "auto" (conexão protegida para os apps 1.1, apps antigos ainda
+entram). Só com o servidor 1.1 funcionam a conexão protegida, as
+mensagens diretas e chamadas criptografadas de ponta a ponta e o
+"parar som" para todos na sala.
+
 DIAGNÓSTICO (novo na v1.0.2)
 Alguns segundos depois de ligar, a janela do servidor mostra:
 - onde ele escuta (IPv4 e IPv6);
@@ -65,7 +76,32 @@ um config antigo com "0.0.0.0:7890" também passa a escutar nos dois).
 Para voltar a só IPv4, acrescente esta linha no data\config.toml:
    ipv6 = false
 
+CONEXÃO PROTEGIDA (novo na v1.1)
+- O servidor 1.1 fala com o app 1.1 (ou mais novo) por conexão protegida
+  (TLS): senhas, convites, mensagens e imagens vão criptografados. Não
+  é preciso abrir nenhuma porta nova.
+- Na primeira vez que liga, o servidor cria o próprio certificado, na
+  pasta data\tls. A janela do servidor mostra o CÓDIGO DO SERVIDOR (ex.:
+  K7QM-2D9X-4HVA-PB1C). Quem entra pode conferir o mesmo código no app:
+  menu do servidor > "Segurança da conexão". Os convites novos já levam
+  esse código e o app confere sozinho.
+- Ao trocar o servidor de PC, leve a pasta data INTEIRA (com data\tls).
+  Sem ela o servidor cria um certificado novo e o app de todo mundo avisa
+  "A identidade do servidor mudou" (aí cada um precisa de um convite
+  novo).
+- Apps antigos (antes da 1.1) ainda entram, sem proteção. Para recusar,
+  ponha no data\config.toml:
+     tls = "required"
+  Eles passam a ver "Este servidor exige o concord 1.1 ou mais novo
+  (conexão protegida)." Este próprio PC (127.0.0.1) sempre entra.
+- Não volte para uma versão antiga do servidor: quem já usou a conexão
+  protegida não conecta mais sem ela (de propósito). Se precisar mesmo
+  voltar, cada pessoa tira o servidor da lista no app ("Remover da
+  lista") e adiciona de novo.
+
 IMPORTANTE
-- A pasta "data" é secreta: ela tem a senha do servidor, as chaves e o
-  banco de dados com as mensagens. Nunca envie essa pasta para ninguém.
-- A conexão ainda não é criptografada. Leia o SECURITY.md do repositório.
+- A pasta "data" é secreta: ela tem a senha do servidor, as chaves, o
+  certificado (data\tls\server.key) e o banco de dados com as mensagens.
+  Nunca envie essa pasta para ninguém.
+- Quem hospeda continua podendo ver o que passa pelo servidor (o banco
+  guarda as mensagens). Leia o SECURITY.md do repositório.

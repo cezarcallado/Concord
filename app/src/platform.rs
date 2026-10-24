@@ -5,8 +5,9 @@
 //!   Mac" instead of failing. The flags are set from what the listing calls the app makes anyway
 //!   return (no extra probes, so no permission prompt), and flip on by themselves once the backend
 //!   lists something. Windows never sets them.
-//! - Global push-to-talk needs a system-wide key hook (Windows: a low-level keyboard hook; macOS:
-//!   the Accessibility permission, phase M4).
+//! - Global push-to-talk and keyboard shortcuts need a system-wide key hook (Windows: a low-level
+//!   keyboard hook; macOS: the Input Monitoring / Accessibility permission, phase M4). On the Mac
+//!   the shortcuts work with the window in front.
 //! - Hosting a server from the app: the pinned LiveKit download is the Windows build (macOS: M4).
 //! - Opening a link or a folder: the shell on Windows, `open` on macOS.
 
@@ -14,6 +15,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The label of a control that is not there on this system yet.
 pub const SOON_MAC: &str = "Em breve no Mac";
+/// The same in the middle of a sentence ("Câmera: em breve no Mac"; `to_lowercase` would also
+/// lower the "Mac").
+pub const SOON_MAC_LC: &str = "em breve no Mac";
 
 static SCREEN_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 static CAMERA_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
@@ -58,6 +62,13 @@ pub const HOSTING_SOON: bool = !cfg!(windows);
 
 /// Push-to-talk with a key that works while another app has the focus.
 pub const fn global_ptt() -> bool {
+    cfg!(windows)
+}
+
+/// Keyboard shortcuts ("Atalhos") that work while another app has the focus: the low-level
+/// keyboard hook on Windows. macOS: only with concord's window in front (a global listener there
+/// needs the Input Monitoring / Accessibility permission and a CGEventTap; not done yet).
+pub const fn global_keybinds() -> bool {
     cfg!(windows)
 }
 

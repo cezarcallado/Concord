@@ -35,7 +35,7 @@ use crate::{
 };
 
 pub use camera::{camera_diagnostics, camera_property_pages, list_camera_formats, list_cameras, start_camera, CameraInner, CameraOutput};
-pub use content::{is_window_minimized, list_monitors, list_windows};
+pub use content::{is_window_minimized, list_monitors, list_windows, window_app};
 pub use stream::{start_audio, start_video, AudioInner, VideoInner};
 pub use thumb::{window_icon, GrabberInner};
 

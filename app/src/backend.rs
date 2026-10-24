@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 use vox_capture::{MonitorInfo, WindowInfo};
 use vox_client_core::audio::device::{default_device_name, list_devices};
+use vox_client_core::audio::MicStatus;
 use vox_client_core::golive::{capture_call, SwitchRequest};
 use vox_client_core::hub::{HubClient, HubEvent, HubSender};
 use vox_client_core::stats::Reporter;
@@ -24,9 +25,14 @@ use vox_client_core::{
 use vox_proto::{ChannelId, ClientEvent, Message, MessageId, ServerEvent, User, UserId, PROTOCOL_VERSION, WATCH_STATE_REJECTED};
 
 mod camera;
+pub mod e2ee;
 mod sounds;
+mod thumbs;
+pub mod tls;
 
 pub use camera::CameraLiveInfo;
+pub use tls::{PinSource, TlsPlan};
+use vox_client_core::tls::Pin;
 
 /// Voice options captured when joining.
 #[derive(Debug, Clone, Default)]
@@ -63,6 +69,9 @@ pub enum Cmd {
         /// v1.0.1: which of the secrets above were saved on this computer, and for which server
         /// (they are sent only to that server, see [`Guard`]).
         guard: Guard,
+        /// v1.1 (T0): the certificate the server must have, and where the address came from (the
+        /// trust rules, `backend/tls.rs`).
+        tls: TlsPlan,
     },
     Logout,
     /// v0.8: an invite call (create, list, revoke); answer: `Ev::Invite`.
@@ -71,6 +80,8 @@ pub enum Cmd {
     Admin(crate::roles::AdminCmd),
     /// The server soundboard (answers: `Ev::Sound`).
     Sound(crate::soundboard::SoundCmd),
+    /// v1.1 (E0): the device list of my account, "Remover" (answers: `Ev::E2ee`).
+    E2ee(e2ee::E2eeCmd),
     LoadHistory {
         channel: ChannelId,
         before: Option<MessageId>,
@@ -87,6 +98,15 @@ pub enum Cmd {
     LinkPreviewImage {
         url: String,
     },
+    /// Someone's Go Live hover preview (v1.1; answer: `Ev::StreamCard`). `have_icon`: the icon
+    /// hash already cached.
+    StreamPreview {
+        user: UserId,
+        have_icon: Option<String>,
+    },
+    /// "Prévia da minha transmissão ao passar o mouse" (v1.1): may my live's still picture go to
+    /// the hub? Sent at start and on every change; off mid-live drops the hub's copy.
+    StreamPreviewUpload(bool),
     SendMessage {
         channel: ChannelId,
         content: String,
@@ -211,6 +231,9 @@ pub enum Cmd {
     /// Push-to-talk mode on/off (while on, the mic is only open while the key is held).
     SetPtt(bool),
     PttKey(bool),
+    /// Another microphone was picked in the settings (`None`: the system default): a call in
+    /// progress follows it at once.
+    SetInputDevice(Option<String>),
     /// "Testar microfone": open the mic and play it back locally with the gate applied.
     /// Nothing is sent to the room, even when in voice.
     StartMicTest {
@@ -253,9 +276,28 @@ pub enum Ev {
         /// (a matching id, the address the user typed or picked, or an accepted invite), so the
         /// entry may keep it.
         pin: bool,
+        /// v1.1 (T0): the certificate this session is pinned to (`None`: plain HTTP, an older
+        /// hub: the open lock).
+        tls_pin: Option<Pin>,
+        /// v1.1 (T0): `tls_pin` was seen on this login for the first time (kept only when the
+        /// login confirmed the server, `pin`).
+        tls_learned: bool,
+    },
+    /// v1.1 (T0): the server answered with another certificate than the one saved / in the
+    /// invite. Nothing was sent. "A identidade do servidor mudou".
+    TlsMismatch {
+        url: String,
+        expected: Pin,
+        got: Pin,
+    },
+    /// v1.1 (T0): a typed address without TLS (an older hub): ask before plain HTTP.
+    PlainPrompt {
+        url: String,
     },
     /// The soundboard: the list, who played what, upload results.
     Sound(crate::soundboard::SoundEv),
+    /// v1.1 (E0): this computer's identity on the server's device list, and new devices of mine.
+    E2ee(e2ee::E2eeEv),
     /// The answer to a `Cmd::Admin`.
     Admin {
         cmd: crate::roles::AdminCmd,
@@ -278,6 +320,8 @@ pub enum Ev {
         messages: Vec<Message>,
     },
     Avatar(crate::avatars::AvatarEv),
+    /// Go Live hover cards (v1.1): whether the hub keeps previews, and the answers.
+    StreamCard(crate::stream_cards::CardEv),
     Profile(crate::profile::ProfileEv),
     /// Direct messages: the answers to `Cmd::Dm`.
     Dm(crate::app::dms::DmEv),
@@ -300,7 +344,12 @@ pub enum Ev {
         warning: Option<String>,
         /// Listen-only: the microphone could not be used.
         no_mic: bool,
+        /// v1.1 (E1): the room's media is end-to-end encrypted.
+        e2ee: bool,
     },
+    /// v1.1 (E1): somebody joined our encrypted call from a device that appeared under their
+    /// account after this computer first knew them ("Fulano entrou de um aparelho novo").
+    CallNewDevice { identity: String },
     VoiceFailed {
         /// Channel to offer a retry for.
         channel: Option<ChannelId>,
@@ -389,6 +438,8 @@ pub struct AudioInfo {
     pub kbps: Option<f64>,
     /// Negotiated codec ("audio/opus 48000 Hz ch=2 ... stereo=1").
     pub codec: String,
+    /// v1.1 (E1, autotests): the longest stretch without sound since the previous report (ms).
+    pub max_quiet_ms: u64,
 }
 
 /// Wakes the egui loop from backend threads.
@@ -543,6 +594,9 @@ struct Controller {
     out: Out,
     no_mic: bool,
     no_playback: bool,
+    /// The microphone picked in the settings: a join in flight opens what it was started with,
+    /// and this is what the session must be using once it is up.
+    input_device: Option<String>,
 
     creds: Option<Creds>,
     hub: Option<Arc<HubClient>>,
@@ -593,6 +647,10 @@ struct Controller {
     ui_player: UiPlayer,
     /// The server soundboard (see `backend/sounds.rs`).
     sb: sounds::SoundState,
+    /// Go Live hover pictures (see `backend/thumbs.rs`).
+    thumbs: thumbs::ThumbState,
+    /// v1.1 (E0): this computer's identity key on the server (see `backend/e2ee.rs`).
+    e2ee: e2ee::E2eeBackend,
 }
 
 fn env_flag(name: &str) -> bool {
@@ -614,6 +672,7 @@ impl Controller {
             out,
             no_mic,
             no_playback,
+            input_device: None,
             creds: None,
             hub: None,
             hub_tx: None,
@@ -646,6 +705,8 @@ impl Controller {
             cam: Default::default(),
             ui_player: UiPlayer::new(),
             sb: Default::default(),
+            thumbs: Default::default(),
+            e2ee: Default::default(),
         }
     }
 
@@ -683,17 +744,18 @@ impl Controller {
 
     async fn on_cmd(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::Connect { url, user, password, personal, device_token, remember_device, invite, guard } => {
+            Cmd::Connect { url, user, password, personal, device_token, remember_device, invite, guard, tls } => {
                 let (url, invite) = match invite {
-                    Some(join) => (pick(&join.urls, &guard).await.unwrap_or(url), join.token),
+                    Some(join) => (pick(&join.urls, &guard, &tls).await.unwrap_or(url), join.token),
                     None => (url, None),
                 };
                 let creds = Creds { personal, device_token, user, password, invite, server_id: None };
-                self.connect(url, creds, remember_device, &guard).await
+                self.connect(url, creds, remember_device, &guard, &tls).await
             }
             Cmd::Admin(cmd) => self.admin(cmd).await,
             Cmd::Invite(cmd) => self.invite(cmd),
             Cmd::Sound(cmd) => self.sound_cmd(cmd),
+            Cmd::E2ee(cmd) => self.e2ee_cmd(cmd),
             Cmd::Logout => {
                 self.teardown().await;
                 self.out.send(Ev::LoggedOut { reason: None });
@@ -744,6 +806,8 @@ impl Controller {
                     out.send(Ev::Preview { url, reply });
                 });
             }
+            Cmd::StreamPreview { user, have_icon } => self.stream_card_fetch(user, have_icon),
+            Cmd::StreamPreviewUpload(on) => self.thumbs_allow(on),
             Cmd::LinkPreviewImage { url } => {
                 let out = self.out.clone();
                 let Some(hub) = self.hub.clone() else {
@@ -792,8 +856,9 @@ impl Controller {
                     out.send(Ev::Dm(cmd.offline()));
                     return;
                 };
+                let e2 = self.e2ee.clone();
                 tokio::spawn(async move {
-                    let ev = crate::app::dms::run(&hub, cmd).await;
+                    let ev = crate::app::dms::run(&hub, &e2, cmd).await;
                     out.send(Ev::Dm(ev));
                 });
             }
@@ -803,8 +868,9 @@ impl Controller {
                     out.send(Ev::Image(cmd.offline()));
                     return;
                 };
+                let e2 = self.e2ee.clone();
                 tokio::spawn(async move {
-                    crate::chat_images::run(&hub, cmd, |ev| out.send(Ev::Image(ev))).await;
+                    crate::chat_images::run(&hub, &e2, cmd, |ev| out.send(Ev::Image(ev))).await;
                 });
             }
             Cmd::LeaveVoice => self.leave_voice(true).await,
@@ -832,6 +898,12 @@ impl Controller {
                     t.set_volume(pct.min(200) as f32 / 100.0);
                 }
             }
+            Cmd::SetInputDevice(device) => {
+                self.input_device = device.clone();
+                if let Some(v) = &self.voice {
+                    v.set_input_device(device);
+                }
+            }
             Cmd::StartMicTest { input_device, output_device, volume_pct, gate, noise } => {
                 self.start_mic_test(input_device, output_device, volume_pct, gate, noise);
             }
@@ -852,20 +924,28 @@ impl Controller {
                 tokio::task::spawn_blocking(move || {
                     let mut error = None;
                     let mut unsupported = false;
-                    let windows = capture_call("list_windows", vox_capture::list_windows).unwrap_or_else(|e| {
+                    let mut windows = capture_call("list_windows", vox_capture::list_windows).unwrap_or_else(|e| {
                         unsupported |= crate::platform::is_unsupported_any(&e);
                         error = Some(format!("{e:#}"));
                         Vec::new()
                     });
-                    let monitors = capture_call("list_monitors", vox_capture::list_monitors).unwrap_or_else(|e| {
+                    let mut monitors = capture_call("list_monitors", vox_capture::list_monitors).unwrap_or_else(|e| {
                         unsupported |= crate::platform::is_unsupported_any(&e);
                         error.get_or_insert(format!("{e:#}"));
                         Vec::new()
                     });
+                    // Unattended tests: the picker (and its thumbnails) shows the test windows
+                    // only, never the person's screens or windows (see `testmode`).
+                    if vox_client_core::testmode::guards_real_capture() {
+                        let before = (windows.len(), monitors.len());
+                        windows.retain(|w| vox_client_core::testmode::is_test_capture_exe(&w.exe_name));
+                        monitors.clear();
+                        info!(windows = before.0, monitors = before.1, kept = windows.len(), "test mode: sources other than the test windows left out");
+                    }
                     // macOS before its capture backend: say what it is, not an error code.
                     crate::platform::note_screen_capture(unsupported);
                     if unsupported && crate::platform::screen_soon() {
-                        error = Some(format!("Transmitir a tela, uma janela ou o som de um app: {}.", crate::platform::SOON_MAC.to_lowercase()));
+                        error = Some(format!("Transmitir a tela, uma janela ou o som de um app: {}.", crate::platform::SOON_MAC_LC));
                     }
                     out.send(Ev::Sources { windows, monitors, error });
                 });
@@ -906,10 +986,12 @@ impl Controller {
                         self.share_audio_only = source.is_audio_only();
                         self.out.send(Ev::ShareStarted { encoder });
                         self.push_voice_state();
+                        self.thumbs_start(&source);
                     }
                     Err(e) => {
                         warn!(error = %format!("{e:#}"), "Go Live failed to start");
                         // Starting replaces a running live, so a failed start leaves none.
+                        self.thumbs_stop();
                         if self.streaming {
                             self.streaming = false;
                             self.push_voice_state();
@@ -930,6 +1012,7 @@ impl Controller {
                     Ok(r) => {
                         info!(from = ?r.from, to = ?source, path = ?r.path, gap_ms = r.gap.as_millis() as u64, total_ms = r.total.as_millis() as u64, audio = r.audio_after, "Go Live source switched");
                         self.out.send(Ev::ShareSwitched { audio: r.audio_after, audio_error: r.audio_error });
+                        self.thumbs_start(&source);
                         // (A switch can go between a screen and an audio-only live.)
                         if self.share_audio_only != source.is_audio_only() {
                             self.share_audio_only = source.is_audio_only();
@@ -943,6 +1026,7 @@ impl Controller {
                 }
             }
             Cmd::StopShare => {
+                self.thumbs_stop();
                 if let Some(v) = &self.voice {
                     v.stop_share().await;
                 }
@@ -1030,7 +1114,7 @@ impl Controller {
                     Err(e) => {
                         warn!(error = %e, "cannot list cameras");
                         crate::platform::note_camera(crate::platform::is_unsupported(&e));
-                        let error = if crate::platform::camera_soon() { format!("Câmera: {}.", crate::platform::SOON_MAC.to_lowercase()) } else { "Não foi possível listar as câmeras.".into() };
+                        let error = if crate::platform::camera_soon() { format!("Câmera: {}.", crate::platform::SOON_MAC_LC) } else { "Não foi possível listar as câmeras.".into() };
                         out.send(Ev::Cameras { list: Vec::new(), error: Some(error) })
                     }
                 });
@@ -1313,6 +1397,7 @@ impl Controller {
                 side_dbfs: r.side_dbfs,
                 kbps: r.kbps,
                 codec: r.codec.clone(),
+                max_quiet_ms: s.counters.take_max_quiet_ms(),
             })
             .collect();
         self.out.send(Ev::AudioInfo(audio));
@@ -1321,9 +1406,9 @@ impl Controller {
 
     // ------------------------------------------------------------ hub
 
-    async fn connect(&mut self, url: String, creds: Creds, remember_device: bool, guard: &Guard) {
+    async fn connect(&mut self, url: String, creds: Creds, remember_device: bool, guard: &Guard, tls: &TlsPlan) {
         self.teardown().await;
-        match self.login_and_listen(&url, &creds, remember_device, guard).await {
+        match self.login_and_listen(&url, &creds, remember_device, guard, tls).await {
             Ok(done) => {
                 let mut creds = done.creds;
                 if done.device_token.is_some() {
@@ -1342,6 +1427,8 @@ impl Controller {
                     device_token: done.device_token,
                     server_id: done.server_id,
                     pin: done.pin,
+                    tls_pin: done.tls_pin,
+                    tls_learned: done.tls_learned,
                 });
             }
             Err(fail) => {
@@ -1351,14 +1438,16 @@ impl Controller {
                     LoginFail::Msg(msg) => Ev::ConnectFailed(msg),
                     LoginFail::Personal { message, forget_device } => Ev::NeedPersonalPassword { message, forget_device },
                     LoginFail::NotSameServer(msg) => Ev::NotSameServer(msg),
+                    LoginFail::TlsMismatch { url, expected, got } => Ev::TlsMismatch { url, expected, got },
+                    LoginFail::AskPlain(url) => Ev::PlainPrompt { url },
                 });
             }
         }
     }
 
     /// Health check, login and event socket. Errors are user-facing Portuguese messages.
-    async fn login_and_listen(&mut self, url: &str, creds: &Creds, remember_device: bool, guard: &Guard) -> Result<LoggedIn, LoginFail> {
-        let (hub, done) = login_at(url, creds, remember_device, guard).await?;
+    async fn login_and_listen(&mut self, url: &str, creds: &Creds, remember_device: bool, guard: &Guard, tls: &TlsPlan) -> Result<LoggedIn, LoginFail> {
+        let (hub, done) = login_at(url, creds, remember_device, guard, tls).await?;
         self.hub = Some(hub);
         self.start_events().map_err(|e| LoginFail::Msg(friendly(&e)))?;
         Ok(done)
@@ -1367,9 +1456,25 @@ impl Controller {
 
 /// Health check, the saved-data check ([`Guard`]) and the login itself, without the event socket
 /// (v1.0.1: a function of its own, so the check can be tested against real addresses).
-async fn login_at(url: &str, creds: &Creds, remember_device: bool, guard: &Guard) -> Result<(Arc<HubClient>, LoggedIn), LoginFail> {
+async fn login_at(url: &str, creds: &Creds, remember_device: bool, guard: &Guard, tls: &TlsPlan) -> Result<(Arc<HubClient>, LoggedIn), LoginFail> {
     let url = normalize_url(url);
-    let hub = Arc::new(HubClient::new(&url).map_err(|e| LoginFail::Msg(friendly(&e)))?);
+    // v1.1 (T0): the transport first (the trust rules). A certificate that is not the pinned one,
+    // or no TLS for a pinned server, stops here: not even the health check goes out.
+    let transport = match tls::decide_at(&url, tls).await {
+        tls::Decision::Use(t) => t,
+        tls::Decision::Mismatch { expected, got } => return Err(LoginFail::TlsMismatch { url, expected, got }),
+        tls::Decision::NoTlsForPinned => return Err(LoginFail::Msg(tls::NO_TLS_FOR_PINNED.into())),
+        tls::Decision::AskPlain => return Err(LoginFail::AskPlain(url)),
+        tls::Decision::Unreachable(why) => {
+            warn!(%url, error = %why, "hub not reachable");
+            return Err(LoginFail::Msg(friendly(&anyhow::anyhow!("connect: {why}"))));
+        }
+    };
+    let (tls_pin, tls_learned) = match transport {
+        tls::Transport::Tls { pin, learned } => (Some(pin), learned),
+        tls::Transport::Plain => (None, false),
+    };
+    let hub = tls::client(&url, transport).map_err(|e| LoginFail::Msg(friendly(&e)))?;
     let health = hub.health().await.map_err(|e| {
         warn!(error = %format!("{e:#}"), %url, "hub health check failed");
         LoginFail::Msg(friendly(&e))
@@ -1384,7 +1489,11 @@ async fn login_at(url: &str, creds: &Creds, remember_device: bool, guard: &Guard
     }
     // v1.0.1: a saved password / login token goes only to the server it was saved for.
     let answered = health.server_id.as_deref().filter(|id| vox_proto::is_server_id(id));
-    let verdict = guard.check(&url, answered);
+    // v1.1 (T0): saved data tied to a certificate goes only over TLS with that certificate.
+    let verdict = match guard.check_pin(tls_pin) {
+        Check::Ok => guard.check(&url, answered),
+        other => other,
+    };
     let creds = match verdict {
         Check::Ok => creds.clone(),
         // An invite carries its own credential: go on with it alone.
@@ -1403,7 +1512,10 @@ async fn login_at(url: &str, creds: &Creds, remember_device: bool, guard: &Guard
     })?;
     let pin = creds.invite.is_some() || guard.confirms(&url, answered);
     let server_id = answered.map(str::to_string);
-    Ok((hub, LoggedIn { server_name: login.server_name, user: login.user, url, livekit_ok: health.livekit_ok, device_token: login.device_token, server_id, pin, creds }))
+    Ok((
+        hub,
+        LoggedIn { server_name: login.server_name, user: login.user, url, livekit_ok: health.livekit_ok, device_token: login.device_token, server_id, pin, creds, tls_pin, tls_learned },
+    ))
 }
 
 impl Controller {
@@ -1467,6 +1579,7 @@ impl Controller {
         self.hub = None;
         self.creds = None;
         self.sounds_reset();
+        self.e2ee_teardown();
     }
 
     async fn on_internal(&mut self, ev: Internal) {
@@ -1509,6 +1622,10 @@ impl Controller {
                         self.relogin().await;
                     }
                     HubEvent::Server(ServerEvent::Ready { .. }) => {
+                        let (me, previews, e2ee) = match &ev {
+                            HubEvent::Server(ServerEvent::Ready { user, stream_previews, e2ee, server_id, .. }) => (Some(user.clone()), *stream_previews, (*e2ee, server_id.clone())),
+                            _ => (None, false, (false, None)),
+                        };
                         self.out.send(Ev::Hub(ev));
                         // The hub forgot our voice state across the reconnect: announce it again.
                         self.push_voice_state();
@@ -1519,10 +1636,21 @@ impl Controller {
                         self.out.send(Ev::ViewersSupported(true));
                         self.push_watch_state(true);
                         self.watch_heal = !self.watch_set.is_empty();
-                        self.sounds_on_ready();
+                        if let Some(me) = me {
+                            // v1.1 (E0): this computer on the server's device list.
+                            self.e2ee_on_ready(e2ee.0, e2ee.1, &me);
+                            self.sounds_on_ready(me);
+                        }
+                        self.thumbs_on_ready(previews);
                     }
                     HubEvent::Server(ServerEvent::SoundsChanged { sounds }) => self.sounds_changed(sounds),
-                    HubEvent::Server(ServerEvent::SoundPlayed { sound_id, by, channel_id }) => self.sound_played(sound_id, by, channel_id),
+                    HubEvent::Server(ServerEvent::E2eeDevicesChanged { user_id, devices }) => self.e2ee_devices_changed(user_id, devices),
+                    // v1.1 (E2): a sealed DM line is opened before the UI hears of it.
+                    HubEvent::Server(ServerEvent::DmMessageCreated { message }) if message.sealed.is_some() || message.reply.as_ref().is_some_and(|r| r.sealed) => {
+                        self.e2ee_dm_created(message)
+                    }
+                    HubEvent::Server(ServerEvent::SoundPlayed { sound_id, by, channel_id, stoppable }) => self.sound_played(sound_id, by, channel_id, stoppable),
+                    HubEvent::Server(ServerEvent::SoundStopped { by, channel_id }) => self.sound_stopped(by, channel_id),
                     HubEvent::Server(ServerEvent::Error { error })
                         if error == WATCH_STATE_REJECTED
                             && self.watch_sent_at.is_some_and(|t| t.elapsed() < Duration::from_secs(10)) =>
@@ -1534,6 +1662,10 @@ impl Controller {
                         self.out.send(Ev::ViewersSupported(false));
                     }
                     other => {
+                        // The hub refused our play: the clip started at the click stops (v1.1).
+                        if matches!(&other, HubEvent::Server(ServerEvent::Error { error }) if crate::soundboard::is_play_refusal(error)) {
+                            self.sound_refused();
+                        }
                         let heal = self.watch_heal
                             && matches!(&other, HubEvent::Server(ServerEvent::VoiceStateChanged { member })
                                 if member.streaming && member.channel_id == self.voice_channel && self.watch_set.contains(&member.user.id));
@@ -1551,12 +1683,17 @@ impl Controller {
                 }
                 match &ev {
                     VoiceEvent::LocalShareEnded { .. } => {
+                        self.thumbs_stop();
                         self.streaming = false;
                         self.push_voice_state();
                     }
                     VoiceEvent::LocalCameraEnded { .. } => {
                         self.camera = false;
                         self.push_voice_state();
+                    }
+                    VoiceEvent::MicAvailable => {
+                        self.apply_ptt();
+                        self.local_voice_changed();
                     }
                     VoiceEvent::WatchStarted { identity } => {
                         if let Ok(id) = identity.parse::<UserId>() {
@@ -1572,7 +1709,15 @@ impl Controller {
                             self.push_watch_state(false);
                         }
                     }
+                    VoiceEvent::E2eePeerDevice { identity, device_id } => {
+                        if identity.parse::<UserId>().is_ok_and(|u| self.e2ee.is_new_device(u, device_id)) {
+                            info!(who = %identity, "e2ee: joined the call from a new device");
+                            self.out.send(Ev::CallNewDevice { identity: identity.clone() });
+                        }
+                    }
                     VoiceEvent::Disconnected { .. } => {
+                        self.thumbs_stop();
+                        self.sounds_voice_left();
                         self.clear_watch_set();
                         self.streaming = false;
                         self.camera = false;
@@ -1635,8 +1780,9 @@ impl Controller {
             }
             Err(e) => {
                 let msg = match LoginFail::from_error(&e, &c) {
-                    LoginFail::Msg(m) | LoginFail::NotSameServer(m) => m,
+                    LoginFail::Msg(m) | LoginFail::NotSameServer(m) | LoginFail::AskPlain(m) => m,
                     LoginFail::Personal { message, .. } => format!("{message} Entre de novo."),
+                    LoginFail::TlsMismatch { .. } => "A identidade do servidor mudou.".into(),
                 };
                 warn!(error = %format!("{e:#}"), "re-login failed");
                 if msg.starts_with("Não foi possível conectar") {
@@ -1679,6 +1825,7 @@ impl Controller {
         self.ptt_down = false;
         opts.gate.set_ptt(opts.ptt);
         self.voice_gate = Some(opts.gate.clone());
+        self.input_device = opts.input_device.clone();
         let cfg = VoiceConfig {
             mic: !self.no_mic,
             playback: !self.no_playback,
@@ -1687,16 +1834,52 @@ impl Controller {
             start_muted: opts.ptt,
             output_volume: Some(opts.volume_pct.min(200) as f32 / 100.0),
             mic_test_tone: None,
+            fake_mics: None,
             user_audio: opts.user_audio,
             others_muted: opts.others_muted,
             gate: Some(opts.gate),
             noise: Some(opts.noise),
+            // v1.1 (T0): over TLS, LiveKit is reached through the hub's port in pinned TLS.
+            tls_pin: hub.tls_pin(),
+            // v1.1 (E1): set by `run_join` when the hub says the room is encrypted.
+            e2ee: None,
         };
+        // Autotests (v1.1 E1): a synthetic tone as the microphone (`VOX_TEST_MIC_TONE=<Hz>`), never
+        // played here; with `VOX_NO_MIC=1` no device is opened.
+        let mut cfg = cfg;
+        if vox_client_core::testmode::background() {
+            if let Some(hz) = std::env::var("VOX_TEST_MIC_TONE").ok().and_then(|v| v.parse::<f32>().ok()).filter(|h| (20.0..=4000.0).contains(h)) {
+                cfg.mic = true;
+                cfg.mic_test_tone = Some(hz);
+                info!(hz, "autotest: the microphone is a synthetic tone");
+            }
+            // Made-up microphones (`autotest_micswitch.rs`): the real one stays closed.
+            if let Some(bank) = vox_client_core::audio::fake_mic::installed() {
+                cfg.mic = true;
+                cfg.fake_mics = Some(bank);
+                info!("autotest: the microphones are fake");
+            }
+        }
+        // v1.1 (E1): this computer can encrypt a room (registered, directory read).
+        let media = self.e2ee.media();
+        let e2ee_status = self.e2ee.status();
         self.join_gen += 1;
         let gen = self.join_gen;
         let int_tx = self.int_tx.clone();
+        let e2 = self.e2ee.clone();
         self.join_task = Some(tokio::spawn(async move {
-            let outcome = run_join(&hub, channel, via, cfg).await;
+            // v1.1 (E1, audit): a DM call is encrypted when the caller's app says it can as the
+            // call starts. While this computer is still registering or reading the device list,
+            // wait for it; if it still cannot, do not start the call in the clear (the other side
+            // would be told "uses an old version"): say so, and let the person try again.
+            let starting_call = matches!(via, JoinVia::Dm { accept: false, .. });
+            let (media, e2ee_status) = if starting_call && media.is_none() { e2.media_for_call(&hub).await } else { (media, e2ee_status) };
+            if starting_call && media.is_none() && matches!(e2ee_status, crate::backend::e2ee::E2eeStatus::Starting | crate::backend::e2ee::E2eeStatus::Active) {
+                warn!(?e2ee_status, "dm call not started: this computer's encryption is not ready");
+                let _ = int_tx.send(Internal::Joined(gen, channel, Err(CALL_E2EE_NOT_READY.to_string())));
+                return;
+            }
+            let outcome = run_join(&hub, channel, via, cfg, media, e2ee_status).await;
             let _ = int_tx.send(Internal::Joined(gen, channel, outcome));
         }));
     }
@@ -1725,10 +1908,13 @@ impl Controller {
                 let identity = session.identity().to_string();
                 let report = session.join_report().clone();
                 let no_mic = report.mic_error.is_some();
+                let e2ee = session.is_e2ee();
                 let warning = join_warning(&report);
                 if let Some(w) = &warning {
                     warn!(warning = %w, mic_error = ?report.mic_error, playback_error = ?report.playback_error, "joined voice with limitations");
                 }
+                // (Picked while the join was on its way.)
+                session.set_input_device(self.input_device.clone());
                 session.set_cameras_hidden(&self.cams_hidden.iter().cloned().collect::<Vec<_>>());
                 session.set_cameras_visible(self.cams_visible).await;
                 session.set_share_preview(self.share_preview).await;
@@ -1754,6 +1940,7 @@ impl Controller {
                     identity,
                     warning,
                     no_mic,
+                    e2ee,
                 });
                 self.local_voice_changed();
             }
@@ -1773,6 +1960,8 @@ impl Controller {
             self.cancel_join();
         }
         self.voice_gen += 1;
+        self.sounds_voice_left();
+        self.thumbs_stop();
         let had = self.voice_channel.take().is_some();
         self.streaming = false;
         self.camera = false;
@@ -1821,6 +2010,10 @@ enum LoginFail {
     Personal { message: String, forget_device: bool },
     /// v1.0.1: saved login data was kept back (see [`Guard`]).
     NotSameServer(String),
+    /// v1.1 (T0): another certificate than the pinned one (nothing sent).
+    TlsMismatch { url: String, expected: Pin, got: Pin },
+    /// v1.1 (T0): a typed address without TLS: ask first (rule 4).
+    AskPlain(String),
 }
 
 /// A login that went through ([`Controller::login_and_listen`]).
@@ -1834,6 +2027,9 @@ struct LoggedIn {
     pin: bool,
     /// What was actually sent (saved data kept back is not in here).
     creds: Creds,
+    /// v1.1 (T0): the session's certificate (`None`: plain HTTP), seen for the first time or not.
+    tls_pin: Option<Pin>,
+    tls_learned: bool,
 }
 
 impl LoginFail {
@@ -1884,6 +2080,9 @@ pub struct Binding {
     /// That server's [`vox_proto::HealthResponse::server_id`], when known (saved by v1.0.1 or
     /// later, from a hub that has one).
     pub server_id: Option<String>,
+    /// v1.1 (T0): that server's certificate, when known: the secret then goes only over TLS with
+    /// exactly that certificate (never plain HTTP).
+    pub tls_pin: Option<Pin>,
 }
 
 /// What of a login was saved on this computer, and for which server (audit
@@ -1946,6 +2145,17 @@ impl Binding {
 }
 
 impl Guard {
+    /// v1.1 (T0): may the saved data go over a connection pinned to `conn` (`None`: plain HTTP)?
+    /// A secret saved with a certificate goes only to that certificate.
+    pub fn check_pin(&self, conn: Option<Pin>) -> Check {
+        let tied = [&self.token, &self.password].into_iter().flatten().filter_map(|b| b.tls_pin);
+        if tied.into_iter().all(|p| conn == Some(p)) {
+            Check::Ok
+        } else {
+            Check::Mismatch
+        }
+    }
+
     /// The verdict for sending the saved data to `url`, whose hub answered `answered`.
     pub fn check(&self, url: &str, answered: Option<&str>) -> Check {
         let all = [&self.token, &self.password].into_iter().flatten().map(|b| b.check(url, answered));
@@ -1981,13 +2191,33 @@ impl Guard {
 /// its health check within a short time, preferring (v1.0.1) one the saved data may go to; else
 /// the first that answered at all (the login there then goes without the saved data, or not at
 /// all).
-async fn pick(urls: &[String], guard: &Guard) -> Option<String> {
+async fn pick(urls: &[String], guard: &Guard, plan: &TlsPlan) -> Option<String> {
     let mut first = None;
     for url in urls {
-        let Ok(hub) = HubClient::new(url) else { continue };
+        // v1.1 (T0): asked over the transport the login would use (pinned TLS when there is a pin).
+        let transport = match tls::decide_at(url, plan).await {
+            tls::Decision::Use(t) => t,
+            tls::Decision::Unreachable(_) => {
+                info!(%url, "invite: address does not answer, trying the next");
+                continue;
+            }
+            // Something answers there, but not as this server must (the login says why).
+            _ => {
+                first.get_or_insert_with(|| url.clone());
+                continue;
+            }
+        };
+        let Ok(hub) = tls::client(url, transport) else { continue };
+        let conn_pin = match transport {
+            tls::Transport::Tls { pin, .. } => Some(pin),
+            tls::Transport::Plain => None,
+        };
         match tokio::time::timeout(Duration::from_secs(3), hub.health()).await {
             Ok(Ok(h)) => {
-                let verdict = guard.check(url, h.server_id.as_deref());
+                let verdict = match guard.check_pin(conn_pin) {
+                    Check::Ok => guard.check(url, h.server_id.as_deref()),
+                    other => other,
+                };
                 info!(%url, ?verdict, "invite: this address answers");
                 if verdict == Check::Ok {
                     return Some(url.clone());
@@ -2033,15 +2263,43 @@ enum JoinVia {
     Dm { dm: vox_proto::DmId, accept: bool },
 }
 
+/// v1.1 (E1, audit): a DM call not started because this computer's encryption is not ready yet
+/// (still registering, or the device list could not be read).
+pub const CALL_E2EE_NOT_READY: &str = "A criptografia deste computador ainda está sendo preparada, e a chamada sairia sem criptografia. Tente de novo em alguns segundos.";
+
+/// v1.1 (E1): why this computer cannot enter an encrypted room (it has no usable key), in words.
+fn no_key_text(status: crate::backend::e2ee::E2eeStatus, call: bool) -> String {
+    use crate::backend::e2ee::E2eeStatus as S;
+    let what = if call { "Esta chamada é criptografada de ponta a ponta" } else { "Esta sala usa criptografia de ponta a ponta" };
+    match status {
+        S::Starting | S::Off => format!("{what}, e a criptografia deste computador ainda está sendo preparada. Tente de novo em alguns segundos."),
+        _ => format!("{what}, e este computador não tem uma chave de criptografia ativa neste servidor (veja Configurações → Privacidade)."),
+    }
+}
+
 /// Hub join request, then the LiveKit connection, with every step logged. The error is the
-/// user-facing message.
-async fn run_join(hub: &HubClient, channel: ChannelId, via: JoinVia, cfg: VoiceConfig) -> JoinOutcome {
+/// user-facing message. v1.1 (E1): `media` = this computer can encrypt (the join says so, and an
+/// encrypted room's answer turns the encryption on).
+async fn run_join(hub: &HubClient, channel: ChannelId, via: JoinVia, mut cfg: VoiceConfig, media: Option<vox_client_core::MediaE2ee>, e2ee_status: crate::backend::e2ee::E2eeStatus) -> JoinOutcome {
     let started = std::time::Instant::now();
+    let capable = media.is_some();
     let asked = match via {
-        JoinVia::Channel => hub.voice_join(channel).await.map_err(|e| friendly(&e)),
+        JoinVia::Channel => hub.voice_join_with(channel, capable).await.map_err(|e| {
+            if !capable && format!("{e:#}").contains(vox_proto::ERR_E2EE_REQUIRED) {
+                no_key_text(e2ee_status, false)
+            } else {
+                friendly(&e)
+            }
+        }),
         JoinVia::Dm { dm, accept } => {
-            let r = if accept { hub.dm_call_accept(dm).await } else { hub.dm_call(dm).await };
-            r.map(|c| c.join).map_err(|e| crate::app::dms::error_text(&e))
+            let r = if accept { hub.dm_call_accept_with(dm, capable).await } else { hub.dm_call_with(dm, capable).await };
+            r.map(|c| c.join).map_err(|e| {
+                if !capable && format!("{e:#}").contains(vox_proto::ERR_E2EE_CALL_REQUIRED) {
+                    no_key_text(e2ee_status, true)
+                } else {
+                    crate::app::dms::error_text(&e)
+                }
+            })
         }
     };
     let resp = match asked {
@@ -2051,7 +2309,14 @@ async fn run_join(hub: &HubClient, channel: ChannelId, via: JoinVia, cfg: VoiceC
             return Err(e);
         }
     };
-    info!(channel, hub_ms = started.elapsed().as_millis() as u64, url = %resp.livekit_url, "voice join: hub join ok");
+    info!(channel, hub_ms = started.elapsed().as_millis() as u64, url = %resp.livekit_url, e2ee = resp.e2ee, "voice join: hub join ok");
+    if resp.e2ee {
+        // (The hub only says so to a join that asked with `?e2ee=1`.)
+        match media {
+            Some(m) => cfg.e2ee = Some(m),
+            None => return Err(no_key_text(e2ee_status, matches!(via, JoinVia::Dm { .. }))),
+        }
+    }
     match VoiceSession::connect(&resp.livekit_url, &resp.livekit_token, cfg).await {
         Ok(ok) => {
             info!(channel, total_ms = started.elapsed().as_millis() as u64, "voice join: complete");
@@ -2094,6 +2359,30 @@ pub fn join_warning(report: &vox_client_core::JoinReport) -> Option<String> {
         parts.push(format!("Entrou sem saída de áudio: {}", output_reason(raw)));
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// What the person is told when the microphone changes by itself. (A switch they asked for needs
+/// no words: the level meter moves.)
+pub fn mic_status_text(status: &MicStatus) -> Option<String> {
+    match status {
+        MicStatus::Switched { .. } => None,
+        MicStatus::FellBack { wanted, device } => {
+            Some(format!("Microfone \"{wanted}\" indisponível: usando o padrão do sistema ({device}). Quando ele voltar, a voz volta para ele sozinha."))
+        }
+        MicStatus::Restored { device } => Some(format!("Microfone de volta: {device}.")),
+        MicStatus::Lost => Some("Microfone desconectado. Conecte um microfone: ele volta sozinho, sem sair da voz.".into()),
+    }
+}
+
+/// A notice left by [`mic_status_text`].
+pub fn is_mic_notice(notice: &str) -> bool {
+    notice.starts_with("Microfone")
+}
+
+/// The voice bar's warning once a microphone showed up: what is left of it.
+pub fn warning_without_mic(warning: String) -> Option<String> {
+    let left: Vec<&str> = warning.split(" · ").filter(|p| !p.starts_with("Entrou sem microfone:")).collect();
+    (!left.is_empty()).then(|| left.join(" · "))
 }
 
 fn is_denied(l: &str) -> bool {
@@ -2153,6 +2442,12 @@ pub fn friendly(e: &anyhow::Error) -> String {
         "Esse nome já existe neste servidor. Escolha outro nome ou peça a senha do servidor.".into()
     } else if l.contains(vox_proto::ERR_TOO_MANY_MENTIONS) {
         "Menções demais numa mensagem só.".into()
+    } else if l.contains(&vox_proto::ERR_E2EE_REQUIRED.to_lowercase()) {
+        // v1.1 (E1): an encrypted room (the hub's own text).
+        vox_proto::ERR_E2EE_REQUIRED.into()
+    } else if l.contains("http 426") || l.contains("conexão protegida") {
+        // v1.1: a hub with `tls = "required"` (an older app shows the hub's text as is).
+        vox_proto::ERR_TLS_REQUIRED.into()
     } else if l.contains("protocol version mismatch") {
         "Versão incompatível com o servidor. Peça a versão mais recente do concord ao host.".into()
     } else if l.contains(vox_proto::ERR_TOO_MANY_ATTEMPTS) {
@@ -2210,6 +2505,29 @@ mod tests {
     }
 
     #[test]
+    fn microphone_changes_are_explained_in_portuguese() {
+        assert_eq!(mic_status_text(&MicStatus::Switched { device: "USB".into() }), None);
+        let fell = mic_status_text(&MicStatus::FellBack { wanted: "Headset".into(), device: "Realtek".into() }).unwrap();
+        assert!(fell.contains("\"Headset\" indisponível") && fell.contains("padrão do sistema (Realtek)"), "{fell}");
+        assert_eq!(mic_status_text(&MicStatus::Restored { device: "Headset".into() }).unwrap(), "Microfone de volta: Headset.");
+        assert!(mic_status_text(&MicStatus::Lost).unwrap().contains("sem sair da voz"));
+        for s in [MicStatus::FellBack { wanted: "a".into(), device: "b".into() }, MicStatus::Restored { device: "a".into() }, MicStatus::Lost] {
+            assert!(is_mic_notice(&mic_status_text(&s).unwrap()));
+        }
+        assert!(!is_mic_notice("Mensagem não enviada: sem conexão com o servidor."));
+    }
+
+    #[test]
+    fn the_warning_keeps_only_what_is_still_true_when_a_mic_shows_up() {
+        let mut report = vox_client_core::JoinReport::default();
+        report.mic_error = Some("no default input device".into());
+        assert_eq!(warning_without_mic(join_warning(&report).unwrap()), None);
+        report.playback_error = Some("no default output device".into());
+        let left = warning_without_mic(join_warning(&report).unwrap()).unwrap();
+        assert!(left.starts_with("Entrou sem saída de áudio:") && !left.contains("microfone"), "{left}");
+    }
+
+    #[test]
     fn errors_are_friendly() {
         let e = anyhow::anyhow!("login failed: HTTP 401 Unauthorized: wrong server password");
         assert_eq!(friendly(&e), "Senha do servidor incorreta.");
@@ -2242,6 +2560,11 @@ mod tests {
                         break (String::new(), String::new());
                     }
                     buf.extend_from_slice(&chunk[..n]);
+                    if buf[0] == 0x16 {
+                        // A TLS hello: answered like an older hub's HTTP server does.
+                        let _ = sock.write_all(b"HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n");
+                        break (String::new(), String::new());
+                    }
                     let text = String::from_utf8_lossy(&buf).to_string();
                     let Some(end) = text.find("\r\n\r\n") else { continue };
                     let len = text[..end]
@@ -2254,6 +2577,10 @@ mod tests {
                         break (text[..end].to_string(), String::from_utf8_lossy(&buf[end + 4..end + 4 + len]).to_string());
                     }
                 };
+                if head.is_empty() {
+                    // v1.1: a TLS probe (no HTTP at all), or a connection closed early.
+                    continue;
+                }
                 let (status, json) = if head.starts_with("GET /api/health") {
                     let id = server_id.map_or(String::new(), |id| format!(r#","server_id":"{id}""#));
                     ("200 OK", format!(r#"{{"ok":true,"version":"9.9.9","protocol_version":{PROTOCOL_VERSION},"livekit_ok":false{id}}}"#))
@@ -2298,19 +2625,21 @@ mod tests {
                 invite: invite.then(|| INVITE.to_string()),
                 server_id: None,
             };
-            let at_a = |id: Option<&str>| Some(Binding { home: a.clone(), server_id: id.map(str::to_string) });
+            let at_a = |id: Option<&str>| Some(Binding { home: a.clone(), server_id: id.map(str::to_string), tls_pin: None });
             let saved = Guard { token: at_a(Some(&a_id)), password: at_a(Some(&a_id)), confirmed: None };
             let not_same = |r: &Result<(Arc<HubClient>, LoggedIn), LoginFail>| matches!(r, Err(LoginFail::NotSameServer(_)));
+            // v1.1: the stand-ins speak plain HTTP (as if the user said "Conectar sem proteção").
+            let open = TlsPlan { plain_ok: true, ..Default::default() };
 
             // An invite code (or a saved entry) that lists B first: B answers, A is the one used.
-            assert_eq!(pick(&[b.clone(), a.clone()], &saved).await.as_deref(), Some(a.as_str()));
-            let (_, done) = login_at(&a, &creds(false), false, &saved).await.ok().expect("A takes its own saved password");
+            assert_eq!(pick(&[b.clone(), a.clone()], &saved, &open).await.as_deref(), Some(a.as_str()));
+            let (_, done) = login_at(&a, &creds(false), false, &saved, &open).await.ok().expect("A takes its own saved password");
             assert!(done.pin && done.server_id.as_deref() == Some(a_id.as_str()));
             // Only B answers: with an invite, B gets the invite's own token and nothing saved...
-            assert_eq!(pick(std::slice::from_ref(&b), &saved).await.as_deref(), Some(b.as_str()));
-            assert!(login_at(&b, &creds(true), true, &saved).await.is_err(), "B refuses (it is not A)");
+            assert_eq!(pick(std::slice::from_ref(&b), &saved, &open).await.as_deref(), Some(b.as_str()));
+            assert!(login_at(&b, &creds(true), true, &saved, &open).await.is_err(), "B refuses (it is not A)");
             // ...and without one (one click on a saved entry), nothing at all.
-            assert!(not_same(&login_at(&b, &creds(false), false, &saved).await));
+            assert!(not_same(&login_at(&b, &creds(false), false, &saved, &open).await));
             let got = b_logins.lock().unwrap().clone();
             assert_eq!(got.len(), 1, "{got:?}");
             assert!(!got[0].contains("token-salvo-de-a") && !got[0].contains("senha-de-a"), "{}", got[0]);
@@ -2318,23 +2647,82 @@ mod tests {
 
             // Saved before v1.0.1 (no identity): only the very address it was saved under.
             let legacy = Guard { token: at_a(None), password: at_a(None), confirmed: None };
-            assert!(not_same(&login_at(&b, &creds(false), false, &legacy).await));
+            assert!(not_same(&login_at(&b, &creds(false), false, &legacy, &open).await));
             assert_eq!(b_logins.lock().unwrap().len(), 1, "B got nothing more");
-            let (_, done) = login_at(&a, &creds(false), false, &legacy).await.ok().expect("A, where it was saved");
+            let (_, done) = login_at(&a, &creds(false), false, &legacy, &open).await.ok().expect("A, where it was saved");
             assert!(!done.pin, "an address from an invite or entry list does not pin");
             let typed = Guard { confirmed: Some(a.clone()), ..legacy };
-            let (_, done) = login_at(&a, &creds(false), false, &typed).await.ok().expect("the address the user typed");
+            let (_, done) = login_at(&a, &creds(false), false, &typed, &open).await.ok().expect("the address the user typed");
             assert!(done.pin && done.server_id.as_deref() == Some(a_id.as_str()), "it pins the identity");
 
             // An older hub with no identity, at the address the data was saved under: as before.
             let (old, old_logins) = recorder(None);
-            let at_old = Guard { token: Some(Binding { home: old.clone(), server_id: None }), password: None, confirmed: Some(old.clone()) };
-            assert!(login_at(&old, &creds(false), false, &at_old).await.is_err(), "(the stand-in refuses every login)");
+            let at_old = Guard { token: Some(Binding { home: old.clone(), server_id: None, tls_pin: None }), password: None, confirmed: Some(old.clone()) };
+            assert!(login_at(&old, &creds(false), false, &at_old, &open).await.is_err(), "(the stand-in refuses every login)");
             assert!(old_logins.lock().unwrap()[0].contains("token-salvo-de-a"), "no regression with an older hub");
             // But data saved with an identity never goes to an address that answers with none.
             let (old2, old2_logins) = recorder(None);
-            assert!(not_same(&login_at(&old2, &creds(false), false, &saved).await));
+            assert!(not_same(&login_at(&old2, &creds(false), false, &saved, &open).await));
             assert!(old2_logins.lock().unwrap().is_empty());
+
+            hub.shutdown().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// v1.1 (T0): the transport follows the trust rules end to end, against a real hub (TLS on)
+    /// and a plain stand-in (an older hub): a pinned login talks only to its certificate, and
+    /// nothing at all goes to a server that does not have it.
+    #[test]
+    fn logins_follow_the_trust_rules() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let dir = std::env::temp_dir().join(format!("concord-tls-login-test-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("config.toml"),
+                "server_name = \"T\"\nserver_password = \"senha\"\n[livekit]\napi_key = \"APItest0000\"\napi_secret = \"0123456789abcdef0123456789abcdef0123456789abcdef\"\nsignal_port = 1\n",
+            )
+            .unwrap();
+            let opts = voxhub_server::Options { data_dir: dir.clone(), no_livekit: true, livekit_bin: "unused".into(), bind_override: Some("127.0.0.1:0".into()) };
+            let hub = voxhub_server::start(opts).await.unwrap();
+            let pin = hub.tls_pin().expect("TLS is on by default");
+            let a = format!("http://127.0.0.1:{}", hub.addr.port());
+            let creds = Creds { personal: None, device_token: None, user: "ana".into(), password: "senha".into(), invite: None, server_id: None };
+            let none = Guard::default();
+            let plan = |pin: Option<Pin>, source: PinSource| TlsPlan { pin, source, plain_ok: false };
+
+            // Rule 4, a typed address: TLS, its certificate seen for the first time.
+            let (h, done) = login_at(&a, &creds, false, &none, &TlsPlan::default()).await.ok().expect("TLS on first use");
+            assert_eq!((done.tls_pin, done.tls_learned, h.tls_pin()), (Some(pin), true, Some(pin)));
+            assert_eq!(h.base_url().scheme(), "https");
+            // Rule 1, an invite with the pin: that certificate.
+            let (_, done) = login_at(&a, &creds, false, &none, &plan(Some(pin), PinSource::Invite)).await.ok().expect("pinned TLS");
+            assert_eq!((done.tls_pin, done.tls_learned), (Some(pin), false));
+            // Another certificate pinned: stopped before anything is sent.
+            let other = [1u8; 32];
+            let r = login_at(&a, &creds, false, &none, &plan(Some(other), PinSource::Saved)).await;
+            assert!(matches!(r, Err(LoginFail::TlsMismatch { expected, got, .. }) if expected == other && got == pin));
+
+            // An older hub (plain HTTP only).
+            let (old, logins) = recorder(None);
+            assert!(matches!(login_at(&old, &creds, false, &none, &TlsPlan::default()).await, Err(LoginFail::AskPlain(_))), "rule 4: ask first");
+            for source in [PinSource::Saved, PinSource::Invite, PinSource::Manual] {
+                let pinned = TlsPlan { pin: Some(pin), source, plain_ok: true };
+                assert!(matches!(login_at(&old, &creds, false, &none, &pinned).await, Err(LoginFail::Msg(m)) if m == tls::NO_TLS_FOR_PINNED), "rules 1, 2, 5");
+            }
+            assert!(logins.lock().unwrap().is_empty(), "nothing reached the plain server");
+            assert!(login_at(&old, &creds, false, &none, &plan(None, PinSource::Saved)).await.is_err(), "(the stand-in refuses every login)");
+            assert_eq!(logins.lock().unwrap().len(), 1, "rule 3: a saved entry without a pin goes plain");
+
+            // Saved data tied to a certificate goes only to that certificate.
+            let tied = |p: Pin| Guard { token: Some(Binding { home: a.clone(), server_id: None, tls_pin: Some(p) }), password: None, confirmed: Some(a.clone()) };
+            let with_token = Creds { device_token: Some("token-salvo".into()), ..creds.clone() };
+            assert!(matches!(login_at(&a, &with_token, false, &tied(other), &TlsPlan::default()).await, Err(LoginFail::NotSameServer(_))));
+            assert_eq!(tied(other).check_pin(None), Check::Mismatch, "never in the clear");
+            assert_eq!(tied(pin).check_pin(Some(pin)), Check::Ok);
+            assert_eq!(Guard::default().check_pin(None), Check::Ok, "nothing saved");
 
             hub.shutdown().await;
             let _ = std::fs::remove_dir_all(&dir);
@@ -2345,11 +2733,11 @@ mod tests {
     fn the_guard_verdicts() {
         let id = "0123456789abcdef0123456789abcdef";
         let home = "http://192.0.2.10:7890";
-        let pinned = Binding { home: home.into(), server_id: Some(id.into()) };
+        let pinned = Binding { home: home.into(), server_id: Some(id.into()), tls_pin: None };
         assert_eq!(pinned.check("http://198.51.100.1:7890", Some(id)), Check::Ok, "same server, another address");
         assert_eq!(pinned.check(home, Some("ffffffffffffffffffffffffffffffff")), Check::Mismatch);
         assert_eq!(pinned.check(home, None), Check::Mismatch, "an identity is known: no answer is not enough");
-        let legacy = Binding { home: home.into(), server_id: None };
+        let legacy = Binding { home: home.into(), server_id: None, tls_pin: None };
         assert_eq!(legacy.check("192.0.2.10", None), Check::Ok, "the address it was saved under");
         assert_eq!(legacy.check("http://198.51.100.1:7890", Some(id)), Check::Unconfirmed);
         let g = Guard { token: Some(pinned), password: Some(legacy), confirmed: None };

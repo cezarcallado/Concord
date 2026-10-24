@@ -24,6 +24,27 @@ pub const ROW_H: f32 = 30.0;
 pub const COMBO_W: f32 = 300.0;
 /// Width of the sliders of the forms.
 pub const SLIDER_W: f32 = 220.0;
+/// v1.1 I6: the narrowest the control column gets beside the label column; a narrower page
+/// (a small or zoomed-in window) puts each label above its control instead ([`stacked`]).
+pub const CONTROL_MIN_W: f32 = 240.0;
+
+/// The page is too narrow for the label column: labels go above their controls, and nothing is
+/// indented under the control column ([`row`], [`indented`], [`note`]).
+pub fn stacked(ui: &Ui) -> bool {
+    ui.available_width() < LABEL_W + ui.spacing().item_spacing.x + CONTROL_MIN_W
+}
+
+/// A combo box's width in the control column: [`COMBO_W`], or what is left when less is.
+pub fn combo_w(ui: &Ui) -> f32 {
+    COMBO_W.min(ui.available_width()).max(120.0)
+}
+
+/// Fit the sliders of a page to its width (call at the top of the page): [`SLIDER_W`], or less
+/// so that a slider and its number stay in the control column.
+pub fn fit_sliders(ui: &mut Ui) {
+    let control = if stacked(ui) { ui.available_width() } else { ui.available_width() - LABEL_W - ui.spacing().item_spacing.x };
+    ui.spacing_mut().slider_width = SLIDER_W.min(control - 90.0).max(80.0);
+}
 
 /// A section header inside a page: sentence case, Bricolage, quiet (like the sidebar's).
 pub fn group(ui: &mut Ui, title: &str) {
@@ -52,23 +73,47 @@ pub fn divider(ui: &mut Ui) {
     ui.add_space(space::L);
 }
 
-/// A labelled form row: `label` in the label column (vertically centred), then the control.
+/// A labelled form row: `label` in the label column (vertically centred), then the control. On a
+/// narrow page ([`stacked`]) the label goes above the control. The control's texts (a checkbox's)
+/// wrap at the page's edge instead of running past it.
 pub fn row<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+    if stacked(ui) {
+        ui.add(egui::Label::new(RichText::new(label).font(theme::body(size::BODY)).color(theme::TEXTO)).wrap().selectable(false));
+        return ui
+            .horizontal(|ui| {
+                ui.spacing_mut().interact_size.y = ROW_H;
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                add(ui)
+            })
+            .inner;
+    }
     ui.horizontal(|ui| {
         ui.spacing_mut().interact_size.y = ROW_H;
         let (rect, _) = ui.allocate_exact_size(Vec2::new(LABEL_W, ROW_H), Sense::hover());
         let g = ui.painter().layout(label.to_owned(), theme::body(size::BODY), theme::TEXTO, LABEL_W - space::M);
         ui.painter().galley(Pos2::new(rect.left(), rect.center().y - g.size().y / 2.0), g, theme::TEXTO);
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
         add(ui)
     })
     .inner
 }
 
+/// The control column's indent ([`LABEL_W`] and the gap; none on a [`stacked`] page).
+fn indent_w(ui: &Ui) -> f32 {
+    if stacked(ui) {
+        0.0
+    } else {
+        LABEL_W + ui.spacing().item_spacing.x
+    }
+}
+
 /// A control in the control column with no label (checkboxes, buttons under a row).
 pub fn indented<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let left = indent_w(ui);
     ui.horizontal(|ui| {
         ui.spacing_mut().interact_size.y = ROW_H;
-        ui.add_space(LABEL_W + ui.spacing().item_spacing.x);
+        ui.add_space(left);
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
         add(ui)
     })
     .inner
@@ -81,7 +126,7 @@ pub fn note(ui: &mut Ui, text: impl Into<String>, indent: bool) {
 
 /// [`note`] in another colour (a warning in the lamp, an error in red).
 pub fn note_colored(ui: &mut Ui, text: impl Into<String>, indent: bool, color: Color32) {
-    let left = if indent { LABEL_W + ui.spacing().item_spacing.x } else { 0.0 };
+    let left = if indent { indent_w(ui) } else { 0.0 };
     let w = (ui.available_width() - left).max(80.0);
     ui.horizontal(|ui| {
         ui.add_space(left);

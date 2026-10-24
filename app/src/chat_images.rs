@@ -37,6 +37,8 @@ use vox_client_core::images::{self as imgs, Compressed, Quality};
 use vox_proto::{Attachment, AttachmentId, AttachmentLimits, ChannelId, DmId, DmMessage, Message, ATTACHMENT_MAX_PER_MESSAGE, ERR_ATTACHMENT_DAILY};
 
 use crate::app::App;
+use crate::backend::e2ee::dm::{self as e2dm, SendMode};
+use crate::backend::e2ee::E2eeBackend;
 use crate::backend::Cmd;
 use crate::theme::ph;
 
@@ -100,8 +102,9 @@ pub fn content_tag(hash: &str) -> u64 {
 pub enum ImageCmd {
     Limits,
     Fetch { key: ImgKey, thumb: bool },
-    /// Upload these pictures, then send the message.
-    Send { token: u64, target: Target, caption: String, images: Vec<Arc<Compressed>>, extras: crate::app::chat_extras::SendExtras },
+    /// Upload these pictures, then send the message. `seal` (DMs, v1.1 E2): how the line may go
+    /// out; when the backend seals it, the pictures are sealed uploads too.
+    Send { token: u64, target: Target, caption: String, images: Vec<Arc<Compressed>>, extras: crate::app::chat_extras::SendExtras, seal: Option<SendMode> },
 }
 
 #[derive(Debug)]
@@ -152,7 +155,8 @@ pub fn error_text(e: &anyhow::Error) -> String {
 }
 
 /// Run one call against the hub (on the backend's runtime); `emit` sends answers to the UI.
-pub async fn run(hub: &HubClient, cmd: ImageCmd, emit: impl Fn(ImageEv)) {
+/// `e2`: E2's sealed DM lines and images (`backend/e2ee/dm.rs`).
+pub async fn run(hub: &HubClient, e2: &E2eeBackend, cmd: ImageCmd, emit: impl Fn(ImageEv)) {
     match cmd {
         ImageCmd::Limits => emit(ImageEv::Limits(hub.attachment_limits().await)),
         ImageCmd::Fetch { key, thumb } => {
@@ -160,13 +164,50 @@ pub async fn run(hub: &HubClient, cmd: ImageCmd, emit: impl Fn(ImageEv)) {
                 Some(s) if s.status == 404 => FetchError::Gone,
                 _ => FetchError::Failed(format!("{e:#}")),
             });
+            // A sealed image is decrypted here; the decoder (and its limits) only sees the result.
+            let result = result.and_then(|bytes| e2dm::open_image(key.id, thumb, bytes).map_err(FetchError::Failed));
             emit(ImageEv::Fetched { key, thumb, result });
         }
-        ImageCmd::Send { token, target, caption, images, extras } => {
+        ImageCmd::Send { token, target, caption, images, extras, seal } => {
             let total = images.len();
+            // E2: a DM line to somebody with a device key is sealed, its pictures too.
+            let plan = match (target, seal) {
+                (Target::Dm(dm), Some(mode)) => {
+                    e2.prepare(hub).await;
+                    match e2.plan(dm, mode).await {
+                        Ok(p) => Some((mode.peer, p)),
+                        Err(e) => {
+                            emit(ImageEv::Sent { token, target, result: Err(e) });
+                            return;
+                        }
+                    }
+                }
+                // A DM whose peer the app does not know: never plain without the plan.
+                (Target::Dm(_), None) => {
+                    emit(ImageEv::Sent { token, target, result: Err("conversa não encontrada (nada foi enviado)".into()) });
+                    return;
+                }
+                (Target::Channel(_), _) => None,
+            };
+            let sealing = matches!(plan, Some((_, e2dm::Plan::Seal)));
             let mut ids = Vec::with_capacity(total);
+            let mut att_keys = Vec::new();
             for (i, c) in images.iter().enumerate() {
-                match hub.upload_attachment(&c.bytes, c.thumb.as_deref()).await {
+                let up = if sealing {
+                    match e2dm::seal_image(c) {
+                        Ok(s) => hub.upload_sealed_attachment(&s.main, s.thumb.as_deref()).await.map(|a| {
+                            att_keys.push(s.att_key(a.id));
+                            a
+                        }),
+                        Err(e) => {
+                            emit(ImageEv::Sent { token, target, result: Err(e) });
+                            return;
+                        }
+                    }
+                } else {
+                    hub.upload_attachment(&c.bytes, c.thumb.as_deref()).await
+                };
+                match up {
                     Ok(a) => ids.push(a.id),
                     Err(e) => {
                         tracing::warn!(error = %format!("{e:#}"), "image upload failed");
@@ -182,8 +223,27 @@ pub async fn run(hub: &HubClient, cmd: ImageCmd, emit: impl Fn(ImageEv)) {
                     hub.send_channel_request(ch, &req).await.map(|m| SentMessage::Channel(Box::new(m)))
                 }
                 Target::Dm(dm) => {
-                    let req = vox_proto::DmSendRequest { content: caption, attachments: ids, reply_to: extras.reply_to };
-                    hub.send_dm_request(dm, &req).await.map(|m| SentMessage::Dm(Box::new(m)))
+                    let mut req = vox_proto::DmSendRequest { content: caption, attachments: ids, reply_to: extras.reply_to, sealed: None };
+                    if let Some((peer, e2dm::Plan::Seal)) = plan {
+                        match e2.seal_line(dm, peer, &req.content, att_keys) {
+                            Ok(body) => {
+                                req.content = String::new();
+                                req.sealed = Some(body);
+                            }
+                            Err(e) => {
+                                emit(ImageEv::Sent { token, target, result: Err(e) });
+                                return;
+                            }
+                        }
+                    }
+                    match hub.send_dm_request(dm, &req).await {
+                        Ok(m) => {
+                            let mut v = vec![m];
+                            e2.open_lines(hub, &mut v).await;
+                            v.pop().map(|m| SentMessage::Dm(Box::new(m))).ok_or_else(|| anyhow::anyhow!("the line came back as a replay"))
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
             };
             emit(ImageEv::Sent { token, target, result: result.map_err(|e| error_text(&e)) });
@@ -470,6 +530,15 @@ impl App {
         self.images.pick_rx = Some((target, rx));
     }
 
+    /// "Colar" in a text box's menu with a picture (or files) on the clipboard: as Ctrl+V.
+    pub fn paste_image_from_menu(&mut self, target: Target, ctx: &egui::Context) {
+        if self.images.supported {
+            self.paste_from_clipboard(target, ctx);
+        } else {
+            self.toast("Este servidor não aceita imagens no chat.");
+        }
+    }
+
     /// Ctrl+V with a picture (or image files) on the clipboard.
     pub fn paste_from_clipboard(&mut self, target: Target, ctx: &egui::Context) {
         let Some(owner) = self.video.parent else { return };
@@ -523,7 +592,11 @@ impl App {
         tracing::info!(images = images.len(), bytes = images.iter().map(|c| c.bytes.len()).sum::<usize>(), ?target, "sending a message with images");
         // The mentions and the reply go with it (the reply draft is used up now).
         let extras = self.take_send_extras(target, &caption);
-        self.backend.send(Cmd::Image(ImageCmd::Send { token, target, caption: caption.clone(), images, extras }));
+        let seal = match target {
+            Target::Dm(dm) => self.dm_send_mode(dm),
+            Target::Channel(_) => None,
+        };
+        self.backend.send(Cmd::Image(ImageCmd::Send { token, target, caption: caption.clone(), images, extras, seal }));
         match target {
             Target::Channel(_) => self.input.clear(),
             Target::Dm(_) => self.dms.input.clear(),
@@ -588,7 +661,14 @@ impl App {
                                 *input = c;
                             }
                         }
-                        self.notice = Some(format!("Imagens não enviadas: {e}"));
+                        // (E2: refused to go out in the clear: the question instead.)
+                        let asked = match target {
+                            Target::Dm(dm) => self.dm_refused_plain(dm, &e),
+                            Target::Channel(_) => false,
+                        };
+                        if !asked {
+                            self.notice = Some(format!("Imagens não enviadas: {e}"));
+                        }
                     }
                 }
             }
@@ -1336,7 +1416,15 @@ impl ImageStore {
 
 /// Decode a thumbnail (small; anything bigger than the hub promises is refused).
 pub fn decode_thumb(bytes: &[u8]) -> Option<egui::ColorImage> {
-    let img = image::load_from_memory(bytes).ok()?;
+    // The size limit applies before decoding: a sealed (E2) thumbnail was never checked by the hub,
+    // and a small file can claim a huge picture (the decoder would allocate for all of it).
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_THUMB_SIDE);
+    limits.max_image_height = Some(MAX_THUMB_SIDE);
+    limits.max_alloc = Some(64 << 20);
+    reader.limits(limits);
+    let img = reader.decode().ok()?;
     if img.width() == 0 || img.height() == 0 || img.width() > MAX_THUMB_SIDE || img.height() > MAX_THUMB_SIDE {
         return None;
     }
@@ -1482,7 +1570,7 @@ mod tests {
     fn a_reused_id_with_other_content_is_a_different_image() {
         let mut s = ImageStore::default();
         let t0 = Instant::now();
-        let old = Attachment { id: 7, mime: "image/webp".into(), width: 10, height: 10, size: 1, thumb_w: 10, thumb_h: 10, animated: false, hash: "00000000000000aa".into() };
+        let old = Attachment { id: 7, mime: "image/webp".into(), width: 10, height: 10, size: 1, thumb_w: 10, thumb_h: 10, animated: false, hash: "00000000000000aa".into(), sealed: false };
         let new = Attachment { hash: "00000000000000bb".into(), ..old.clone() };
         let (ko, kn) = (ImgKey::of(&old), ImgKey::of(&new));
         assert_ne!(ko, kn);
@@ -1517,5 +1605,39 @@ mod tests {
         image::DynamicImage::ImageRgba8(big).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
         assert!(decode_thumb(&png).is_none(), "bigger than any thumbnail");
         assert!(decode_full(b"junk").is_err());
+    }
+
+    /// A sealed (E2) thumbnail is only checked here, after decryption: a 60-byte PNG that claims
+    /// 60000 x 60000 pixels must be refused from its header, not decoded into 14 GB.
+    #[test]
+    fn a_thumbnail_claiming_a_huge_size_is_refused_before_decoding() {
+        fn crc(data: &[u8]) -> u32 {
+            let mut c = 0xffff_ffffu32;
+            for b in data {
+                c ^= u32::from(*b);
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+            }
+            !c
+        }
+        fn chunk(out: &mut Vec<u8>, kind: &[u8], data: &[u8]) {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&crc(&body).to_be_bytes());
+        }
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&60_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&60_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        chunk(&mut png, b"IHDR", &ihdr);
+        chunk(&mut png, b"IDAT", &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        chunk(&mut png, b"IEND", &[]);
+        assert!(image::ImageReader::new(std::io::Cursor::new(&png)).with_guessed_format().unwrap().into_dimensions().unwrap() == (60_000, 60_000));
+        assert!(decode_thumb(&png).is_none());
+        assert!(decode_full(&png).is_err(), "the viewer's own limit (8192)");
     }
 }

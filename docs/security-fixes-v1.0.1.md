@@ -1,6 +1,6 @@
 # Security fixes in concord v1.0.1
 
-What v1.0.1 does about the second security audit of v1.0.0 (run-2, kept privately). Each
+What v1.0.1 does about the run-2 audit of v1.0.0 (`security-audit-skill\voxhub\run-2`). Each
 fix was checked again against the audit record's trace in the current source. Wire changes are
 additive (no `PROTOCOL_VERSION` bump): a v1.0.0 app works with a v1.0.1 hub and the other way
 round.

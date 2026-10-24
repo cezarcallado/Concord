@@ -95,6 +95,14 @@ impl Auto {
         }
         let name = self.dm_peer_name();
         match app.online.iter().find(|u| u.username == name) {
+            // v1.1 (E1): an encrypted call needs this computer registered and the other person's
+            // device on the list first (otherwise the call is rightly a plain one).
+            Some(u) if std::env::var("VOX_TEST_EXPECT_E2EE").as_deref() == Ok("1") && !app.privacy.view.can_seal_for(u.id) => {
+                if self.waited(60) {
+                    return Some(Err(self.fail(&format!("e2ee never ready for a call with {name}: {:?}", app.privacy.view.status)).unwrap_or(1)));
+                }
+                None
+            }
             Some(u) => Some(Ok(u.id)),
             None if self.waited(60) => Some(Err(self.fail(&format!("{name} never came online")).unwrap_or(1))),
             None => None,
@@ -322,6 +330,19 @@ impl Auto {
                 }
                 if app.voice.cameras.contains(&peer) && fps.is_none_or(|f| f < 3.0) {
                     return tell_fail(app, self, &format!("A's camera is on but its frames do not arrive ({fps:?}/s)"));
+                }
+                // v1.1 (E1): between two 1.1 apps with device keys the call is end-to-end encrypted
+                // (`VOX_TEST_EXPECT_E2EE=1`: it must be, and A's media must decrypt here).
+                let state = app.voice.e2ee_states.get(&peer).copied();
+                log(&format!("call end-to-end encrypted: {}; A's media state {state:?}", app.voice.e2ee));
+                if std::env::var("VOX_TEST_EXPECT_E2EE").as_deref() == Ok("1") {
+                    if !app.voice.e2ee {
+                        return tell_fail(app, self, "the call is not end-to-end encrypted");
+                    }
+                    if state != Some(vox_client_core::MediaE2eeState::Ok) {
+                        return tell_fail(app, self, &format!("A's media state is {state:?}, not Ok"));
+                    }
+                    super::shots::save(app, "e2v-chamada-dm");
                 }
                 let dm = self.dm.dm?;
                 let text = self.dm_tag("ok");

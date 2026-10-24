@@ -3,14 +3,20 @@ concord @VERSION@ para Mac (Apple Silicon: M1 ou mais novo, macOS 13 ou mais nov
 
 COMO ABRIR NA PRIMEIRA VEZ
 --------------------------
-1. Arraste o concord.app para a pasta Aplicativos (ou deixe onde preferir).
-2. O concord ainda não é assinado por um desenvolvedor registrado na Apple, então o Mac
-   não deixa abrir com dois cliques na primeira vez. Faça uma destas:
-   - Clique com o botão direito (ou Control + clique) no concord.app e escolha "Abrir";
-     na janela que aparece, clique em "Abrir" de novo.
-   - Ou: tente abrir uma vez, depois vá em Ajustes do Sistema > Privacidade e Segurança,
-     role até o aviso sobre o concord e clique em "Abrir Mesmo Assim".
-   Depois disso ele abre normalmente.
+1. Extraia o zip e arraste o concord.app para a pasta Aplicativos.
+2. O concord não é assinado por um desenvolvedor registrado na Apple, então na primeira
+   vez o Mac diz que não pode verificar o app. Faça assim:
+   - Dê dois cliques no concord.app e feche o aviso (clique em "OK" ou "Concluído",
+     NÃO em "Mover para o Lixo").
+   - Abra Ajustes do Sistema > Privacidade e Segurança, role até o fim e, na mensagem
+     sobre o concord, clique em "Abrir Mesmo Assim". Confirme com a sua senha do Mac
+     (ou Touch ID) e clique em "Abrir Mesmo Assim" de novo.
+   Depois disso ele abre normalmente, com dois cliques. Nas atualizações, repita uma vez.
+
+   Alternativa pelo Terminal (Aplicativos > Utilitários > Terminal), depois de pôr o
+   concord.app em Aplicativos:
+       xattr -dr com.apple.quarantine /Applications/concord.app
+   Depois é só abrir com dois cliques.
 
 PERMISSÕES QUE O MAC VAI PEDIR
 ------------------------------
@@ -20,9 +26,11 @@ PERMISSÕES QUE O MAC VAI PEDIR
   Depois de permitir, feche e abra o concord de novo.
 - Rede Local: para falar com um servidor que está na sua casa (no mesmo Wi-Fi).
   Sem ela, um servidor da rede de casa "não responde".
-- Chaves (Keychain): na primeira vez que o concord guardar uma senha, e depois de cada
-  atualização, o Mac pode perguntar se ele pode usar o item "concord" das suas chaves.
-  Clique em "Permitir Sempre". As senhas ficam nas Chaves do Mac, nunca num arquivo.
+- Chaves (Keychain), só UMA vez, ao abrir a 1.1.0 pela primeira vez depois de uma versão
+  antiga: o concord copia das Chaves a senha que você tinha salvo e não usa mais as Chaves
+  (chega de pedido de senha a cada atualização). Clique em "Permitir". Se negar, é só
+  digitar a senha do servidor de novo uma vez. Agora as senhas lembradas ficam no arquivo
+  secrets.json da pasta de configurações, que só o seu usuário do Mac consegue ler.
 Se negar alguma sem querer: Ajustes do Sistema > Privacidade e Segurança > (Microfone,
 Câmera, Gravação de Tela e Áudio do Sistema, Rede Local) e ligue o concord.
 
@@ -39,10 +47,16 @@ O QUE JÁ FUNCIONA
   de casa sozinho.
 - Se o microfone ou o fone mudar no meio da chamada (fone Bluetooth, outro app mudando o
   áudio), o concord reabre o dispositivo sozinho.
+- Novidades da 1.1: conexão protegida (TLS) com servidores 1.1, mensagens diretas e
+  chamadas criptografadas de ponta a ponta (também entre Mac e Windows), emojis coloridos,
+  atalhos de teclado e parar um som do soundboard no meio (para todos na sala).
+- Trocar de microfone no meio da chamada vale na hora, sem sair da sala.
+- Apoiar o projeto: o QR Code e a chave Pix ficam em Configurações > Apoiar o projeto.
 
 AINDA NÃO (EM BREVE NO MAC)
 ---------------------------
-- Push-to-talk com tecla global (use o botão do microfone ou a detecção de voz).
+- Atalhos globais: no Mac os atalhos (e o push-to-talk) só funcionam com a janela do concord
+  em foco. Fora dela, use o botão do microfone ou a detecção de voz.
 - Hospedar um servidor pelo app ("Criar servidor"): entre no servidor de um amigo.
 - Copiar imagens para a área de transferência.
 - Ícone na barra de menus e notificações do macOS (fechar a janela fecha o app).

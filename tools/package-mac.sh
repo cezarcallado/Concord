@@ -78,6 +78,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<string>public.app-category.social-networking</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
+	<key>LSMultipleInstancesProhibited</key>
+	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
@@ -99,7 +101,8 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 # The pt-BR read-me for friends (what to click the first time, the permissions, what works).
 sed "s/@VERSION@/$VERSION/g" "$ROOT/tools/LEIA-ME-MAC.txt" > "$STAGE/LEIA-ME-MAC.txt"
 
-# Ad-hoc signature (no Apple developer account): the friends open it with right-click > Abrir.
+# Ad-hoc signature (no Apple developer account): LEIA-ME-MAC explains the first open
+# (Privacidade e Segurança > "Abrir Mesmo Assim", or xattr -dr com.apple.quarantine).
 codesign --force --deep -s - "$APP"
 codesign --verify --deep --strict "$APP"
 

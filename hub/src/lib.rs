@@ -12,6 +12,7 @@ pub mod config;
 pub mod db;
 pub mod diag;
 pub mod dms;
+pub mod e2ee;
 pub mod host;
 pub mod ids;
 pub mod invites;
@@ -27,6 +28,8 @@ pub mod profile;
 pub mod serve;
 pub mod sounds;
 pub mod state;
+pub mod stream_preview;
+pub mod tls;
 pub mod util;
 pub mod voice_guard;
 pub mod ws;
@@ -90,9 +93,24 @@ pub struct Server {
     shutdown_tx: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
     slots: serve::Slots,
+    /// v1.1 (T0): the SHA-256 of the TLS certificate (`None` with `tls = "off"`).
+    tls_pin: Option<[u8; 32]>,
+    tls_policy: tls::Policy,
 }
 
 impl Server {
+    /// v1.1 (T0): the SHA-256 of this hub's TLS certificate, what the apps pin (`None` with
+    /// `tls = "off"`).
+    pub fn tls_pin(&self) -> Option<[u8; 32]> {
+        self.tls_pin
+    }
+
+    /// v1.1 (T0): switch between `auto` and `required` while running (host mode's "Aceitar apps
+    /// antigos sem conexão protegida").
+    pub fn tls_policy(&self) -> tls::Policy {
+        self.tls_policy.clone()
+    }
+
     /// HTTP connections open right now (tests).
     pub fn open_connections(&self) -> usize {
         self.slots.open()
@@ -157,6 +175,12 @@ pub async fn start_tuned(opts: Options, previews: linkpreview::PreviewConfig, tu
     let server_id = db.call(|c| db::server_id(c)).await?;
     let server_muted = db.call(|c| db::server_muted_ids(c)).await?;
 
+    // v1.1 (T0): the certificate, made on the first start (none with `tls = "off"`).
+    let hub_tls = match cfg.tls {
+        tls::TlsMode::Off => None,
+        _ => Some(tls::load_or_create(&opts.data_dir).context("TLS certificate")?),
+    };
+    let tls_pin = hub_tls.as_ref().map(|t| t.pin);
     let bind = opts.bind_override.as_deref().unwrap_or(&cfg.bind);
     let bound = listen::bind(&listen::plan(bind, cfg.ipv6)).await.with_context(|| format!("binding {bind}"))?;
     let (addr, addrs, dual_stack) = (bound.addrs[0], bound.addrs.clone(), bound.dual_stack);
@@ -172,6 +196,8 @@ pub async fn start_tuned(opts: Options, previews: linkpreview::PreviewConfig, tu
         rtc_tcp = cfg.livekit.rtc_tcp_port,
         rtc_udp = cfg.livekit.rtc_udp_port,
         external_ip = cfg.livekit.use_external_ip,
+        tls = cfg.tls.as_str(),
+        server_code = %tls_pin.map(|p| vox_proto::tls_server_code(&p)).unwrap_or_default(),
         data_dir = %opts.data_dir.display(),
         "concord-server starting"
     );
@@ -191,6 +217,9 @@ pub async fn start_tuned(opts: Options, previews: linkpreview::PreviewConfig, tu
     let attachments = attachments::AttachmentState::new(&opts.data_dir, &cfg);
     let slots = serve::Slots::new(tuning.limits.clone());
     let state = state::Shared::new(cfg.clone(), db, server_id, channels, server_muted, previews, lk_admin, attachments, tuning, shutdown_rx.clone());
+    if let Some(pin) = tls_pin {
+        let _ = state.tls_pin.set(pin);
+    }
     owner::init(&state).await?;
     // Private channels: everybody's effective role, before anybody connects.
     access::init_roles(&state).await?;
@@ -199,10 +228,12 @@ pub async fn start_tuned(opts: Options, previews: linkpreview::PreviewConfig, tu
     tasks.push(tokio::spawn(attachments::watch(state.clone(), shutdown_rx.clone())));
     tasks.push(tokio::spawn(voice_guard::watch(state.clone(), shutdown_rx.clone())));
     let app = api::router(state.clone());
+    let tls_policy = tls::Policy::new(cfg.tls);
+    let tls_setup = std::sync::Arc::new(serve::TlsSetup { tls: hub_tls, policy: tls_policy.clone(), signal_port: cfg.livekit.signal_port });
     // One accept loop per socket (two without a dual-stack one); the connection caps are shared.
     for listener in bound.listeners {
-        tasks.push(tokio::spawn(serve::serve(listener, app.clone(), slots.clone(), shutdown_rx.clone())));
+        tasks.push(tokio::spawn(serve::serve_with(listener, app.clone(), slots.clone(), shutdown_rx.clone(), tls_setup.clone())));
     }
 
-    Ok(Server { addr, addrs, dual_stack, config: cfg, state, shutdown_tx, tasks, slots })
+    Ok(Server { addr, addrs, dual_stack, config: cfg, state, shutdown_tx, tasks, slots, tls_pin, tls_policy })
 }

@@ -135,6 +135,9 @@ fn init(conn: &mut Connection) -> rusqlite::Result<()> {
     // ---- v0.9: private channels (`access.rs`): one column, two tables, a trigger, and the
     // downgrade guard row while a channel is private.
     crate::access::init(conn)?;
+    // ---- v1.1 (E0): the directory of device keys (`e2ee.rs`): one new table, `IF NOT EXISTS`,
+    // nothing existing changes (older hubs never read it).
+    crate::e2ee::init(conn)?;
     let n: i64 = conn.query_row("SELECT COUNT(*) FROM channels WHERE id > 0", [], |r| r.get(0))?;
     if n == 0 {
         for (name, kind) in [("geral", ChannelKind::Text), ("Sala 1", ChannelKind::Voice), ("Sala 2", ChannelKind::Voice)] {
@@ -197,6 +200,10 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     crate::avatar::init(&tx)?;
     crate::profile::init(&tx)?;
     crate::attachments::init(&tx)?;
+    // v1.1 (E1): end-to-end encrypted voice rooms ("Chamada criptografada de ponta a ponta").
+    if !has_column(&tx, "channels", "e2ee")? {
+        tx.execute_batch("ALTER TABLE channels ADD COLUMN e2ee INTEGER NOT NULL DEFAULT 0")?;
+    }
     if !has_column(&tx, "sessions", "auth_epoch")? {
         tx.execute_batch("ALTER TABLE sessions ADD COLUMN auth_epoch INTEGER NOT NULL DEFAULT 0")?;
         // Sessions of unprotected names prove nothing either way: keep them. Protected names log
@@ -471,7 +478,7 @@ pub fn server_muted_ids(conn: &Connection) -> rusqlite::Result<Vec<UserId>> {
 /// Every channel (with its access list when private, v0.9), in order. `id > 0` skips the
 /// downgrade guard row (`access.rs`), here and in every query on `channels`.
 pub fn list_channels(conn: &Connection) -> rusqlite::Result<Vec<Channel>> {
-    let mut st = conn.prepare("SELECT id, name, kind, position FROM channels WHERE id > 0 ORDER BY position, id")?;
+    let mut st = conn.prepare("SELECT id, name, kind, position, e2ee FROM channels WHERE id > 0 ORDER BY position, id")?;
     let rows = st.query_map([], |r| {
         let kind: String = r.get(2)?;
         Ok(Channel {
@@ -480,6 +487,7 @@ pub fn list_channels(conn: &Connection) -> rusqlite::Result<Vec<Channel>> {
             kind: if kind == "voice" { ChannelKind::Voice } else { ChannelKind::Text },
             position: r.get(3)?,
             private: None,
+            e2ee: kind == "voice" && r.get::<_, i64>(4)? != 0,
         })
     })?;
     let mut list = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -495,7 +503,13 @@ pub fn create_channel(conn: &Connection, name: &str, kind: ChannelKind) -> rusql
         conn.execute("INSERT INTO channels (id, name, kind, position) VALUES (?, ?, ?, ?)", params![id, name, k, pos])?;
         Ok(id)
     })?;
-    Ok(Channel { id, name: name.to_string(), kind, position: pos, private: None })
+    Ok(Channel { id, name: name.to_string(), kind, position: pos, private: None, e2ee: false })
+}
+
+/// v1.1 (E1): a voice channel's end-to-end encryption flag. `false` when there is no such voice
+/// channel.
+pub fn set_channel_e2ee(conn: &Connection, id: i64, on: bool) -> rusqlite::Result<bool> {
+    Ok(conn.execute("UPDATE channels SET e2ee = ? WHERE id = ? AND id > 0 AND kind = 'voice'", params![on as i64, id])? > 0)
 }
 
 pub fn rename_channel(conn: &Connection, id: i64, name: &str) -> rusqlite::Result<bool> {
@@ -565,7 +579,7 @@ pub fn insert_message_with(
     owner: &str,
 ) -> rusqlite::Result<Result<Message, crate::attachments::LinkError>> {
     let tx = conn.transaction()?;
-    if let Err(e) = crate::attachments::check_pending(&tx, user.id, attachments)? {
+    if let Err(e) = crate::attachments::check_pending(&tx, user.id, attachments, false)? {
         return Ok(Err(e));
     }
     let extras = crate::chat::resolve_channel(&tx, user.id, channel_id, caption, draft, owner)?;

@@ -334,7 +334,17 @@ impl App {
                         public_host no config.toml."
                 .into());
         }
-        Ok(InviteCode { token, hub_port, addrs }.encode())
+        // v1.1 (T0): the certificate goes into the code (layout 2): my own server's; else the one
+        // this session is pinned to (checked by this app); else, on the server's own PC
+        // (loopback), the hub's word for it. Without one the code stays the layout every app reads.
+        let tls_pin = match self.own_server() {
+            Some(st) => st.tls_pin,
+            None => self.tls.session.or_else(|| {
+                let local = url_host_port(&self.session_url).is_some_and(|(h, _)| h.eq_ignore_ascii_case("localhost") || h.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()));
+                c.hints.tls_pin.as_deref().filter(|_| local).and_then(vox_proto::tls_pin_from_hex)
+            }),
+        };
+        Ok(InviteCode { token, hub_port, addrs, tls_pin }.encode())
     }
 
     pub fn invite_cmd(&mut self, cmd: InviteCmd) {
@@ -412,12 +422,15 @@ impl App {
         // another address of the code: anybody can write an invite code with any addresses.
         let token_at = urls.iter().map(|u| crate::backend::normalize_url(u)).find_map(|u| self.settings.device_token(&u, user).map(|t| (u, t)));
         let guard = crate::backend::Guard {
-            token: token_at.as_ref().map(|(at, _)| crate::backend::Binding { home: at.clone(), server_id: self.settings.device_token_server(at, user) }),
+            token: token_at.as_ref().map(|(at, _)| crate::backend::Binding { home: at.clone(), server_id: self.settings.device_token_server(at, user), tls_pin: self.settings.device_token_pin(at, user) }),
             password: None,
             confirmed: None,
         };
+        // v1.1 (T0): a code with a pin means pinned TLS only (rule 1); without one (an older
+        // hub's), TLS when the hub has it, else plain HTTP (rule 3).
+        let tls = crate::backend::TlsPlan { pin: self.tls.trust_override.take().or(code.tls_pin), source: crate::backend::PinSource::Invite, plain_ok: false };
         let device_token = token_at.map(|(_, t)| t);
-        tracing::info!(candidates = urls.len(), user, personal = personal.is_some(), device_token = device_token.is_some(), "connecting with an invite");
+        tracing::info!(candidates = urls.len(), user, personal = personal.is_some(), device_token = device_token.is_some(), tls_pin = code.tls_pin.is_some(), "connecting with an invite");
         // v0.9.1: the saved entry keeps the invite's addresses (never its token).
         self.servers_login_started(device_token.is_some(), Some((code.hub_port, &code.addrs)));
         self.backend.send(Cmd::Connect {
@@ -430,6 +443,7 @@ impl App {
             remember_device: true,
             invite: Some(InviteJoin { token: Some(code.token_hex()), urls }),
             guard,
+            tls,
         });
     }
 
@@ -635,7 +649,7 @@ impl App {
         }
         // macOS: the voice server (LiveKit) has no official macOS build to download yet (M4).
         if crate::platform::HOSTING_SOON {
-            notice(ui, ui_kit::Notice::Info, &format!("Hospedar um servidor pelo app: {}. Por enquanto, entre no servidor de um amigo com o endereço ou um convite.", crate::platform::SOON_MAC.to_lowercase()));
+            notice(ui, ui_kit::Notice::Info, &format!("Hospedar um servidor pelo app: {}. Por enquanto, entre no servidor de um amigo com o endereço ou um convite.", crate::platform::SOON_MAC_LC));
             return;
         }
         let busy = self.host.preparing.is_some();
@@ -786,17 +800,19 @@ impl App {
         }
         let mut open = !(ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !self.host_confirming() && !egui::Popup::is_any_open(ctx));
         let screen = ctx.content_rect();
-        let h = (screen.height() - 48.0).clamp(300.0, 640.0);
+        // (I6: inside a small or zoomed-in window too: narrower, shorter, the body scrolls.)
+        let panel = ui_kit::fit_size(ctx, Vec2::new(PANEL_W, (screen.height() - 48.0).min(640.0)), Vec2::new(360.0, 300.0), 32.0);
+        let (pw, h) = (panel.x, panel.y);
         egui::Window::new("Meu servidor")
             .id(egui::Id::new("host_panel"))
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
-            .fixed_size(Vec2::new(PANEL_W, h))
+            .fixed_size(Vec2::new(pw, h))
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .frame(ui_kit::dialog_frame(&ctx.global_style()).inner_margin(egui::Margin { left: 22, right: 10, top: 18, bottom: 12 }))
             .show(ctx, |ui| {
-                ui.set_width(PANEL_W);
+                ui.set_width(pw);
                 // The head: icon, name, state, close.
                 let (text, color) = phase_text(&st.phase);
                 ui.horizontal(|ui| {
@@ -817,7 +833,7 @@ impl App {
                 });
                 ui.add_space(space::L);
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    ui.set_width(PANEL_W - 14.0);
+                    ui.set_width(pw - 14.0);
                     ui.spacing_mut().item_spacing.y = 6.0;
                     self.host_panel_body(ui, &st, mine);
                     ui.add_space(space::M);
@@ -856,6 +872,37 @@ impl App {
                 }
             });
         });
+        ui.add_space(space::L);
+        // v1.1 (T0): the certificate's code and "Aceitar apps antigos sem conexão protegida".
+        ui_kit::section(ui, crate::app::tls_ui::SECURITY_TITLE);
+        ui_kit::group_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui_kit::info_row(ui, label_w, "Código do servidor", |ui| match st.tls_pin {
+                Some(pin) => {
+                    let code = vox_proto::tls_server_code(&pin);
+                    ui.label(RichText::new(&code).monospace().color(theme::GIZ));
+                    if ui_kit::button_sized(ui, Kind::Ghost, Size::Small, Some(ph::COPY), "Copiar").clicked() {
+                        ui.ctx().copy_text(code);
+                    }
+                }
+                None => {
+                    ui.label(RichText::new("...").color(theme::NEVOA));
+                }
+            });
+            let mut on = st.accept_old_apps;
+            if ui.checkbox(&mut on, crate::app::tls_ui::OLD_APPS).changed() {
+                if let Some(r) = &self.host.runner {
+                    if let Err(e) = r.set_accept_old_apps(on) {
+                        self.host.error = Some(format!("{e:#}"));
+                    }
+                }
+            }
+        });
+        ui_kit::hint(
+            ui,
+            "Quem entra pelo concord 1.1 ou mais novo usa conexão protegida e pode conferir este código no menu do servidor, em \
+             \"Segurança da conexão\". Ligado: apps antigos ainda entram, sem proteção. Desligado: eles recebem um aviso para atualizar.",
+        );
         ui.add_space(space::L);
         ui_kit::section(ui, "Acesso pela internet");
         let (reach, rc) = reach_text(st);

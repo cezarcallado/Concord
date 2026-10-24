@@ -35,6 +35,9 @@ pub const PLAY_GAP_PER_USER: Duration = Duration::from_secs(2);
 /// A voice channel hears at most [`PLAY_MAX_PER_ROOM`] sounds in this window.
 pub const PLAY_ROOM_WINDOW: Duration = Duration::from_secs(10);
 pub const PLAY_MAX_PER_ROOM: usize = 5;
+/// v1.1: a stop is relayed only this long after the player's last play (the longest clip, plus
+/// a margin for a clip that started late on a slow download).
+pub const STOP_WINDOW: Duration = Duration::from_millis(SOUND_MAX_MS as u64 + 3000);
 /// Upload token bucket per person: a burst of this many, then one more every [`UPLOAD_REFILL`].
 pub const UPLOAD_BURST: f64 = 5.0;
 pub const UPLOAD_REFILL: Duration = Duration::from_secs(30);
@@ -201,6 +204,8 @@ pub struct SoundState {
 #[derive(Default)]
 struct Plays {
     last_by_user: HashMap<UserId, Instant>,
+    /// v1.1: people who played lately and may still stop it (one stop per play).
+    stoppable: HashMap<UserId, Instant>,
     by_room: HashMap<ChannelId, VecDeque<Instant>>,
 }
 
@@ -249,11 +254,26 @@ impl SoundState {
         }
         room.push_back(now);
         g.last_by_user.insert(user, now);
+        g.stoppable.insert(user, now);
         // Keep the maps small: forget people who have been quiet for a while.
         if g.last_by_user.len() > 256 {
             g.last_by_user.retain(|_, t| now.saturating_duration_since(*t) < PLAY_ROOM_WINDOW);
         }
+        if g.stoppable.len() > 256 {
+            g.stoppable.retain(|_, t| now.saturating_duration_since(*t) < STOP_WINDOW);
+        }
         Ok(())
+    }
+
+    /// May `user` stop their sound now? Only while one they played could still be playing, and
+    /// once per play (so a stop is never a way to flood a room).
+    pub fn allow_stop(&self, user: UserId) -> bool {
+        self.allow_stop_at(user, Instant::now())
+    }
+
+    fn allow_stop_at(&self, user: UserId, now: Instant) -> bool {
+        let mut g = self.plays.lock().unwrap_or_else(|e| e.into_inner());
+        g.stoppable.remove(&user).is_some_and(|t| now.saturating_duration_since(t) < STOP_WINDOW)
     }
 }
 
@@ -285,7 +305,21 @@ pub async fn play(s: &AppState, user: &User, sound_id: SoundId) -> Option<Server
     let members: Vec<UserId> = s.voice_members().into_iter().filter(|m| m.channel_id == Some(channel)).map(|m| m.user.id).collect();
     tracing::info!(user = %user.username, sound_id, channel, listeners = members.len(), "sound played");
     // Only the room's members, and only those who may see the channel (v0.9: private channels).
-    s.send_channel_to(channel, &members, &ServerEvent::SoundPlayed { sound_id, by: s.current_user(user), channel_id: channel });
+    s.send_channel_to(channel, &members, &ServerEvent::SoundPlayed { sound_id, by: s.current_user(user), channel_id: channel, stoppable: true });
+    None
+}
+
+/// `ClientEvent::StopSound` (v1.1): tell the player's voice channel to stop the sounds they
+/// played. Silently ignored when there is nothing of theirs to stop (no error: the client sends
+/// it whenever its "Parar" is pressed).
+pub fn stop(s: &AppState, user: &User) -> Option<ServerEvent> {
+    let channel = s.voice_of(user.id).and_then(|m| m.channel_id)?;
+    if !s.sounds.allow_stop(user.id) {
+        return None;
+    }
+    let members: Vec<UserId> = s.voice_members().into_iter().filter(|m| m.channel_id == Some(channel)).map(|m| m.user.id).collect();
+    tracing::info!(user = %user.username, channel, listeners = members.len(), "sound stopped");
+    s.send_channel_to(channel, &members, &ServerEvent::SoundStopped { by: user.id, channel_id: channel });
     None
 }
 
@@ -442,6 +476,19 @@ mod tests {
         assert_eq!(st.allow_play_at(1, 10, t + Duration::from_millis(1900)), Err(PlayDenied::User));
         assert_eq!(st.allow_play_at(2, 10, t + Duration::from_millis(1900)), Ok(()), "somebody else is not slowed down");
         assert_eq!(st.allow_play_at(1, 10, t + Duration::from_millis(2100)), Ok(()));
+    }
+
+    #[test]
+    fn a_play_can_be_stopped_once_while_it_may_still_play() {
+        let st = SoundState::default();
+        let t = Instant::now();
+        assert!(!st.allow_stop_at(1, t), "nothing played");
+        st.allow_play_at(1, 10, t).unwrap();
+        assert!(!st.allow_stop_at(2, t), "only the player");
+        assert!(st.allow_stop_at(1, t + Duration::from_millis(300)));
+        assert!(!st.allow_stop_at(1, t + Duration::from_millis(400)), "once per play");
+        st.allow_play_at(1, 10, t + Duration::from_secs(3)).unwrap();
+        assert!(!st.allow_stop_at(1, t + Duration::from_secs(3) + STOP_WINDOW), "too late: it has ended");
     }
 
     #[test]

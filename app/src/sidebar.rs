@@ -54,13 +54,26 @@ impl App {
                 .show(ui, |ui| self.voice_panel(ui));
         }
         egui::CentralPanel::no_frame().show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                let ui = &mut ui.new_child(egui::UiBuilder::new().max_rect(ui.max_rect().shrink2(Vec2::new(8.0, 0.0))));
-                ui.spacing_mut().item_spacing.y = 2.0;
-                ui.add_space(8.0);
-                self.channel_lists(ui);
-                ui.add_space(12.0);
+            // v1.1: the list scrolls at any window height. Its content goes in a frame (the side
+            // padding), never a `new_child`: a child does not report its size to the scroll area,
+            // which then thought the list was empty and never scrolled.
+            let probe = !self.persist;
+            let out = egui::ScrollArea::vertical().id_salt("sidebar_lists").auto_shrink([false, false]).show(ui, |ui| {
+                if probe {
+                    ui_kit::apply_scroll_request(ui, ui_kit::SIDEBAR_SCROLL);
+                }
+                egui::Frame::new().inner_margin(Margin::symmetric(8, 0)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.add_space(8.0);
+                    self.channel_lists(ui);
+                    ui.add_space(12.0);
+                });
             });
+            if probe {
+                // Autotests: what the list scrolls (`autotest_uix.rs`).
+                ui_kit::note_scroll(ui.ctx(), ui_kit::SIDEBAR_SCROLL, &out);
+            }
         });
     }
 
@@ -134,6 +147,10 @@ impl App {
             sub.push_str(" · sem dono");
         }
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 50.0), Sense::click());
+        // v1.1 (T0): the connection's lock, before the online count ("Conexão protegida" / "Conexão
+        // sem proteção (servidor antigo)" under the pointer).
+        let lock = self.tls_lock();
+        let mut lock_rect = None;
         if ui.is_rect_visible(rect) {
             let p = ui.painter();
             if resp.hovered() {
@@ -145,9 +162,21 @@ impl App {
             let name_h = name.size().y;
             p.galley(Pos2::new(x, rect.top() + 6.0), name, theme::GIZ);
             p.galley(Pos2::new(rect.right() - 8.0 - caret.size().x, rect.top() + 6.0 + (name_h - caret.size().y) / 2.0), caret, theme::NEVOA);
-            p.text(Pos2::new(x, rect.bottom() - 7.0), Align2::LEFT_BOTTOM, &sub, theme::body(12.0), if no_owner { theme::AVISO } else { theme::NEVOA });
+            let mut sub_x = x;
+            if let Some((icon, _, color)) = lock {
+                let g = p.layout_no_wrap(icon.to_owned(), theme::body(13.0), color);
+                let r = egui::Rect::from_min_size(Pos2::new(x, rect.bottom() - 7.0 - g.size().y), g.size());
+                p.galley(r.min, g, color);
+                lock_rect = Some(r.expand(3.0));
+                sub_x = r.right() + 4.0;
+            }
+            p.text(Pos2::new(sub_x, rect.bottom() - 7.0), Align2::LEFT_BOTTOM, &sub, theme::body(12.0), if no_owner { theme::AVISO } else { theme::NEVOA });
         }
-        let resp = resp.on_hover_text("Menu do servidor");
+        let over_lock = lock_rect.zip(resp.hover_pos()).is_some_and(|(r, pos)| r.contains(pos));
+        let resp = resp.on_hover_text(match lock {
+            Some((_, text, _)) if over_lock => text,
+            _ => "Menu do servidor",
+        });
         egui::Popup::menu(&resp).frame(ui_kit::popup_frame(ui.style())).show(|ui| self.server_header_menu(ui));
     }
 
@@ -188,6 +217,11 @@ impl App {
         if any {
             ui_kit::menu_separator(ui);
         }
+        // v1.1 (T0): the lock and the server's code, for everybody.
+        if ui_kit::menu_row(ui, ph::SHIELD, crate::app::tls_ui::SECURITY_TITLE, false).on_hover_text("Se a conexão com este servidor é protegida, e o código dele").clicked() {
+            self.tls.security_open = true;
+            ui.close();
+        }
         if ui_kit::menu_row(ui, ph::GEAR_SIX, "Configurações", false).clicked() {
             self.open_settings();
             ui.close();
@@ -210,8 +244,10 @@ impl App {
     /// local volume / mute of them, and who watches their live.
     fn member_row(&mut self, ui: &mut egui::Ui, m: &VoiceMember, same_channel: bool) {
         let me = self.my_id() == Some(m.user.id);
-        // My own ring follows what is actually sent (gate open), not the room's report.
-        let speaking = if me { self.sending_voice() } else { self.voice.speaking.contains(&m.user.id.to_string()) } && !m.muted && !m.server_muted;
+        // My own ring follows what is actually sent (gate open), not the room's report. Muted
+        // still rings while a soundboard sound of theirs plays (a muted mic never puts anyone in
+        // the speaking set); server-muted never does (the hub refuses their sounds).
+        let speaking = if me { self.sending_voice() } else { self.voice.speaking.contains(&m.user.id.to_string()) } && !m.server_muted;
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), MEMBER_H), Sense::click());
         if !ui.is_rect_visible(rect) {
             return;
@@ -228,7 +264,11 @@ impl App {
         let center = Pos2::new(rect.left() + MEMBER_INDENT + MEMBER_AVATAR / 2.0, cy);
         crate::avatars::draw_avatar(&mut self.avatars.store, &painter, &ctx, center, MEMBER_AVATAR / 2.0, &m.user, crate::avatars::Surface::Sidebar);
         if speaking {
-            ui_kit::paint_speaking_ring(&painter, center, MEMBER_AVATAR / 2.0, if resp.hovered() { theme::ROW_HOVER } else { theme::PAREDE });
+            // The ring reaches past the row's top and bottom (it is wider than the row is tall):
+            // painted unclipped by the row, into the gap between rows, so it is never cut and the
+            // rows do not move when it comes and goes. Still clipped by the list's scroll area.
+            let ring = ui.painter().with_clip_rect(ui_kit::speaking_ring_rect(center, MEMBER_AVATAR / 2.0).union(rect).intersect(ui.clip_rect()));
+            ui_kit::paint_speaking_ring(&ring, center, MEMBER_AVATAR / 2.0, if resp.hovered() { theme::ROW_HOVER } else { theme::PAREDE });
         }
         // Right to left: the live tag, then the small icons.
         let mut x = rect.right() - 6.0;
@@ -310,7 +350,10 @@ impl App {
                 (false, false, true, false) => "Entre neste canal de voz para ouvir",
                 (false, false, false, false) => "Entre neste canal de voz para assistir",
             };
-            let live = live.on_hover_text(hover);
+            // v1.1: with a hub that keeps previews, a resting pointer gets the hover card (the
+            // still picture and what is streamed) instead of the plain tooltip.
+            let carded = !audio_only && self.stream_hover(ui, "sidebar", r, live.hovered(), &m.user, Some(hover));
+            let live = if carded { live } else { live.on_hover_text(hover) };
             if !me && live.clicked() {
                 if watching {
                     self.unwatch(&key);
@@ -400,14 +443,14 @@ impl App {
                 CameraUi::On { info, .. } => (ph::VIDEO_CAMERA, format!("Câmera ligada ({info}). Clique para desligar"), IconState::On),
             };
             let cam_soon = self.voice.camera == CameraUi::Off && crate::platform::camera_soon();
-            let hover = if cam_soon { format!("Câmera: {}", crate::platform::SOON_MAC.to_lowercase()) } else { hover };
+            let hover = if cam_soon { format!("Câmera: {}", crate::platform::SOON_MAC_LC) } else { hover };
             let cam = ui.add_enabled_ui(self.voice.camera != CameraUi::Starting && !cam_soon, |ui| ui_kit::icon_button(ui, icon, &hover, state)).inner;
             if cam.clicked() {
                 self.toggle_camera();
             }
             match self.voice.share {
                 Share::Off if crate::platform::screen_soon() => {
-                    ui.add_enabled_ui(false, |ui| ui_kit::icon_button(ui, ph::SCREENCAST, &format!("Transmitir: {}", crate::platform::SOON_MAC.to_lowercase()), IconState::Normal));
+                    ui.add_enabled_ui(false, |ui| ui_kit::icon_button(ui, ph::SCREENCAST, &format!("Transmitir: {}", crate::platform::SOON_MAC_LC), IconState::Normal));
                 }
                 Share::Off => {
                     if ui_kit::icon_button(ui, ph::SCREENCAST, "Transmitir (Go Live)", IconState::Normal).clicked() {
@@ -585,8 +628,10 @@ impl App {
         painter.circle(center + Vec2::splat(ONLINE_AVATAR / 2.0 * 0.72), 5.0, crate::profile::presence_color(presence), egui::Stroke::new(2.0, bg));
         let mut x = rect.right() - 8.0;
         let mut voice_rect = None;
+        // v1.1: someone live shows it here too (the hover card works from this list as well).
+        let live = self.voice_members.get(&u.id).is_some_and(|m| m.streaming && !m.audio_only && m.channel_id.is_some());
         if in_voice {
-            voice_rect = Some(icon_at(&painter, &mut x, cy, super::ICON_VOICE, theme::NEVOA));
+            voice_rect = Some(if live { icon_at(&painter, &mut x, cy, ph::SCREENCAST, theme::AO_VIVO) } else { icon_at(&painter, &mut x, cy, super::ICON_VOICE, theme::NEVOA) });
         }
         let mut local = None;
         if with_me {
@@ -613,7 +658,11 @@ impl App {
         let name = crate::app::notify::fit_name(&painter, u.shown_name(), theme::body(14.0), color, x - name_left - 2.0);
         painter.galley(Pos2::new(name_left, cy - name.size().y / 2.0), name, color);
         if let Some(r) = voice_rect {
-            ui.interact(r, ui.id().with(("in_voice", u.id)), Sense::hover()).on_hover_text("Em um canal de voz");
+            let hit = ui.interact(r.expand(3.0), ui.id().with(("in_voice", u.id)), Sense::hover());
+            let carded = live && self.stream_hover(ui, "online", r, hit.hovered(), u, Some("Ao vivo em um canal de voz"));
+            if !carded {
+                hit.on_hover_text(if live { "Ao vivo em um canal de voz" } else { "Em um canal de voz" });
+            }
         }
         if let Some((r, t)) = local {
             ui.interact(r, ui.id().with(("local", u.id)), Sense::hover()).on_hover_text(t);

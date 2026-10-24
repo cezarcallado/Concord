@@ -89,6 +89,13 @@ pub struct Shared {
     pub argon2: Arc<tokio::sync::Semaphore>,
     /// Private channels: who may see what (`access.rs`), the hub's one access check.
     pub access: access::Access,
+    /// Go Live hover previews (v1.1, `stream_preview.rs`): the latest picture of each live.
+    pub stream_previews: crate::stream_preview::StreamPreviews,
+    /// v1.1 (T0): the SHA-256 of this hub's TLS certificate (unset with `tls = "off"`), for the
+    /// invites (`InviteHints::tls_pin`).
+    pub tls_pin: std::sync::OnceLock<[u8; 32]>,
+    /// v1.1 (E0): the directory of device keys' rate limit (`e2ee.rs`).
+    pub e2ee: crate::e2ee::E2eeState,
     channels: Mutex<Vec<Channel>>,
     tx: broadcast::Sender<Out>,
     inner: Mutex<Inner>,
@@ -185,6 +192,9 @@ impl Shared {
             tuning,
             voice_guard: Default::default(),
             argon2: Arc::new(tokio::sync::Semaphore::new(crate::auth::ARGON2_AT_ONCE)),
+            stream_previews: Default::default(),
+            tls_pin: Default::default(),
+            e2ee: Default::default(),
             channels: Mutex::new(channels),
             tx,
             inner: Mutex::new(inner),
@@ -355,6 +365,9 @@ impl Shared {
             account: Some(account),
             chat: Some(vox_proto::ChatFeatures::ALL),
             server_id: Some(self.server_id.clone()),
+            stream_previews: true,
+            // v1.1 (E0): the directory of device keys (`e2ee.rs`).
+            e2ee: true,
         };
         (ready, rx)
     }
@@ -375,6 +388,7 @@ impl Shared {
         g.voice_buckets.remove(&user_id);
         g.reaction_buckets.remove(&user_id);
         if let Some(m) = g.voice.remove(&user_id) {
+            self.stream_previews.forget(user_id);
             let prev = m.channel_id;
             self.send_voice(left(m), prev);
             for v in g.drop_viewers_of(user_id) {
@@ -526,6 +540,7 @@ impl Shared {
     pub fn force_leave(&self, user_id: UserId) -> Option<VoiceMember> {
         let mut g = self.lock();
         let prev = g.voice.remove(&user_id)?;
+        self.stream_previews.forget(user_id);
         self.send_voice(left(prev.clone()), prev.channel_id);
         for v in g.drop_viewers_of(user_id) {
             let ch = v.channel_id;
@@ -543,6 +558,7 @@ impl Shared {
         }
         m.streaming = false;
         m.audio_only = false;
+        self.stream_previews.forget(user_id);
         let member = m.clone();
         let ch = member.channel_id;
         self.send_voice(member, ch);
@@ -627,6 +643,10 @@ impl Shared {
         // Nobody can keep watching someone who left, moved, or stopped streaming.
         let moved = prev.as_ref().is_some_and(|p| p.channel_id != member.channel_id);
         let viewers = if member.channel_id.is_some() && member.streaming && !moved { Vec::new() } else { g.drop_viewers_of(user.id) };
+        // The hover picture of a live goes with it (ended, left, moved, or now sound only; v1.1).
+        if !(member.channel_id.is_some() && member.streaming && !member.audio_only && !moved) {
+            self.stream_previews.forget(user.id);
+        }
         self.send_voice(member, prev.and_then(|p| p.channel_id));
         for v in viewers {
             let ch = v.channel_id;

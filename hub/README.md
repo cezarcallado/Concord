@@ -29,9 +29,24 @@ Cria `<data-dir>\config.toml` com padrões. Edite e reinicie:
 - `[livekit] use_external_ip = true`: faça isso para colegas fora da sua rede, para o LiveKit anunciar o IP público.
 - `api_key`/`api_secret` são gerados sozinhos. Não compartilhe.
 
+- `tls`: conexão protegida (v1.1), `"auto"` por padrão. Veja [Conexão protegida](#conexão-protegida-tls-v11).
+
 - `owner`: normalmente **não precisa**. Veja a seção abaixo: quem hospeda vira o Dono sozinho. Escrever `owner = "seu-nome"` (no começo do arquivo, antes de `[livekit]`) é a forma manual, que fixa o Dono pelo nome.
 
-Também ficam em `<data-dir>`: `voxhub.db` (SQLite, modo WAL) e `livekit.yaml` (gerado a cada início).
+Também ficam em `<data-dir>`: `voxhub.db` (SQLite, modo WAL), `livekit.yaml` (gerado a cada início) e, desde a v1.1, a pasta `tls\` com o certificado do servidor.
+
+## Conexão protegida (TLS, v1.1)
+
+Desde a v1.1 o servidor fala **TLS na mesma porta** (7890): o app 1.1 (ou mais novo) conecta com TLS e um app antigo continua conectando sem, na mesma porta (o servidor olha o primeiro byte de cada conexão). Senhas, convites, logins lembrados, mensagens e imagens vão criptografados.
+
+- **Certificado próprio.** Na primeira vez que liga, o servidor cria um certificado autoassinado (ECDSA P-256, válido por 100 anos) em `<data-dir>\tls\server.key` (a chave, secreta) e `server.crt`. Não há autoridade certificadora: o app guarda o SHA-256 desse certificado (o *pin*) e só conversa com ele. Os convites novos já levam o pin; quem digita o endereço aceita o certificado na primeira vez. A janela do servidor mostra o **código do servidor** (os 10 primeiros bytes do pin em base32, como `K7QM-2D9X-4HVA-PB1C`), o mesmo que o app mostra em "Segurança da conexão", para comparar.
+- **Ao mudar o servidor de PC, leve a pasta `tls\` junto com o resto de `data\`.** Um certificado novo faz todos os apps dizerem "A identidade do servidor mudou" (e eles não mandam nada até a pessoa usar um convite novo ou confiar no código novo).
+- **A voz também passa pela porta do servidor.** Pela conexão protegida, a sinalização do LiveKit (`/rtc`) entra pela porta 7890 e o servidor a repassa ao LiveKit no próprio PC (`127.0.0.1:7880`). A mídia continua nas portas 7881/7882. Apps antigos ainda usam a 7880 direto.
+- **`tls` no `config.toml`:**
+  - `"auto"` (padrão): apps 1.1 com proteção, apps antigos sem.
+  - `"required"`: só conexões protegidas. Um app antigo recebe `426` com a mensagem "Este servidor exige o concord 1.1 ou mais novo (conexão protegida)." O próprio PC do servidor (`127.0.0.1`) pode sempre entrar sem. No app, "Meu servidor" > "Aceitar apps antigos sem conexão protegida" faz o mesmo para servidores criados pelo app (ligado = `auto`, desligado = `required`, vale na hora).
+  - `"off"`: sem TLS nenhum, como antes da v1.1 (não recomendado).
+- **Não volte para um servidor antigo (downgrade).** Um app que já usou a conexão protegida com um servidor **nunca mais** conecta nele sem ela: se o servidor voltar para a v1.0.x (ou para `tls = "off"`), esses apps dizem que não conseguem conectar com proteção. É de propósito (um atacante não consegue "rebaixar" a conexão). Para voltar mesmo assim, cada pessoa tira o servidor da lista no app ("Remover da lista", ou seja, esquecer o servidor) e adiciona de novo.
 
 ## Dono do servidor (quem hospeda vira dono)
 
@@ -79,7 +94,7 @@ Redirecione para o PC do host:
 | Porta | Protocolo | Uso |
 |---|---|---|
 | 7890 | TCP | API e chat (hub) |
-| 7880 | TCP | sinalização do LiveKit |
+| 7880 | TCP | sinalização do LiveKit (apps antigos; o app 1.1 usa a 7890) |
 | 7881 | TCP | mídia do LiveKit (fallback quando UDP é bloqueado) |
 | 7882 | UDP | mídia do LiveKit (principal) |
 

@@ -117,7 +117,7 @@ async fn a_newcomer_joins_with_only_the_invite_and_stays_in() {
     assert_eq!(env.list(&dono).await[0].uses, 0);
 
     // The code the app hands out round-trips to the same token.
-    let code = InviteCode { token: invite_token_from_hex(&created.token).unwrap(), hub_port: port, addrs: vec![InviteAddr::Lan("127.0.0.1".parse().unwrap(), 8)] };
+    let code = InviteCode { token: invite_token_from_hex(&created.token).unwrap(), hub_port: port, addrs: vec![InviteAddr::Lan("127.0.0.1".parse().unwrap(), 8)], tls_pin: None };
     let decoded = InviteCode::decode(&code.encode()).unwrap();
     assert_eq!(decoded.candidate_urls(&[("127.0.0.1".parse().unwrap(), 8)]), [format!("http://127.0.0.1:{port}")]);
 

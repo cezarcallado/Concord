@@ -18,12 +18,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::Json;
 use vox_proto::*;
 
-use crate::api::{ApiErr, AuthUser};
+use crate::api::{ApiErr, AuthUser, E2eeQuery, LkUrl};
 use crate::dms::{self, ConvRow};
 use crate::livekit_admin::LkError;
 use crate::livekit_token;
@@ -133,18 +133,29 @@ pub fn room_of(s: &AppState, user: UserId) -> Option<String> {
 
 // ---------------------------------------------------------------- tokens
 
-fn join_response(s: &AppState, me: &User, conv: &ConvRow, headers: &HeaderMap) -> VoiceJoinResponse {
+fn join_response(s: &AppState, me: &User, conv: &ConvRow, lk_url: &str, e2ee: bool) -> VoiceJoinResponse {
     let room = dm_room(conv.lo, conv.hi);
     let lk = &s.cfg.livekit;
     // A server mute holds in private calls too: no microphone in the token.
     let muted = s.is_server_muted(me.id);
     let token = livekit_token::join_token_with(&lk.api_key, &lk.api_secret, &room, &me.id.to_string(), &me.username, now_ms() / 1000, muted);
     s.voice_guard.issued(me.id);
-    VoiceJoinResponse { livekit_url: dms::livekit_url(s, headers), livekit_token: token, room }
+    VoiceJoinResponse { livekit_url: lk_url.to_string(), livekit_token: token, room, e2ee }
 }
 
-fn answer(s: &AppState, me: &User, live: &Live, headers: &HeaderMap) -> Json<DmCallResponse> {
-    Json(DmCallResponse { call: live.call.clone(), join: join_response(s, me, &live.conv, headers) })
+/// A token for `live`'s room. v1.1 (E1): an end-to-end encrypted call only to an app that
+/// encrypts (`capable`: it asked with `?e2ee=1`); an older one gets `409` with a text it shows.
+fn answer(s: &AppState, me: &User, live: &Live, lk: &str, capable: bool) -> ApiResult<DmCallResponse> {
+    if live.call.e2ee && !capable {
+        tracing::info!(call = live.call.id, user = %me.username, "dm call token refused: the call is end-to-end encrypted and the app cannot encrypt");
+        return Err(conflict(ERR_E2EE_CALL_REQUIRED));
+    }
+    Ok(Json(DmCallResponse { call: live.call.clone(), join: join_response(s, me, &live.conv, lk, live.call.e2ee) }))
+}
+
+/// Does `user` have a device with encryption keys (E0's directory)?
+async fn has_e2ee_device(s: &AppState, user: UserId) -> Result<bool, ApiErr> {
+    Ok(!s.db.call(move |c| crate::e2ee::list_user(c, user)).await?.is_empty())
 }
 
 fn conflict(msg: &str) -> ApiErr {
@@ -291,7 +302,8 @@ pub async fn on_voice_join(s: &AppState, user: UserId, channel: ChannelId) {
 // ---------------------------------------------------------------- handlers
 
 /// `POST /api/dms/{id}/call`: ring the other person, or join this DM's call if there is one.
-pub async fn call(State(s): State<AppState>, AuthUser(me): AuthUser, Path(id): Path<DmId>, headers: HeaderMap) -> ApiResult<DmCallResponse> {
+pub async fn call(State(s): State<AppState>, AuthUser(me): AuthUser, Path(id): Path<DmId>, Query(q): Query<E2eeQuery>, LkUrl(lk): LkUrl) -> ApiResult<DmCallResponse> {
+    let capable = q.capable();
     let conv = dms::conversation_of(&s, me.id, id).await?;
     let peer_id = conv.peer_of(me.id);
     let (a, b) = (me.id, peer_id);
@@ -302,9 +314,9 @@ pub async fn call(State(s): State<AppState>, AuthUser(me): AuthUser, Path(id): P
     let existing = s.calls.lock().of_dm(id).cloned();
     if let Some(live) = existing {
         if live.answered.is_none() && live.call.callee.id == me.id {
-            return accept_live(&s, &me, live.call.id, &headers);
+            return accept_live(&s, &me, live.call.id, &lk, capable);
         }
-        return Ok(answer(&s, &me, &live, &headers));
+        return answer(&s, &me, &live, &lk, capable);
     }
     // A call elsewhere: mine ends (I am calling someone else now); theirs means busy.
     end_for(&s, me.id, CallEndReason::Hangup).await;
@@ -316,6 +328,9 @@ pub async fn call(State(s): State<AppState>, AuthUser(me): AuthUser, Path(id): P
         .map(|r| r.user(&owner))
         .ok_or_else(|| ApiErr::new(StatusCode::NOT_FOUND, "user not found"))?;
     let me_now = s.current_user(&me);
+    // v1.1 (E1): end-to-end encrypted when both ends can: this app said so, and the callee has a
+    // device with keys (whichever of their computers answers must then be 1.1).
+    let e2ee = capable && has_e2ee_device(&s, peer_id).await?;
     // `Err(first)`: busy (`first`: the first time I hit this busy call).
     let live: Result<Live, bool> = {
         let mut g = s.calls.lock();
@@ -333,7 +348,7 @@ pub async fn call(State(s): State<AppState>, AuthUser(me): AuthUser, Path(id): P
             Err(first)
         } else {
             g.next_id += 1;
-            let call = DmCall { id: g.next_id, dm_id: id, caller: me_now, callee: peer, state: CallState::Ringing, started_at_ms: now_ms() };
+            let call = DmCall { id: g.next_id, dm_id: id, caller: me_now, callee: peer, state: CallState::Ringing, started_at_ms: now_ms(), e2ee };
             let live = Live { call, conv: conv.clone(), answered: None, busy_noted: Vec::new() };
             g.calls.insert(live.call.id, live.clone());
             Ok(live)
@@ -350,39 +365,45 @@ pub async fn call(State(s): State<AppState>, AuthUser(me): AuthUser, Path(id): P
             return Err(conflict(ERR_CALL_BUSY));
         }
     };
-    tracing::info!(call = live.call.id, dm = id, caller = %me.username, callee = %live.call.callee.username, "dm call ringing");
+    tracing::info!(call = live.call.id, dm = id, caller = %me.username, callee = %live.call.callee.username, e2ee, "dm call ringing");
     dms::tell_both(&s, &conv, &ServerEvent::CallInvite { call: live.call.clone() });
     arm_ring_timeout(&s, live.call.id);
-    Ok(answer(&s, &me, &live, &headers))
+    answer(&s, &me, &live, &lk, capable)
 }
 
 /// The callee answers call `id`.
-fn accept_live(s: &AppState, me: &User, id: CallId, headers: &HeaderMap) -> ApiResult<DmCallResponse> {
+fn accept_live(s: &AppState, me: &User, id: CallId, lk: &str, capable: bool) -> ApiResult<DmCallResponse> {
     let live = {
         let mut g = s.calls.lock();
         let Some(live) = g.calls.get_mut(&id) else { return Err(conflict("no call")) };
+        if live.call.e2ee && !capable {
+            // Not answered: the call keeps ringing for the callee's other (1.1) computers.
+            tracing::info!(call = id, callee = %me.username, "dm call accept refused: the call is end-to-end encrypted and the app cannot encrypt");
+            return Err(conflict(ERR_E2EE_CALL_REQUIRED));
+        }
         if live.answered.is_none() {
             live.answered = Some(Instant::now());
             live.call.state = CallState::Active;
         }
         live.clone()
     };
-    tracing::info!(call = id, dm = live.call.dm_id, callee = %me.username, "dm call answered");
+    tracing::info!(call = id, dm = live.call.dm_id, callee = %me.username, e2ee = live.call.e2ee, "dm call answered");
     dms::tell_both(s, &live.conv, &ServerEvent::CallAccepted { call: live.call.clone() });
-    Ok(answer(s, me, &live, headers))
+    answer(s, me, &live, lk, capable)
 }
 
 /// `POST /api/dms/{id}/call/accept`
-pub async fn accept(State(s): State<AppState>, AuthUser(me): AuthUser, Path(id): Path<DmId>, headers: HeaderMap) -> ApiResult<DmCallResponse> {
+pub async fn accept(State(s): State<AppState>, AuthUser(me): AuthUser, Path(id): Path<DmId>, Query(q): Query<E2eeQuery>, LkUrl(lk): LkUrl) -> ApiResult<DmCallResponse> {
+    let capable = q.capable();
     dms::conversation_of(&s, me.id, id).await?;
     let Some(live) = s.calls.lock().of_dm(id).cloned() else { return Err(conflict("no call")) };
     if live.answered.is_none() {
         if live.call.callee.id != me.id {
             return Err(conflict("only the person being called can answer"));
         }
-        return accept_live(&s, &me, live.call.id, &headers);
+        return accept_live(&s, &me, live.call.id, &lk, capable);
     }
-    Ok(answer(&s, &me, &live, &headers))
+    answer(&s, &me, &live, &lk, capable)
 }
 
 /// `POST /api/dms/{id}/call/decline`

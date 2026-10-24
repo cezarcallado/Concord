@@ -200,6 +200,15 @@ struct CameraTrack {
 impl CameraTrack {
     async fn publish(room: &Room, path: VideoPath, source: NativeVideoSource, fps: u32, max_bitrate: u64, encoder: VideoEncoderBackend) -> Result<Self> {
         let track = LocalVideoTrack::create_video_track("camera", RtcVideoSource::Native(source.clone()));
+        // v1.1 (E1): the encoded path's per-frame timing events (`publish_timing_events`) need a
+        // sender frame transformer. Subscribed BEFORE publishing, the SDK makes it at the publish
+        // and an end-to-end encrypted room's frame cryptor chains itself in front of it. Made after
+        // (the first subscription on a published track), it REPLACED the cryptor on the sender:
+        // the pre-encoded H.264 then went out unencrypted (found by the e2v gate). Later
+        // subscriptions reuse that transformer.
+        if encoder == VideoEncoderBackend::PreEncoded {
+            drop(track.publish_timing_events());
+        }
         let opts = TrackPublishOptions {
             source: TrackSource::Camera,
             video_codec: VideoCodec::H264,

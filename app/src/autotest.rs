@@ -56,6 +56,10 @@ pub enum Role {
     /// card and presence (see `autotest_profiles.rs`).
     ProfileA,
     ProfileB,
+    /// Changing the microphone mid-call, with fake devices: A switches, unplugs and replugs, B
+    /// must keep hearing it (see `autotest_micswitch.rs`).
+    MicSwitchA,
+    MicSwitchB,
     /// Soundboard: A uploads sounds and plays them, B checks its own mixer, the deafen and mute
     /// gates and the permissions (see `autotest_sounds.rs`).
     SoundA,
@@ -134,9 +138,58 @@ pub enum Role {
     /// card and is not sent, while a message that only contains the word is; then Configurações →
     /// Sobre. Partners: one or more `idle` clients (the members on the card).
     Calladex,
+    /// v1.1 interface fixes (see `autotest_uix.rs`): A checks that the sidebar and every chat
+    /// scroll in the smallest window, the speaking ring, the message and text box menus; B sits
+    /// in the voice room.
+    UixA,
+    UixB,
+    /// v1.1 D1: the Pix donation popups and page (see `autotest_donate.rs`; only in a build with
+    /// the `donate-test` feature).
+    #[cfg(feature = "donate-test")]
+    Donate,
+    /// v1.1 keyboard shortcuts (see `autotest_keys.rs`): synthetic key events for deafen, mute,
+    /// push-to-talk, a missing sound, Go Live and leave, straight into the shortcut matcher.
+    KeysA,
+    /// v1.1 Go Live hover cards (see `autotest_thumbs.rs`): A streams the test window, B and C
+    /// see its still picture and app from outside the room; in a private room only B does.
+    ThumbsA,
+    ThumbsB,
+    ThumbsC,
+    /// v1.1 colour emoji (see `autotest_emoji.rs`): message text, chips, quick reactions, picker.
+    EmojiA,
+    /// v1.1 T0 TLS (see `autotest_tls.rs`): invite with the pin, chat and voice through the tunnel
+    /// (`tls-a` / `tls-b`), another certificate at a saved address (`tls-mitm`), an older hub
+    /// (`tls-oldhub`).
+    TlsA,
+    TlsB,
+    TlsMitm,
+    TlsOldHub,
+    /// v1.1 E0 per-device identity keys (see `autotest_e2ee.rs`): A and B register, a second
+    /// device of A appears, A gets the alert and removes it from "Seus aparelhos".
+    E2eeA,
+    E2eeA2,
+    E2eeB,
+    /// v1.1 E2 end-to-end encrypted DMs (see `autotest_e2dm.rs`): A sends text and a photo, B
+    /// opens and draws them and replies, A's second computer reads A's own lines, a new computer
+    /// of A sees "antes deste aparelho existir", B verifies the safety code and sees it change.
+    E2dmA,
+    E2dmB,
+    E2dmA2,
+    E2dmNew,
+    /// v1.1 E1 end-to-end encrypted calls (see `autotest_e2v.rs`): A turns the room's encryption
+    /// on, joins with tone, camera and a pre-encoded live; B checks everything decodes and that the
+    /// keys rotate without a gap while C comes and goes; `e2v-admin` turns it on for `e2v-old`.
+    E2vA,
+    E2vB,
+    E2vC,
+    E2vAdmin,
     /// v1.1 macOS (M2): watch a stream drawn by the app itself, pinned, fullscreen, popped out and
     /// back (see `autotest_macview.rs`). Partner: anyone live (`vox-cli share h264file`).
     MacView,
+    /// v1.1 I6 responsive layout (see `autotest_resp.rs`): every screen at several window sizes
+    /// and zoom levels, checking the layout rules (`resp-a`); `resp-b` streams or shows a camera.
+    RespA,
+    RespB,
 }
 
 #[path = "autotest_roles.rs"]
@@ -193,6 +246,29 @@ mod stagetest;
 mod shots3b;
 #[path = "autotest_macview.rs"]
 mod macview;
+#[path = "autotest_uix.rs"]
+mod uixtest;
+#[cfg(feature = "donate-test")]
+#[path = "autotest_donate.rs"]
+mod donatetest;
+#[path = "autotest_keys.rs"]
+mod keystest;
+#[path = "autotest_thumbs.rs"]
+mod thumbstest;
+#[path = "autotest_tls.rs"]
+mod tlstest;
+#[path = "autotest_e2ee.rs"]
+mod e2eetest;
+#[path = "autotest_e2dm.rs"]
+mod e2dmtest;
+#[path = "autotest_e2v.rs"]
+mod e2vtest;
+#[path = "autotest_emoji.rs"]
+mod emojitest;
+#[path = "autotest_micswitch.rs"]
+mod micswitch;
+#[path = "autotest_resp.rs"]
+mod resp;
 
 /// Command-line parameters of an autotest run.
 #[derive(Default)]
@@ -321,6 +397,22 @@ pub struct Auto {
     /// Role `stage-b`.
     stage: stagetest::State,
     s3b: shots3b::State,
+    /// Roles `uix-a` / `uix-b`.
+    uix: uixtest::State,
+    /// Role `keys-a`: the shortcuts run before the last presses.
+    keys_base: usize,
+    /// Roles `thumbs-a` / `thumbs-b` / `thumbs-c`.
+    th: thumbstest::State,
+    /// Roles `tls-a` / `tls-b` / `tls-mitm` / `tls-oldhub`.
+    tls: tlstest::State,
+    /// Roles `e2dm-a` / `e2dm-b` / `e2dm-a2` / `e2dm-new`.
+    e2dm: e2dmtest::State,
+    /// Roles `resp-a` / `resp-b`.
+    resp: resp::State,
+    /// Roles `e2v-a` / `e2v-b` / `e2v-c` / `e2v-admin`.
+    e2v: e2vtest::State,
+    /// Roles `micswitch-a` / `micswitch-b`.
+    micsw: micswitch::State,
 }
 
 impl Auto {
@@ -383,6 +475,14 @@ impl Auto {
             nav: navtest::State::default(),
             stage: stagetest::State::default(),
             s3b: shots3b::State::default(),
+            uix: uixtest::State::default(),
+            keys_base: 0,
+            th: thumbstest::State::default(),
+            tls: tlstest::State::default(),
+            e2dm: e2dmtest::State::default(),
+            resp: resp::State::default(),
+            e2v: e2vtest::State::default(),
+            micsw: micswitch::State::default(),
         }
     }
 
@@ -481,6 +581,8 @@ impl Auto {
             Role::AvatarB => self.run_avatar_b(app),
             Role::ProfileA => self.run_profile_a(app),
             Role::ProfileB => self.run_profile_b(app),
+            Role::MicSwitchA => self.run_micswitch_a(app),
+            Role::MicSwitchB => self.run_micswitch_b(app),
             Role::SoundA => self.run_sound_a(app),
             Role::SoundB => self.run_sound_b(app),
             Role::SoundTrim => self.run_sound_trim(app),
@@ -516,6 +618,32 @@ impl Auto {
             Role::Shots3bHost => self.run_shots3b_host(app),
             Role::Calladex => self.run_calladex(app),
             Role::MacView => self.run_mac_view(app),
+            Role::UixA => self.run_uix_a(app),
+            Role::UixB => self.run_uix_b(app),
+            #[cfg(feature = "donate-test")]
+            Role::Donate => self.run_donate(app),
+            Role::KeysA => self.run_keys_a(app),
+            Role::ThumbsA => self.run_thumbs_a(app),
+            Role::ThumbsB => self.run_thumbs_b(app),
+            Role::ThumbsC => self.run_thumbs_c(app),
+            Role::TlsA => self.run_tls_a(app),
+            Role::TlsB => self.run_tls_b(app),
+            Role::TlsMitm => self.run_tls_mitm(app),
+            Role::TlsOldHub => self.run_tls_oldhub(app),
+            Role::E2eeA => self.run_e2ee_a(app),
+            Role::E2eeA2 => self.run_e2ee_a2(app),
+            Role::E2eeB => self.run_e2ee_b(app),
+            Role::E2dmA => self.run_e2dm_a(app),
+            Role::E2dmB => self.run_e2dm_b(app),
+            Role::E2dmA2 => self.run_e2dm_a2(app),
+            Role::E2dmNew => self.run_e2dm_new(app),
+            Role::E2vA => self.run_e2v_a(app),
+            Role::E2vB => self.run_e2v_b(app),
+            Role::E2vC => self.run_e2v_c(app),
+            Role::E2vAdmin => self.run_e2v_admin(app),
+            Role::EmojiA => self.run_emoji_a(app),
+            Role::RespA => self.run_resp_a(app),
+            Role::RespB => self.run_resp_b(app),
         }
     }
 
@@ -1423,6 +1551,8 @@ mod win {
 impl App {
     pub fn auto_tick(&mut self, ctx: &egui::Context) {
         let Some(mut auto) = self.auto.take() else { return };
+        #[cfg(not(windows))]
+        shots::collect(ctx);
         let done = auto.run(self);
         let auto_done_ticking = auto.resting();
         let quiet = auto.quiet_until.map(|t| t.saturating_duration_since(Instant::now()));

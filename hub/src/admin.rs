@@ -534,6 +534,77 @@ pub async fn set_channel_access(State(s): State<AppState>, me: Authed, Path(id):
     Ok(ok())
 }
 
+/// Is anybody in voice channel `id`'s room: listed by the hub, or present at LiveKit (an
+/// unlisted participant counts too; LiveKit unreachable or off counts as empty only when the hub
+/// lists nobody).
+async fn room_occupied(s: &AppState, id: ChannelId) -> bool {
+    if s.voice_members().iter().any(|m| m.channel_id == Some(id)) {
+        return true;
+    }
+    match s.livekit.list_participants(&room(id)).await {
+        Ok(list) => !list.is_empty(),
+        Err(LkError::NotFound) | Err(LkError::Disabled) => false,
+        Err(LkError::Other(e)) => {
+            // Cannot tell: refuse the change rather than flip the flag under somebody's feet.
+            tracing::warn!(channel = id, error = %e, "cannot list the voice room before an e2ee change");
+            true
+        }
+    }
+}
+
+/// The people who may see channel `ch` but have no device with encryption keys on this server
+/// (an app older than 1.1, or 1.1 never opened here): they cannot enter it while it is encrypted.
+async fn e2ee_outdated(s: &AppState, ch: ChannelId) -> Result<Vec<User>, ApiErr> {
+    let owner = s.owner();
+    let (rows, devices) = s.db.call(|c| Ok((db::list_users(c)?, crate::e2ee::list_all(c)?))).await?;
+    let mut out: Vec<User> = rows
+        .into_iter()
+        .filter(|r| s.can_see(r.id, ch) && !devices.iter().any(|d| d.user_id == r.id))
+        .map(|r| r.user(&owner))
+        .collect();
+    out.sort_by_key(|u| u.username.to_lowercase());
+    Ok(out)
+}
+
+/// v1.1 (E1): `GET /api/channels/{id}/e2ee` (Admin and up): the flag and who could not enter.
+pub async fn get_channel_e2ee(State(s): State<AppState>, me: Authed, Path(id): Path<ChannelId>) -> ApiResult<ChannelE2eeResponse> {
+    can_manage_channels(&me)?;
+    let Some(ch) = s.channel(id).filter(|c| c.kind == ChannelKind::Voice) else {
+        return Err(ApiErr::new(StatusCode::NOT_FOUND, "voice channel not found"));
+    };
+    Ok(Json(ChannelE2eeResponse { on: ch.e2ee, outdated: e2ee_outdated(&s, id).await? }))
+}
+
+/// v1.1 (E1): `POST /api/channels/{id}/e2ee` (Admin and up): end-to-end encrypted calls on or off,
+/// only while the room is empty (`409` [`ERR_ROOM_OCCUPIED`]): nobody's call changes under them,
+/// and nobody keeps a token from the other mode.
+pub async fn set_channel_e2ee(State(s): State<AppState>, me: Authed, Path(id): Path<ChannelId>, body: Result<Json<ChannelE2eeRequest>, JsonRejection>) -> ApiResult<ChannelE2eeResponse> {
+    let Json(req) = body?;
+    can_manage_channels(&me)?;
+    let Some(ch) = s.channel(id) else {
+        return Err(ApiErr::new(StatusCode::NOT_FOUND, "channel not found"));
+    };
+    if ch.kind != ChannelKind::Voice {
+        return Err(ApiErr::new(StatusCode::BAD_REQUEST, "not a voice channel"));
+    }
+    if ch.e2ee != req.on {
+        if room_occupied(&s, id).await {
+            return Err(ApiErr::new(StatusCode::CONFLICT, ERR_ROOM_OCCUPIED));
+        }
+        let on = req.on;
+        s.db.call(move |c| db::set_channel_e2ee(c, id, on)).await?;
+        reload_channels(&s).await?;
+        // A join token of the other mode may still be on its way into the room (the room was
+        // empty a moment ago): such a participant is removed (`voice_guard`); check closely while
+        // one could still be used.
+        crate::voice_guard::watch_closely(&s);
+        tracing::info!(channel = id, on, "channel e2ee changed");
+        let detail = format!("{}: {}", ch.name, if on { "ligada" } else { "desligada" });
+        audit(&s, Some(me.user.id), AUDIT_CHANNEL_E2EE, None, detail).await;
+    }
+    Ok(Json(ChannelE2eeResponse { on: req.on, outdated: e2ee_outdated(&s, id).await? }))
+}
+
 /// `POST /api/admin/channels/{id}/rename`
 pub async fn rename_channel(State(s): State<AppState>, me: Authed, Path(id): Path<ChannelId>, body: Result<Json<ChannelRenameRequest>, JsonRejection>) -> ApiResult<OkResponse> {
     let Json(req) = body?;

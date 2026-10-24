@@ -1,0 +1,19 @@
+Twemoji
+=======
+
+atlas.png in this folder holds emoji graphics from Twemoji:
+
+  Twemoji (c) Twitter, Inc and other contributors.
+  Graphics licensed under CC-BY 4.0: https://creativecommons.org/licenses/by/4.0/
+  (legal code: https://creativecommons.org/licenses/by/4.0/legalcode)
+
+Source: the maintained Twemoji fork, https://github.com/jdecked/twemoji, release v15.1.0,
+assets/72x72/<code points>.png, fetched from
+https://cdn.jsdelivr.net/gh/jdecked/twemoji@v15.1.0/assets/72x72/
+
+Changes made for concord: only the emoji listed in index.txt were taken; each was scaled from
+72x72 to 48x48 pixels and packed with the others into the single atlas.png (16 per row, each in a
+64x64 cell with a transparent margin), saved with one shared palette of 256 colours. The graphics
+were not otherwise modified.
+
+The Twemoji code (not used here) is MIT-licensed; only the graphics above are included.

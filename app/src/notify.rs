@@ -443,7 +443,14 @@ impl App {
         let p = plan(self.settings.notify.windows, self.do_not_disturb(), &inc);
         if p.toast {
             self.dms.flashes += 1;
-            let body = if m.kind.is_call() { super::dms::call_line_text(m, me) } else { preview(m.caption(), m.attachments.len()) };
+            // v1.1 (E2): an encrypted line shows its text once opened here, or only that it came.
+            let body = if m.kind.is_call() {
+                super::dms::call_line_text(m, me)
+            } else if crate::backend::e2ee::dm::is_unreadable(m) {
+                crate::backend::e2ee::dm::NOTIFY_TEXT.to_string()
+            } else {
+                preview(m.caption(), m.attachments.len())
+            };
             self.raise_toast(Target::Dm(m.dm_id), toast_title(m.author.shown_name(), None), body);
         }
     }
@@ -507,6 +514,14 @@ impl App {
         }
     }
 
+    /// The `donate` autotest: into the tray, as closing the window does.
+    #[cfg(feature = "donate-test")]
+    pub fn hide_for_test(&mut self) {
+        if let Some(c) = self.repaint.ctx() {
+            self.hide_to_tray(&c);
+        }
+    }
+
     /// Bring the window back to the front (tray click, "Abrir concord", a clicked notification).
     pub fn show_window(&mut self, ctx: &egui::Context) {
         tracing::info!(was_hidden = self.notify.hidden, "window restored from the tray");
@@ -532,6 +547,10 @@ impl App {
     pub(super) fn notify_tick(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         self.sync_tray(now);
+        // v1.1: concord was opened again (`single_instance`): bring this one to the front.
+        if crate::single_instance::take_show() {
+            self.show_window(ctx);
+        }
 
         while let Ok(ev) = self.notify.rx.try_recv() {
             tracing::info!(?ev, "tray event");
@@ -611,6 +630,8 @@ impl App {
 
     pub(super) fn notify_on_exit(&mut self) {
         self.notify.tray = None; // removes the icon and the badge
+        // Opening concord again from here on starts a new one (`single_instance::release`).
+        crate::single_instance::release();
     }
     // (The settings of this module, "Notificações do Windows" and the tray, are drawn in
     // Configurações → Notificações: `settings_ui.rs`.)

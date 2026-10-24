@@ -300,6 +300,38 @@ pub fn default_audio_target(source: &ShareSource) -> Option<AudioTarget> {
     }
 }
 
+/// Test mode only ([`crate::testmode::guards_real_capture`]): why `source`, with the sound of
+/// `audio_pid`, must not be captured. Only the `test_window` example, this app's own window and
+/// the synthetic sources may be: never a real screen, the PC's sound or another program.
+pub fn test_capture_refusal(source: &ShareSource, audio_pid: Option<u32>) -> Option<String> {
+    if !crate::testmode::guards_real_capture() {
+        return None;
+    }
+    refusal_for(source, audio_pid, window_pid, is_test_process)
+}
+
+fn is_test_process(pid: u32) -> bool {
+    capture_call("list_windows", vox_capture::list_windows).is_ok_and(|l| l.iter().any(|w| w.process_id == pid && crate::testmode::is_test_capture_exe(&w.exe_name)))
+}
+
+fn refusal_for(source: &ShareSource, audio_pid: Option<u32>, pid_of: impl Fn(isize) -> Option<u32>, is_test: impl Fn(u32) -> bool) -> Option<String> {
+    let what = match source {
+        ShareSource::Monitor(i) => Some(format!("a real screen (Monitor({i}))")),
+        ShareSource::AudioSystem => Some("the PC's sound".to_string()),
+        ShareSource::Window(h) => match pid_of(*h) {
+            Some(pid) if pid == std::process::id() || is_test(pid) => None,
+            _ => Some(format!("window {h}, which is not a test window")),
+        },
+        ShareSource::AudioApp { pid } if !is_test(*pid) => Some(format!("the sound of process {pid}, which is not a test program")),
+        _ => None,
+    };
+    let what = what.or_else(|| audio_pid.filter(|p| !is_test(*p)).map(|p| format!("the sound of process {p}, which is not a test program")))?;
+    Some(format!(
+        "test mode refuses to capture {what}: only the test window, this app's own window or a test source (set {}=1 to allow it by hand)",
+        crate::testmode::ALLOW_REAL_CAPTURE_ENV
+    ))
+}
+
 /// A stoppable producer thread (test pattern / sine / file).
 pub(crate) struct ProducerThread {
     stop: Arc<AtomicBool>,
@@ -637,6 +669,15 @@ impl VideoPublication {
     #[allow(clippy::too_many_arguments)]
     async fn publish(room: &Room, path: VideoPath, source: NativeVideoSource, width: u32, height: u32, fps: u32, max_bitrate: u64, encoder: VideoEncoderBackend) -> Result<Self> {
         let track = LocalVideoTrack::create_video_track("screenshare", RtcVideoSource::Native(source.clone()));
+        // v1.1 (E1): the encoded path's per-frame timing events (`publish_timing_events`) need a
+        // sender frame transformer. Subscribed BEFORE publishing, the SDK makes it at the publish
+        // and an end-to-end encrypted room's frame cryptor chains itself in front of it. Made after
+        // (the first subscription on a published track), it REPLACED the cryptor on the sender:
+        // the pre-encoded H.264 then went out unencrypted (found by the e2v gate). Later
+        // subscriptions reuse that transformer.
+        if encoder == VideoEncoderBackend::PreEncoded {
+            drop(track.publish_timing_events());
+        }
         let publish = TrackPublishOptions {
             source: TrackSource::Screenshare,
             video_codec: VideoCodec::H264,
@@ -1258,6 +1299,12 @@ impl ActiveShare {
         if let Some(t) = self.video.as_ref().and_then(|v| v.preview_tap()) {
             t.apply(cfg);
         }
+    }
+
+    /// The preview tap's owner, for the hover picture's snapshots (v1.1). `None` without a
+    /// preview (audio-only, test pattern, file).
+    pub fn preview_handle(&self) -> Option<SharePreview> {
+        self.preview.clone()
     }
 
     /// Frames of our own preview shown so far (stats), when there is one.
@@ -2547,6 +2594,33 @@ mod audio_only_tests {
     use super::*;
 
     #[test]
+    fn test_mode_never_captures_real_screens_windows_or_sound() {
+        // Window 10 belongs to the test window (pid 50), window 11 to somebody's browser (pid 60),
+        // window 12 to this process.
+        let me = std::process::id();
+        let pid_of = |h: isize| match h {
+            10 => Some(50),
+            11 => Some(60),
+            12 => Some(me),
+            _ => None,
+        };
+        let is_test = |pid: u32| pid == 50;
+        let refused = |s: ShareSource, audio_pid: Option<u32>| refusal_for(&s, audio_pid, pid_of, is_test);
+        for s in [ShareSource::Monitor(0), ShareSource::Monitor(2), ShareSource::AudioSystem, ShareSource::Window(11), ShareSource::Window(99), ShareSource::AudioApp { pid: 60 }] {
+            let why = refused(s.clone(), None).unwrap_or_else(|| panic!("{s:?} must be refused"));
+            assert!(why.contains(crate::testmode::ALLOW_REAL_CAPTURE_ENV), "{why}");
+        }
+        for s in [ShareSource::Window(10), ShareSource::Window(12), ShareSource::AudioApp { pid: 50 }, ShareSource::TestPattern, ShareSource::AudioTone] {
+            assert_eq!(refused(s.clone(), None), None, "{s:?}");
+        }
+        // The test window's picture with somebody else's sound: refused too.
+        assert!(refused(ShareSource::Window(10), Some(60)).is_some());
+        assert!(refused(ShareSource::TestPattern, Some(50)).is_none());
+        assert!(crate::testmode::is_test_capture_exe("Test_Window.exe") && crate::testmode::is_test_capture_exe("test_window"));
+        assert!(!crate::testmode::is_test_capture_exe("chrome.exe") && !crate::testmode::is_test_capture_exe("test_window2.exe"));
+    }
+
+    #[test]
     fn audio_only_sources_have_audio_targets_and_no_video() {
         assert!(ShareSource::AudioApp { pid: 7 }.is_audio_only());
         assert!(ShareSource::AudioSystem.is_audio_only());
@@ -2558,6 +2632,10 @@ mod audio_only_tests {
         assert_eq!(default_audio_target(&ShareSource::AudioApp { pid: 7 }), Some(AudioTarget::ProcessTree { pid: 7 }));
         assert_eq!(default_audio_target(&ShareSource::AudioSystem), Some(AudioTarget::SystemExcludingProcessTree { pid: std::process::id() }));
         assert_eq!(default_audio_target(&ShareSource::AudioTone), None);
+        // G1 (v1.1): a whole-screen share's sound leaves out our own process tree too, where the
+        // call's voices, the soundboard and the alerts are played (cpal, in this process).
+        assert_eq!(default_audio_target(&ShareSource::Monitor(0)), Some(AudioTarget::SystemExcludingProcessTree { pid: std::process::id() }));
+        assert_eq!(default_audio_target(&ShareSource::Monitor(3)), Some(AudioTarget::SystemExcludingProcessTree { pid: std::process::id() }));
         // They never take the encoded video path.
         for s in [ShareSource::AudioApp { pid: 7 }, ShareSource::AudioSystem, ShareSource::AudioTone] {
             assert!(encoded_backend(&s, EncoderChoice::Auto).is_none(), "{s:?}");
@@ -2582,7 +2660,7 @@ mod audio_only_tests {
     #[test]
     fn audio_failures_are_portuguese() {
         let e = capture_error("start_audio", vox_capture::CaptureError::Unsupported("old windows".into()));
-        assert!(audio_failure_pt(&e).contains("Windows 10"));
+        assert!(audio_failure_pt(&e).contains(if cfg!(target_os = "macos") { "macOS 13" } else { "Windows 10" }));
         let e = capture_error("start_audio", vox_capture::CaptureError::NotFound("pid 9".into()));
         assert!(audio_failure_pt(&e).contains("não existe mais"));
     }

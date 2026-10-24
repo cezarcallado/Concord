@@ -87,6 +87,7 @@ fn main() -> Result<()> {
     let livekit_exe = (!cli.opts.no_livekit).then(|| std::path::absolute(&cli.opts.livekit_bin).unwrap_or_else(|_| cli.opts.livekit_bin.clone()));
     let no_diag = cli.no_diag;
     let result = rt.block_on(serve_until(cli.opts, move |server| {
+        print_server_code(server.tls_pin());
         if !no_diag {
             let lk = &server.config.livekit;
             let hub_port = server.addr.port();
@@ -109,6 +110,21 @@ fn main() -> Result<()> {
     }
     tracing::info!("bye");
     result
+}
+
+/// v1.1 (T0): the code people can compare with "Servidor > Segurança da conexão" in the app.
+/// Written with `writeln!` and its error ignored: a closed console must not stop the server.
+fn print_server_code(pin: Option<[u8; 32]>) {
+    use std::io::Write;
+    let line = "==============================================================================";
+    let text = match pin {
+        Some(pin) => format!(
+            "  Conexão protegida (TLS) ligada. Código do servidor: {}\n  Quem entrar pode conferir este código no app: menu do servidor > Segurança da conexão.",
+            vox_proto::tls_server_code(&pin)
+        ),
+        None => "  ATENÇÃO: conexão protegida desligada (tls = \"off\" no config.toml): senhas e mensagens passam pela rede sem criptografia.".to_string(),
+    };
+    let _ = writeln!(std::io::stderr(), "\n{line}\n{text}\n{line}\n");
 }
 
 async fn wait_ctrl_c() {

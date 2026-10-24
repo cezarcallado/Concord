@@ -53,9 +53,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/admin/channels/{id}/delete", post(admin::delete_channel))
         // private channels (v0.9, `access.rs`)
         .route("/api/admin/channels/{id}/access", post(admin::set_channel_access))
+        // v1.1 (E1): end-to-end encrypted calls in a voice channel (Admin and up)
+        .route("/api/channels/{id}/e2ee", get(admin::get_channel_e2ee).post(admin::set_channel_e2ee))
         // profile pictures
         .route("/api/me/avatar", put(avatar::put_avatar).delete(avatar::delete_avatar).layer(DefaultBodyLimit::max(AVATAR_MAX_UPLOAD_BYTES)))
         .route("/api/users/{id}/avatar", get(avatar::get_avatar))
+        // Go Live hover previews (v1.1, `stream_preview.rs`)
+        .route("/api/me/stream-preview", put(crate::stream_preview::put).delete(crate::stream_preview::delete).layer(DefaultBodyLimit::max(STREAM_PREVIEW_MAX_BODY)))
+        .route("/api/users/{id}/stream-preview", get(crate::stream_preview::get))
         .route("/api/mod/users/{id}/remove-avatar", post(avatar::remove_avatar))
         // profiles: display name, bio, colour, custom status, presence
         .route("/api/users/{id}/profile", get(profile::get_profile))
@@ -79,6 +84,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/invites/{id}/revoke", post(crate::invites::revoke))
         // direct messages and private calls (`dms.rs`, `calls.rs`)
         .merge(crate::dms::routes())
+        // end-to-end encryption, E0 (v1.1, `e2ee.rs`): the directory of device keys
+        .merge(crate::e2ee::routes())
         .route("/ws", get(ws::handler))
         .layer(middleware::from_fn(log_request))
         .layer(middleware::from_fn(move |req, next| crate::serve::timeout_layer(limits.clone(), req, next)))
@@ -427,22 +434,43 @@ async fn voice_join(
     State(s): State<AppState>,
     AuthUser(user): AuthUser,
     Path(id): Path<ChannelId>,
-    headers: header::HeaderMap,
+    Query(q): Query<E2eeQuery>,
+    LkUrl(livekit_url): LkUrl,
 ) -> ApiResult<VoiceJoinResponse> {
-    match s.channel_for(user.id, id) {
+    let e2ee = match s.channel_for(user.id, id) {
         None => return Err(ApiErr::new(StatusCode::NOT_FOUND, "channel not found")),
         Some(c) if c.kind != ChannelKind::Voice => return Err(ApiErr::new(StatusCode::BAD_REQUEST, "not a voice channel")),
-        _ => {}
+        Some(c) => c.e2ee,
+    };
+    // v1.1 (E1): an end-to-end encrypted room only lets in apps that encrypt (an older one would
+    // send its media in the clear and fail to decode everybody else's).
+    if e2ee && !q.capable() {
+        tracing::info!(user = %user.username, channel = id, "voice join refused: the room is end-to-end encrypted and the app cannot encrypt");
+        return Err(ApiErr::new(StatusCode::FORBIDDEN, ERR_E2EE_REQUIRED));
     }
     let room = format!("voice-{id}");
     let lk = &s.cfg.livekit;
     // A server-muted member (item 12) gets a token that does not allow the microphone at all.
     let server_muted = s.is_server_muted(user.id);
     let token = livekit_token::join_token_with(&lk.api_key, &lk.api_secret, &room, &user.id.to_string(), &user.username, now_ms() / 1000, server_muted);
-    s.voice_guard.issued(user.id);
-    let livekit_url = livekit_url(&headers, &s.cfg);
-    tracing::info!(user = %user.username, room, url = %livekit_url, server_muted, "voice join");
-    Ok(Json(VoiceJoinResponse { livekit_url, livekit_token: token, room }))
+    // v1.1 (E1): with the mode it was given for (a join racing the encryption toggle is removed).
+    s.voice_guard.issued_voice(user.id, id, e2ee);
+    tracing::info!(user = %user.username, room, url = %livekit_url, server_muted, e2ee, "voice join");
+    Ok(Json(VoiceJoinResponse { livekit_url, livekit_token: token, room, e2ee }))
+}
+
+/// v1.1 (E1): `?e2ee=1` on a join token request (a voice channel, a DM call): the app can encrypt
+/// the room's media end to end.
+#[derive(Debug, Default, Deserialize)]
+pub struct E2eeQuery {
+    #[serde(default)]
+    e2ee: Option<String>,
+}
+
+impl E2eeQuery {
+    pub fn capable(&self) -> bool {
+        self.e2ee.as_deref() == Some("1")
+    }
 }
 
 #[derive(Deserialize)]
@@ -483,8 +511,43 @@ async fn link_preview_image(State(s): State<AppState>, _: AuthUser, Query(q): Qu
 /// port>`, IPv6 hosts in brackets (`ws://[2001:db8::1]:7880`). A v1.0.1 app connects to it as
 /// given (its LiveKit SDK and its own port check both take a bracketed IPv6 host), and LiveKit
 /// listens on IPv6 as well as IPv4 by itself.
-pub(crate) fn livekit_url(headers: &header::HeaderMap, cfg: &crate::config::Config) -> String {
-    format!("ws://{}:{}", livekit_host(headers, &cfg.public_host), cfg.livekit.signal_port)
+///
+/// v1.1 (T0): over TLS, `wss://<host>:<hub port>`: the hub's own port (the one the client used,
+/// from `Host`, else the configured one), where `serve.rs` splices `/rtc` to LiveKit. The app
+/// reaches it through its pinned TLS; a plain client keeps the direct `ws://` of before.
+pub(crate) fn livekit_url(headers: &header::HeaderMap, cfg: &crate::config::Config, transport: crate::tls::Transport) -> String {
+    let host = livekit_host(headers, &cfg.public_host);
+    if transport == crate::tls::Transport::Tls {
+        let port = headers.get(header::HOST).and_then(|v| v.to_str().ok()).and_then(host_port).or_else(|| cfg.bind.rsplit_once(':').and_then(|(_, p)| p.trim().parse().ok())).unwrap_or(7890);
+        return format!("wss://{host}:{port}");
+    }
+    format!("ws://{host}:{}", cfg.livekit.signal_port)
+}
+
+/// The port of a `Host` header (`a:1`, `[::1]:2`); `None` without one.
+fn host_port(host: &str) -> Option<u16> {
+    let rest = match host.strip_prefix('[') {
+        Some(r) => r.split_once(']')?.1.strip_prefix(':')?,
+        None => {
+            let (h, p) = host.rsplit_once(':')?;
+            if h.contains(':') {
+                return None;
+            }
+            p
+        }
+    };
+    rest.parse().ok()
+}
+
+/// The LiveKit URL for this request ([`livekit_url`]): what a voice join or a call answers with.
+pub struct LkUrl(pub String);
+
+impl FromRequestParts<AppState> for LkUrl {
+    type Rejection = std::convert::Infallible;
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        let transport = parts.extensions.get::<crate::tls::Transport>().copied().unwrap_or_default();
+        Ok(LkUrl(livekit_url(&parts.headers, &state.cfg, transport)))
+    }
 }
 
 /// LiveKit runs on the same machine as the hub, so the host the client used to reach the hub
@@ -531,9 +594,29 @@ mod tests {
         assert_eq!(livekit_host(&header::HeaderMap::new(), "::1"), "[::1]");
     }
 
+    /// v1.1 (T0): over TLS, LiveKit is reached through the hub's own port (`wss://`), the port the
+    /// client used; in the clear it stays the direct `ws://` signal port of before.
+    #[test]
+    fn livekit_url_over_tls_uses_the_hub_port() {
+        use crate::tls::Transport::{Plain, Tls};
+        let cfg = crate::config::Config::default();
+        assert_eq!(livekit_url(&with_host("192.0.2.10:7890"), &cfg, Tls), "wss://192.0.2.10:7890");
+        assert_eq!(livekit_url(&with_host("192.0.2.10:7890"), &cfg, Plain), "ws://192.0.2.10:7880");
+        assert_eq!(livekit_url(&with_host("example.org:9000"), &cfg, Tls), "wss://example.org:9000", "a router that remaps the port");
+        assert_eq!(livekit_url(&with_host("[2001:db8::1]:7997"), &cfg, Tls), "wss://[2001:db8::1]:7997");
+        assert_eq!(livekit_url(&with_host("example.org"), &cfg, Tls), "wss://example.org:7890", "no port: the configured one");
+        assert_eq!(livekit_url(&header::HeaderMap::new(), &cfg, Tls), "wss://127.0.0.1:7890");
+        let mut cfg = cfg;
+        cfg.bind = "127.0.0.1:7997".into();
+        assert_eq!(livekit_url(&with_host("localhost"), &cfg, Tls), "wss://localhost:7997");
+        assert_eq!(host_port("[::1]:5"), Some(5));
+        assert_eq!(host_port("::1"), None);
+    }
+
     /// v1.0.2: a client that reached the hub over IPv6 gets LiveKit at the same IPv6 address.
     #[test]
     fn livekit_url_keeps_ipv6_hosts_in_brackets() {
+        let livekit_url = |h: &header::HeaderMap, c: &crate::config::Config| livekit_url(h, c, crate::tls::Transport::Plain);
         let cfg = crate::config::Config::default();
         assert_eq!(livekit_url(&with_host("[2001:db8::1]:7890"), &cfg), "ws://[2001:db8::1]:7880");
         assert_eq!(livekit_url(&with_host("[2001:db8::1]"), &cfg), "ws://[2001:db8::1]:7880");

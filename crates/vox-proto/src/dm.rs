@@ -26,6 +26,11 @@
 //! - `POST /api/dms/{id}/call/accept`        -> [`DmCallResponse`] (callee)
 //! - `POST /api/dms/{id}/call/decline`       -> `OkResponse` (callee, while ringing)
 //! - `POST /api/dms/{id}/call/end`           -> `OkResponse` (either: hang up, or cancel the ring)
+//! - v1.1 (E1): `call` and `call/accept` take `?e2ee=1` from an app that can encrypt the call's
+//!   media. A new call is end-to-end encrypted ([`DmCall::e2ee`]) when the caller said so and the
+//!   callee has a device with encryption keys; its tokens then need `?e2ee=1` (`409`
+//!   [`crate::ERR_E2EE_CALL_REQUIRED`] for an older app) and [`crate::VoiceJoinResponse::e2ee`] is
+//!   set.
 //!
 //! Events, to the two participants only: `DmMessageCreated`, `DmMessageDeleted`, `DmRead` (my own
 //! connections: another device read it), `CallInvite`, `CallAccepted`, `CallDeclined`,
@@ -37,6 +42,16 @@
 //! logged in the conversation as system lines ([`DmMessageKind`]). A DM call is not a voice
 //! channel: it never shows in anybody's voice state, so nobody else sees who is in one. Joining a
 //! voice channel ends your DM call; a person who stays offline for a short grace period leaves it.
+//!
+//! **End-to-end encryption (v1.1, phase E2; additive, no protocol bump).** An app whose peer has a
+//! device key (`vox_proto::e2ee`) sends [`DmSendRequest::sealed`] (the `e2e1` body made by the
+//! `vox-e2ee` crate, at most [`DM_SEALED_MAX_BYTES`]) with an empty `content`. The hub stores it
+//! as is (`dm_messages.format = 'e2e1'`) and never reads it: a sealed line comes back with
+//! [`DmMessage::sealed`] and, for older apps, `content` = [`DM_SEALED_PLACEHOLDER`]. Its images
+//! are sealed uploads ([`crate::Attachment::sealed`]) and travel in
+//! [`DmMessage::sealed_attachments`] (never in `attachments`, which an older app would try to
+//! draw). A reply to a sealed line has [`crate::ReplyRef::sealed`] and no excerpt (the app fills
+//! it from the line it decrypted). Reactions and call lines stay readable.
 
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +66,12 @@ pub type CallId = i64;
 
 /// Longest message, in characters: the same limit as the channels.
 pub const DM_MESSAGE_MAX_CHARS: usize = 4000;
+/// Longest sealed body (E2), in characters of base64url.
+pub const DM_SEALED_MAX_BYTES: usize = 32 * 1024;
+/// `dm_messages.format` of a sealed line (E2).
+pub const DM_FORMAT_SEALED: &str = "e2e1";
+/// The `content` the hub gives a sealed line: what an app without E2 shows.
+pub const DM_SEALED_PLACEHOLDER: &str = "Mensagem criptografada. Atualize o concord para ler.";
 /// Most messages per history page.
 pub const DM_PAGE_MAX: u32 = 100;
 /// An unanswered call rings this long, then it is a missed call.
@@ -174,6 +195,19 @@ pub struct DmMessage {
     /// Emoji reactions (v0.8): absent when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reactions: Vec<crate::Reaction>,
+    /// E2: the sealed body (`content` is then [`DM_SEALED_PLACEHOLDER`]); absent for a readable line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed: Option<String>,
+    /// E2: the line's sealed images (ciphertext on the hub; their keys are inside `sealed`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sealed_attachments: Vec<crate::Attachment>,
+}
+
+impl DmMessage {
+    /// An end-to-end encrypted line.
+    pub fn is_sealed(&self) -> bool {
+        self.sealed.is_some()
+    }
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -193,6 +227,9 @@ pub struct DmSendRequest {
     /// A line of this conversation this one answers (v0.8; absent when none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<DmMessageId>,
+    /// E2: the sealed body (then `content` must be empty and every image a sealed upload).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed: Option<String>,
 }
 
 /// `POST /api/dms/{id}/read`: everything up to (and including) this message is read.
@@ -227,6 +264,16 @@ pub struct DmCall {
     pub state: CallState,
     /// When it started ringing (Unix ms).
     pub started_at_ms: i64,
+    /// v1.1 (E1): the call is end-to-end encrypted: the caller asked with `?e2ee=1` and the callee
+    /// has a device with encryption keys. Decided when it starts ringing and kept for the whole
+    /// call; tokens for it are then only given with `?e2ee=1` (an older app answering gets `409`
+    /// [`crate::ERR_E2EE_CALL_REQUIRED`]). Absent when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub e2ee: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl DmCall {
@@ -289,7 +336,7 @@ mod tests {
 
     #[test]
     fn a_text_message_has_no_kind_and_unknown_kinds_are_tolerated() {
-        let m = DmMessage { id: 1, dm_id: 2, author: User::new(3, "a"), content: "oi".into(), created_at_ms: 4, kind: DmMessageKind::Text, call_secs: 0, attachments: vec![], reply: None, reactions: vec![] };
+        let m = DmMessage { id: 1, dm_id: 2, author: User::new(3, "a"), content: "oi".into(), created_at_ms: 4, kind: DmMessageKind::Text, call_secs: 0, attachments: vec![], reply: None, reactions: vec![], sealed: None, sealed_attachments: vec![] };
         let json = serde_json::to_string(&m).unwrap();
         assert_eq!(json, r#"{"id":1,"dm_id":2,"author":{"id":3,"username":"a"},"content":"oi","created_at_ms":4}"#);
         assert_eq!(serde_json::from_str::<DmMessage>(&json).unwrap(), m);
@@ -307,7 +354,7 @@ mod tests {
         let json = serde_json::to_string(&c).unwrap();
         assert_eq!(json, r#"{"id":5,"peer":{"id":2,"username":"b"},"last_activity_ms":9,"unread":0,"read_up_to":0}"#);
         assert_eq!(serde_json::from_str::<DmConversation>(r#"{"id":5,"peer":{"id":2,"username":"b"},"last_activity_ms":9}"#).unwrap(), c);
-        let call = DmCall { id: 1, dm_id: 5, caller: User::new(1, "a"), callee: User::new(2, "b"), state: CallState::Ringing, started_at_ms: 3 };
+        let call = DmCall { id: 1, dm_id: 5, caller: User::new(1, "a"), callee: User::new(2, "b"), state: CallState::Ringing, started_at_ms: 3, e2ee: false };
         assert_eq!(call.peer_of(1).id, 2);
         assert_eq!(call.peer_of(2).id, 1);
         assert!(serde_json::to_string(&call).unwrap().contains(r#""state":"ringing""#));
@@ -332,8 +379,8 @@ mod tests {
     #[test]
     fn the_new_events_are_skipped_by_a_v052_app_and_read_by_a_new_one() {
         use crate::ServerEvent;
-        let msg = DmMessage { id: 1, dm_id: 2, author: User::new(3, "a"), content: "oi".into(), created_at_ms: 4, kind: DmMessageKind::Text, call_secs: 0, attachments: vec![], reply: None, reactions: vec![] };
-        let call = DmCall { id: 1, dm_id: 2, caller: User::new(3, "a"), callee: User::new(4, "b"), state: CallState::Active, started_at_ms: 3 };
+        let msg = DmMessage { id: 1, dm_id: 2, author: User::new(3, "a"), content: "oi".into(), created_at_ms: 4, kind: DmMessageKind::Text, call_secs: 0, attachments: vec![], reply: None, reactions: vec![], sealed: None, sealed_attachments: vec![] };
+        let call = DmCall { id: 1, dm_id: 2, caller: User::new(3, "a"), callee: User::new(4, "b"), state: CallState::Active, started_at_ms: 3, e2ee: false };
         for ev in [
             ServerEvent::DmMessageCreated { message: msg },
             ServerEvent::DmMessageDeleted { dm_id: 2, message_id: 1 },
@@ -349,5 +396,72 @@ mod tests {
         }
         let json = serde_json::to_string(&ServerEvent::DmMessageDeleted { dm_id: 2, message_id: 1 }).unwrap();
         assert_eq!(json, r#"{"type":"dm_message_deleted","dm_id":2,"message_id":1}"#);
+    }
+
+    /// `DmMessage` / `Attachment` exactly as v1.0.2 had them (E2's compatibility promise).
+    mod v102 {
+        use serde::Deserialize;
+
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        pub struct Attachment {
+            pub id: i64,
+            pub mime: String,
+            pub width: u32,
+            pub height: u32,
+            pub size: u64,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        pub struct DmMessage {
+            pub id: i64,
+            pub dm_id: i64,
+            pub content: String,
+            pub created_at_ms: i64,
+            #[serde(default)]
+            pub attachments: Vec<Attachment>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        pub enum ServerEvent {
+            DmMessageCreated { message: DmMessage },
+        }
+    }
+
+    #[test]
+    fn a_sealed_line_reads_as_the_placeholder_in_an_old_app() {
+        let img = crate::Attachment { id: 9, mime: "application/octet-stream".into(), width: 0, height: 0, size: 1234, thumb_w: 0, thumb_h: 0, animated: false, hash: "ab".into(), sealed: true };
+        let m = DmMessage {
+            id: 1,
+            dm_id: 2,
+            author: User::new(3, "a"),
+            content: DM_SEALED_PLACEHOLDER.into(),
+            created_at_ms: 4,
+            kind: DmMessageKind::Text,
+            call_secs: 0,
+            attachments: vec![],
+            reply: None,
+            reactions: vec![],
+            sealed: Some("AQID".into()),
+            sealed_attachments: vec![img],
+        };
+        let json = serde_json::to_string(&crate::ServerEvent::DmMessageCreated { message: m.clone() }).unwrap();
+        assert!(json.contains(r#""sealed":"AQID""#) && json.contains(r#""sealed_attachments":[{"id":9"#), "{json}");
+        let v102::ServerEvent::DmMessageCreated { message } = serde_json::from_str::<v102::ServerEvent>(&json).unwrap();
+        assert_eq!(message.content, "Mensagem criptografada. Atualize o concord para ler.");
+        assert!(message.attachments.is_empty(), "an old app never sees the ciphertext as an image");
+        // A new app gets everything back.
+        let crate::ServerEvent::DmMessageCreated { message } = serde_json::from_str(&json).unwrap() else { panic!() };
+        assert_eq!(message, m);
+        assert!(message.is_sealed());
+        // An old app's request (and an old hub's line) has no sealed parts.
+        let req: DmSendRequest = serde_json::from_str(r#"{"content":"oi"}"#).unwrap();
+        assert_eq!(req.sealed, None);
+        assert_eq!(serde_json::to_string(&DmSendRequest { sealed: Some("x".into()), ..Default::default() }).unwrap(), r#"{"content":"","sealed":"x"}"#);
+        let old: DmMessage = serde_json::from_str(r#"{"id":1,"dm_id":2,"author":{"id":3,"username":"a"},"content":"oi","created_at_ms":4}"#).unwrap();
+        assert!(!old.is_sealed() && old.sealed_attachments.is_empty());
     }
 }

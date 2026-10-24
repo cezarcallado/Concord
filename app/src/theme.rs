@@ -22,7 +22,8 @@
 //! to the icons named in [`ph`] (a few KB instead of the full ~480 KB font).
 //!
 //! egui's own fonts stay as fallbacks after ours: Ubuntu-Light (symbols such as ✓ ▶ ●), the two
-//! emoji fonts (reactions, messages, the soundboard) and Hack (monospace).
+//! emoji fonts (reactions, messages, the soundboard) and Hack (monospace). The emoji that have a
+//! Twemoji picture (`emoji`, CC-BY 4.0) are drawn in colour over their monochrome glyphs.
 
 use std::sync::LazyLock;
 
@@ -190,6 +191,16 @@ egui_phosphor::subset! {
             // (phase 3b: CARET_UP, CHECK_CIRCLE, CLIPBOARD_TEXT, PHONE_INCOMING, WARNING_CIRCLE for the server window,
             // the host panel, the ringing window and the notices.)
             CARET_UP, CHECK_CIRCLE, CLIPBOARD_TEXT, PHONE_INCOMING, WARNING_CIRCLE,
+            // (v1.1: IDENTIFICATION_BADGE, LINK, SELECTION_ALL for the message and text box menus.)
+            IDENTIFICATION_BADGE, LINK, SELECTION_ALL,
+            // (v1.1: KEYBOARD for "Atalhos".)
+            KEYBOARD,
+            // (v1.1: GAME_CONTROLLER for the Go Live hover card's "Jogando".)
+            GAME_CONTROLLER,
+            // (v1.1 T0: LOCK_SIMPLE_OPEN for the server header's "Conexão sem proteção".)
+            LOCK_SIMPLE_OPEN,
+            // (v1.1 D1: HEART for "Apoiar o projeto".)
+            HEART,
             ARROW_BEND_UP_LEFT, ARROW_RIGHT, ARROW_SQUARE_OUT, ARROWS_CLOCKWISE, ARROWS_LEFT_RIGHT, CARET_DOWN,
             CARET_LEFT, CARET_RIGHT, CHAT_CENTERED_TEXT, CHAT_CIRCLE, CHECK, CIRCLE, COPY, CORNERS_IN, CORNERS_OUT, CROWN, DOTS_THREE,
             ENVELOPE_SIMPLE, EYE, EYE_SLASH, GAVEL, GEAR_SIX, HARD_DRIVES, HASH, HEADPHONES, IMAGE, INFO, LOCK_SIMPLE,
@@ -329,11 +340,17 @@ pub fn style() -> egui::Style {
 }
 
 /// Install the theme and the fonts (once, at startup). Dark only in 1.0, whatever Windows uses.
+/// Also the colour emoji ([`emoji`]: Twemoji pictures over the emoji font's grey glyphs).
 pub fn apply(ctx: &egui::Context) {
     ctx.set_fonts(fonts());
     ctx.set_theme(egui::Theme::Dark);
     ctx.set_style_of(egui::Theme::Dark, style());
+    emoji::install(ctx);
 }
+
+/// Colour emoji (v1.1): a child module here so it comes with the fonts it draws over.
+#[path = "emoji.rs"]
+pub mod emoji;
 
 #[cfg(test)]
 mod tests {

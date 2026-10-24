@@ -15,7 +15,7 @@ use std::time::Duration;
 use windows::core::{implement, Interface, HRESULT, PCWSTR};
 use windows::Win32::Foundation::{E_NOINTERFACE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
-    ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
+    ActivateAudioInterfaceAsync, PROCESS_LOOPBACK_MODE, IActivateAudioInterfaceAsyncOperation,
     IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
     IAudioCaptureClient, IAudioClient, AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY,
     AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
@@ -78,10 +78,34 @@ impl Drop for AudioInner {
     }
 }
 
+/// The process loopback mode and target pid for `target`. A whole-screen share (and "Todo o som
+/// do PC") asks for everything *except* our own process tree: every sound concord makes (the
+/// call's voices, watched streams, the soundboard, alerts) is played by cpal inside this process,
+/// so viewers never hear the call echoed back.
+pub(crate) fn loopback_mode(target: AudioTarget) -> (u32, PROCESS_LOOPBACK_MODE) {
+    match target {
+        AudioTarget::ProcessTree { pid } => (pid, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE),
+        AudioTarget::SystemExcludingProcessTree { pid } => (pid, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE),
+    }
+}
+
+/// Said once per run: exclude-mode process loopback is missing on this Windows.
+static EXCLUDE_UNAVAILABLE_LOGGED: AtomicBool = AtomicBool::new(false);
+
 pub fn start_audio(target: AudioTarget, on_audio: AudioCallback) -> Result<AudioInner> {
-    let pid = match target {
-        AudioTarget::ProcessTree { pid } | AudioTarget::SystemExcludingProcessTree { pid } => pid,
-    };
+    let res = start_audio_inner(target, on_audio);
+    if let (Err(CaptureError::Unsupported(why)), AudioTarget::SystemExcludingProcessTree { .. }) = (&res, target) {
+        // The behaviour of before stays: the share goes on without the PC's sound. Plain endpoint
+        // loopback is never used instead, since it would send the call's own voices back.
+        if !EXCLUDE_UNAVAILABLE_LOGGED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(reason = %why, "system sound without our own: exclude-mode process loopback is unavailable on this Windows (needs Windows 10 2004+); sharing without the PC's sound");
+        }
+    }
+    res
+}
+
+fn start_audio_inner(target: AudioTarget, on_audio: AudioCallback) -> Result<AudioInner> {
+    let (pid, _) = loopback_mode(target);
     // Process loopback happily "captures" a pid that doesn't exist (silence forever); fail early.
     match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
         Ok(h) => drop(OwnedHandle(h)),
@@ -104,7 +128,7 @@ pub fn start_audio(target: AudioTarget, on_audio: AudioCallback) -> Result<Audio
             .spawn(move || {
                 let _com = ComInit::mta();
                 let _mmcss = Mmcss::pro_audio();
-                match Stream::open(target, pid) {
+                match Stream::open(target) {
                     Ok(mut s) => {
                         let _ = tx.send(Ok(()));
                         s.run(&stop, on_audio);
@@ -213,13 +237,8 @@ struct Stream {
 }
 
 impl Stream {
-    fn open(target: AudioTarget, pid: u32) -> Result<Self> {
-        let mode = match target {
-            AudioTarget::ProcessTree { .. } => PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
-            AudioTarget::SystemExcludingProcessTree { .. } => {
-                PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
-            }
-        };
+    fn open(target: AudioTarget) -> Result<Self> {
+        let (pid, mode) = loopback_mode(target);
         let params = AUDIOCLIENT_ACTIVATION_PARAMS {
             ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
             Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
@@ -311,7 +330,14 @@ impl Stream {
             .map_err(|e| os("SetWaitableTimer", e))?;
 
         unsafe { client.Start() }.map_err(|e| os("IAudioClient::Start", e))?;
-        tracing::info!(target = ?target, exe = %exe_name_of(pid), "audio capture started (process loopback, 48kHz f32->s16 stereo)");
+        let excluding = mode == PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
+        tracing::info!(
+            target = ?target,
+            mode = if excluding { "exclude" } else { "include" },
+            own_process = pid == std::process::id(),
+            exe = %exe_name_of(pid),
+            "audio capture started (process loopback, 48kHz f32->s16 stereo)"
+        );
         let now = monotonic_now_us();
         Ok(Self {
             target,
@@ -463,5 +489,42 @@ fn unsupported_or_os(ctx: &str, e: windows_core::Error) -> CaptureError {
         ))
     } else {
         os(ctx, e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_screen_share_excludes_our_own_process_tree() {
+        let me = std::process::id();
+        assert_eq!(loopback_mode(AudioTarget::SystemExcludingProcessTree { pid: me }), (me, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE));
+        assert_eq!(loopback_mode(AudioTarget::ProcessTree { pid: 42 }), (42, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE));
+    }
+
+    /// Opens the real exclude-mode stream for this test process for a moment. Nothing is kept:
+    /// only the number of 10 ms chunks is counted (no samples are read or stored). It taps the
+    /// machine's sound, so it is ignored by default and, even with `--ignored`, only runs with
+    /// `VOX_TEST_ALLOW_REAL_CAPTURE=1` (a person at the PC asked for it).
+    #[test]
+    #[ignore]
+    fn exclude_mode_opens_for_our_own_tree() {
+        use std::sync::atomic::AtomicU64;
+        if std::env::var("VOX_TEST_ALLOW_REAL_CAPTURE").as_deref() != Ok("1") {
+            eprintln!("skipped: taps the PC's real sound; set VOX_TEST_ALLOW_REAL_CAPTURE=1 to run it");
+            return;
+        }
+        let n = Arc::new(AtomicU64::new(0));
+        let c = n.clone();
+        let cap = start_audio(AudioTarget::SystemExcludingProcessTree { pid: std::process::id() }, Box::new(move |_| {
+            c.fetch_add(1, Ordering::Relaxed);
+        }))
+        .expect("exclude-mode process loopback");
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(cap.is_running());
+        drop(cap);
+        let chunks = n.load(Ordering::Relaxed);
+        assert!(chunks >= 20, "only {chunks} chunks in 400 ms");
     }
 }

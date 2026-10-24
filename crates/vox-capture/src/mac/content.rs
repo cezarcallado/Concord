@@ -190,6 +190,19 @@ pub fn list_windows() -> Result<Vec<WindowInfo>> {
     })
 }
 
+/// The app behind a listed window (Go Live hover cards, v1.1): ScreenCaptureKit's name of the
+/// running application (its localized name), never the window's title. The game guess only has the
+/// name here (no exe path), so it is right for the well-known games only.
+pub fn window_app(hwnd: isize) -> Option<crate::AppInfo> {
+    let w = list_windows().ok()?.into_iter().find(|w| w.hwnd == hwnd)?;
+    let name = crate::program_name(&w.exe_name, None, None);
+    if name.is_empty() {
+        return None;
+    }
+    let is_game = crate::looks_like_game(&format!("{}.exe", w.exe_name.to_lowercase()));
+    Some(crate::AppInfo { name, is_game })
+}
+
 /// Only on-screen windows are listed: a listed window is never minimized.
 pub fn is_window_minimized(_: isize) -> bool {
     false

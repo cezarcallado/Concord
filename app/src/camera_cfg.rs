@@ -565,7 +565,7 @@ impl App {
             (Some(id), None) => id.clone(),
             _ => "Padrão (a primeira câmera)".to_string(),
         };
-        egui::ComboBox::from_id_salt(salt).width(300.0).selected_text(current).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt(salt).width(forms::combo_w(ui)).selected_text(current).show_ui(ui, |ui| {
             if ui.selectable_label(self.settings.camera_device.is_none(), "Padrão (a primeira câmera)").clicked() {
                 self.settings.camera_device = None;
                 self.settings.camera_name = None;
@@ -641,7 +641,7 @@ impl App {
         let screen = ctx.content_rect();
         let size = egui::vec2(PREVIEW_W + 36.0, (screen.height() - 24.0).min(860.0));
         let open = forms::Dialog::new("camera_window", "Configurar câmera").icon(ph::VIDEO_CAMERA).size(size).show(ctx, |ui| {
-            ui.spacing_mut().slider_width = forms::SLIDER_W;
+            forms::fit_sliders(ui);
             self.camera_window_preview_ui(ui);
             self.camera_rate_ui(ui);
             let error = self.settings_ui.cam.native_error.clone();
@@ -650,7 +650,7 @@ impl App {
             ui.add_space(space::S);
             egui::ScrollArea::vertical()
                 .id_salt("camera_window_body")
-                .max_height((ui.available_height() - footer_h).max(60.0))
+                .max_height((ui.available_height() - footer_h).max(40.0))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width() - 14.0);
@@ -659,6 +659,8 @@ impl App {
             if let Some(e) = error {
                 forms::note_colored(ui, format!("{} {e}", ph::WARNING), false, theme::AVISO);
             }
+            // (I6: shorter labels in a narrow window, so the footer keeps its three buttons.)
+            let narrow = ui.available_width() < 560.0;
             forms::footer(ui, |ui| {
                 if ui_kit::button(ui, Kind::Secondary, None, "Fechar").clicked() {
                     close = true;
@@ -666,7 +668,12 @@ impl App {
                 let (id, _) = self.camera_ident();
                 let synthetic = id == vox_capture::SYNTHETIC_CAMERA_ID;
                 let native_open = self.settings_ui.cam.native_open;
-                let label = if native_open { "Configurações do fabricante abertas…" } else { "Configurações avançadas do fabricante…" };
+                let label = match (native_open, narrow) {
+                    (true, false) => "Configurações do fabricante abertas…",
+                    (false, false) => "Configurações avançadas do fabricante…",
+                    (true, true) => "Fabricante: aberto…",
+                    (false, true) => "Ajustes do fabricante…",
+                };
                 let enabled = !native_open && !synthetic && !self.settings_ui.cameras.is_empty();
                 let r = ui.add_enabled_ui(enabled, |ui| ui_kit::button(ui, Kind::Secondary, Some(ph::WRENCH), label)).inner;
                 let r = if synthetic {
@@ -678,7 +685,8 @@ impl App {
                     self.open_camera_native_dialog();
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    if ui_kit::button(ui, Kind::Ghost, Some(ph::ARROW_COUNTER_CLOCKWISE), "Restaurar padrão")
+                    let reset = if narrow { "Restaurar" } else { "Restaurar padrão" };
+                    if ui_kit::button(ui, Kind::Ghost, Some(ph::ARROW_COUNTER_CLOCKWISE), reset)
                         .on_hover_text("Brilho, exposição, foco e os outros ajustes voltam ao padrão da câmera (automático onde existir). Girar, espelhar e zoom digital não mudam.")
                         .clicked()
                     {
@@ -698,8 +706,14 @@ impl App {
     fn camera_window_preview_ui(&mut self, ui: &mut egui::Ui) {
         let portrait = matches!(self.camera_profile().rotation, 90 | 270);
         // Up to 640x360, and at most ~36% of a short app window's height (the controls need room).
-        let max_h = ui.ctx().content_rect().height() * 0.36;
-        let w = ui.available_width().min(max_h * PREVIEW_W / PREVIEW_H).clamp(200.0, PREVIEW_W);
+        // (I6: and never more than what leaves the rate, the controls' scroll and the footer their
+        // room: a short window gets a smaller picture, a very short one none. The video is a
+        // window of its own, so it never goes in the scroll.)
+        let max_h = (ui.ctx().content_rect().height() * 0.36).min(ui.available_height() - 170.0);
+        if max_h < 40.0 {
+            return;
+        }
+        let w = ui.available_width().min(max_h * PREVIEW_W / PREVIEW_H).clamp(120.0, PREVIEW_W);
         let h = w * PREVIEW_H / PREVIEW_W;
         let (slot, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
         let frame = egui::Rect::from_center_size(slot.center(), egui::vec2(w, h));
@@ -761,29 +775,44 @@ impl App {
             }
             SmoothMethod::Unsupported => "Esta câmera não deixa ajustar a exposição.".to_string(),
         };
+        let whose = if l.from_call { "Câmera (na chamada)" } else { "Câmera" };
+        let (dot, text) = if l.fps <= 0.0 {
+            (theme::NEVOA, format!("{whose}: medindo quadros por segundo..."))
+        } else if l.low_light {
+            (theme::AVISO, format!("{whose} entregando {:.0} fps (pouca luz)", l.fps))
+        } else if l.fps < target * 0.85 {
+            (theme::AVISO, format!("{whose} entregando {:.0} de {} fps", l.fps, vox_capture::fps_text(target)))
+        } else {
+            (theme::ONLINE, format!("{whose} entregando {:.0} fps", l.fps))
+        };
+        let check = format!("Priorizar fluidez ({} fps)", vox_capture::fps_text(target));
+        // (I6: side by side while the row has room for both, else the checkbox on a line of its own.
+        // Both texts are laid out once: measured here, then drawn as they are.)
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let text_g = ui.painter().layout_no_wrap(text, font.clone(), theme::TEXTO);
+        let check_g = ui.painter().layout_no_wrap(check, font, egui::Color32::PLACEHOLDER);
+        let side = ui.available_width() >= text_g.size().x + check_g.size().x + 80.0;
+        let smooth_toggle = |ui: &mut egui::Ui| {
+            let mut on = smooth;
+            let r = ui.add_enabled(method != SmoothMethod::Unsupported, egui::Checkbox::new(&mut on, check_g.clone()));
+            let r = if method == SmoothMethod::Unsupported { r.on_disabled_hover_text(hover.as_str()) } else { r.on_hover_text(hover.as_str()) };
+            r.changed().then_some(on)
+        };
+        let mut changed = None;
         ui.horizontal(|ui| {
-            let whose = if l.from_call { "Câmera (na chamada)" } else { "Câmera" };
-            let (dot, text) = if l.fps <= 0.0 {
-                (theme::NEVOA, format!("{whose}: medindo quadros por segundo..."))
-            } else if l.low_light {
-                (theme::AVISO, format!("{whose} entregando {:.0} fps (pouca luz)", l.fps))
-            } else if l.fps < target * 0.85 {
-                (theme::AVISO, format!("{whose} entregando {:.0} de {} fps", l.fps, vox_capture::fps_text(target)))
-            } else {
-                (theme::ONLINE, format!("{whose} entregando {:.0} fps", l.fps))
-            };
             let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 18.0), egui::Sense::hover());
             ui.painter().circle_filled(r.center(), 3.5, dot);
-            ui.label(RichText::new(text).color(theme::TEXTO));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut on = smooth;
-                let r = ui.add_enabled(method != SmoothMethod::Unsupported, egui::Checkbox::new(&mut on, format!("Priorizar fluidez ({} fps)", vox_capture::fps_text(target))));
-                let r = if method == SmoothMethod::Unsupported { r.on_disabled_hover_text(hover) } else { r.on_hover_text(hover) };
-                if r.changed() {
-                    self.set_camera_smooth(on);
-                }
-            });
+            ui.label(text_g);
+            if side {
+                changed = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| smooth_toggle(ui)).inner;
+            }
         });
+        if !side {
+            changed = smooth_toggle(ui);
+        }
+        if let Some(on) = changed {
+            self.set_camera_smooth(on);
+        }
         if l.low_light && !smooth && method != SmoothMethod::Unsupported {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Pouca luz: a câmera alonga a exposição e perde quadros. Acenda uma luz ou:").color(theme::AVISO).size(size::SMALL + 0.5));
@@ -808,7 +837,7 @@ impl App {
         });
         forms::row(ui, "Qualidade enviada", |ui| {
             let before = self.settings.camera_preset;
-            egui::ComboBox::from_id_salt("camera_window_preset").width(forms::COMBO_W).selected_text(self.settings.camera_preset.label()).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("camera_window_preset").width(forms::combo_w(ui)).selected_text(self.settings.camera_preset.label()).show_ui(ui, |ui| {
                 for p in CameraPreset::ALL {
                     ui.selectable_value(&mut self.settings.camera_preset, p, p.label());
                 }
@@ -899,7 +928,7 @@ impl App {
             menu.insert(0, c);
         }
         let text = chosen.map_or("Automático".to_string(), |m| m.label());
-        egui::ComboBox::from_id_salt("camera_window_format").width(forms::COMBO_W).selected_text(text).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("camera_window_format").width(forms::combo_w(ui)).selected_text(text).show_ui(ui, |ui| {
             if ui.selectable_label(chosen.is_none(), "Automático").on_hover_text("O formato da câmera mais próximo da qualidade enviada").clicked() && chosen.is_some() {
                 self.edit_camera_profile(|p| p.mode = None);
                 changed = true;
@@ -935,6 +964,9 @@ impl App {
                             edited = true;
                         }
                     } else {
+                        // (I6: the slider leaves its number and "Auto" their room in a narrow window.)
+                        let auto_w = if c.can_auto { 64.0 } else { 0.0 };
+                        ui.spacing_mut().slider_width = ui.spacing().slider_width.min(ui.available_width() - 72.0 - auto_w).max(60.0);
                         let cc = *c;
                         let r = ui.add_enabled(
                             c.can_manual && !auto,

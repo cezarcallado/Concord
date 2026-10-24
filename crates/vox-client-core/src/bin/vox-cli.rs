@@ -37,6 +37,10 @@ struct Args {
     /// Shared server password (hub mode)
     #[arg(long, default_value = "")]
     password: String,
+    /// v1.1: the hub's TLS certificate pin (64 hex digits, as in an invite or the hub's
+    /// `tls/server.crt` SHA-256): talk to the hub over pinned TLS only (hub mode).
+    #[arg(long)]
+    tls_pin: Option<String>,
     #[arg(long, default_value = "devkey")]
     api_key: String,
     #[arg(long, default_value = "secret")]
@@ -174,7 +178,14 @@ async fn run(args: Args) -> Result<()> {
 
     let mut hub_rx: Option<mpsc::Receiver<HubEvent>> = None;
     if let Some(url) = app.args.hub.clone() {
-        let hub = Arc::new(HubClient::new(&url)?);
+        let hub = match app.args.tls_pin.as_deref() {
+            Some(hex) => {
+                let pin = vox_proto::tls_pin_from_hex(hex).ok_or_else(|| anyhow!("--tls-pin must be 64 hex digits"))?;
+                println!("pinned TLS to the hub (server code {})", vox_proto::tls_server_code(&pin));
+                Arc::new(HubClient::new_pinned(&url, pin)?)
+            }
+            None => Arc::new(HubClient::new(&url)?),
+        };
         match hub.health().await {
             Ok(h) => info!(version = %h.version, protocol = h.protocol_version, livekit_ok = h.livekit_ok, "hub health"),
             Err(e) => warn!(error = %format!("{e:#}"), "hub health check failed"),
@@ -276,6 +287,7 @@ impl App {
         VoiceConfig {
             mic: !self.args.no_mic || self.args.mic_tone.is_some(),
             mic_test_tone: self.args.mic_tone,
+            fake_mics: None,
             playback: !self.args.no_playback,
             input_device: self.args.input_device.clone(),
             output_device: self.args.output_device.clone(),
@@ -285,6 +297,9 @@ impl App {
             others_muted: false,
             gate: None,
             noise: None,
+            tls_pin: self.hub.as_ref().and_then(|h| h.tls_pin()),
+            // (The CLI has no device identity: it joins plain rooms only, like an app before 1.1.)
+            e2ee: None,
         }
     }
 
@@ -797,6 +812,8 @@ impl App {
             VoiceEvent::ServerMuted { muted } => {
                 println!("[voice] {}", if muted { "server-muted by a moderator" } else { "server mute lifted" })
             }
+            VoiceEvent::Mic(status) => println!("[voice] microphone: {status:?}"),
+            VoiceEvent::MicAvailable => println!("[voice] a microphone showed up: published"),
             VoiceEvent::WatchStarted { identity } => println!("[golive] watching {identity}"),
             VoiceEvent::CameraStarted { identity } => println!("[camera] {identity} turned the camera on"),
             VoiceEvent::CameraStopped { identity } => println!("[camera] {identity} turned the camera off"),
@@ -809,6 +826,8 @@ impl App {
                 self.push_voice_state();
             }
             VoiceEvent::WatchEnded { identity, reason } => println!("[golive] stopped watching {identity}: {reason}"),
+            VoiceEvent::E2eeState { identity, state } => println!("[e2ee] {identity}: {state:?}"),
+            VoiceEvent::E2eePeerDevice { identity, device_id } => println!("[e2ee] {identity} is here with device {}", device_id.get(..8).unwrap_or("")),
             VoiceEvent::Reconnecting => println!("[voice] reconnecting..."),
             VoiceEvent::Reconnected => println!("[voice] reconnected"),
             VoiceEvent::Disconnected { reason } => {

@@ -23,9 +23,11 @@ pub enum TrayEvent {
 
 // ---------------------------------------------------------------- the badge picture (pure)
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const BADGE_PX: usize = 32;
 
 /// What the red circle says: the number, "9+" from ten on, nothing for zero.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn badge_text(count: u32) -> Option<String> {
     match count {
         0 => None,
@@ -35,6 +37,7 @@ pub fn badge_text(count: u32) -> Option<String> {
 }
 
 /// 5x7 glyphs of the digits and the plus sign, one row per entry (bit 4 = leftmost column).
+#[cfg_attr(not(windows), allow(dead_code))]
 fn glyph(c: char) -> [u8; 7] {
     match c {
         '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
@@ -54,6 +57,7 @@ fn glyph(c: char) -> [u8; 7] {
 
 /// A red circle with `text` in white, as 32x32 non-premultiplied BGRA pixels (`0xAARRGGBB`).
 /// The glyphs are drawn at twice their size, so one or two of them fit well inside the circle.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn render_badge(text: &str) -> Vec<u32> {
     const RED: (u32, u32, u32) = (237, 66, 69);
     let n = BADGE_PX;

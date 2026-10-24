@@ -18,22 +18,28 @@ impl App {
     pub(super) fn connect_screen(&mut self, ui: &mut egui::Ui) {
         // "calladex" typed here, with no field focused, opens the easter egg's credits.
         self.calladex_home_keys(ui.ctx());
-        let w = (ui.available_width() * 0.4).clamp(280.0, 440.0);
+        // (I6: a small or zoomed-in window gets a narrower left panel with smaller margins, so the
+        // list on the right keeps its buttons.)
+        let full = ui.available_width();
+        let w = (full * 0.4).clamp(280.0_f32.min(full * 0.42), 440.0);
+        let pad = if full < 640.0 { 20 } else { 36 };
         egui::Panel::left("home_left")
             .exact_size(w)
             .resizable(false)
             .show_separator_line(false)
-            .frame(egui::Frame::new().fill(theme::PAREDE).inner_margin(Margin::symmetric(36, 36)))
+            .frame(egui::Frame::new().fill(theme::PAREDE).inner_margin(Margin::symmetric(pad, pad)))
             .show(ui, |ui| self.home_left(ui));
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::NOITE)).show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let few = self.settings.servers.servers.len() < 4;
                 ui.add_space(if few { 64.0 } else { 32.0 });
-                let side = ((ui.available_width() - FORM_W) / 2.0).max(28.0);
+                let side = ((ui.available_width() - FORM_W) / 2.0).max(if ui.available_width() < 400.0 { 16.0 } else { 28.0 });
+                let form_w = FORM_W.min(ui.available_width() - 2.0 * side).max(160.0);
                 ui.horizontal(|ui| {
                     ui.add_space(side);
                     ui.vertical(|ui| {
-                        ui.set_max_width(FORM_W);
+                        ui.set_max_width(form_w);
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                         self.home_right(ui);
                     });
                 });
@@ -44,10 +50,11 @@ impl App {
 
     fn home_left(&mut self, ui: &mut egui::Ui) {
         let h = ui.available_height();
-        // The signature, small and quiet at the bottom of the panel (two lines when narrow).
-        brand::signature_footer(ui, ui.max_rect(), 11.5);
+        let area = ui.max_rect();
         ui.add_space((h * 0.30 - 60.0).max(0.0));
-        brand::wordmark(ui, 40.0, 40.0);
+        // (A smaller wordmark in a narrow panel: it never runs past it.)
+        let big = (ui.available_width() / 5.5).clamp(24.0, 40.0);
+        brand::wordmark(ui, big, big);
         ui.add_space(10.0);
         ui.add(egui::Label::new(RichText::new("Voz, tela e chat para o seu grupo, rodando no PC de um de vocês.").font(theme::body(15.0)).color(theme::NEVOA)).wrap());
         ui.add_space(28.0);
@@ -60,6 +67,11 @@ impl App {
                 }
             }
         });
+        // The signature, small and quiet at the bottom of the panel (two lines when narrow); left
+        // out when a short window would put it over the tabs.
+        if ui.min_rect().bottom() + 44.0 <= area.bottom() {
+            brand::signature_footer(ui, area, 11.5);
+        }
     }
 
     fn home_right(&mut self, ui: &mut egui::Ui) {
@@ -94,17 +106,17 @@ impl App {
         let enter = |ui: &egui::Ui, r: &egui::Response| r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         ui.spacing_mut().item_spacing.y = 6.0;
         label(ui, "Servidor ou convite");
-        let r = ui.add(ui_kit::field(&mut self.form.url).hint_text("192.168.0.10 ou vox1-...").desired_width(FORM_W));
+        let r = ui.add(ui_kit::field(&mut self.form.url).hint_text("192.168.0.10 ou vox1-...").desired_width(ui.available_width()));
         submit |= enter(ui, &r);
         ui.add_space(4.0);
         label(ui, "Seu nome");
-        let r = ui.add(ui_kit::field(&mut self.form.user).hint_text("como os outros vão ver você").desired_width(FORM_W));
+        let r = ui.add(ui_kit::field(&mut self.form.user).hint_text("como os outros vão ver você").desired_width(ui.available_width()));
         submit |= enter(ui, &r);
         // An invite replaces the server password.
         if !invite {
             ui.add_space(4.0);
             label(ui, "Senha do servidor");
-            let r = ui.add(ui_kit::field(&mut self.form.password).password(true).desired_width(FORM_W));
+            let r = ui.add(ui_kit::field(&mut self.form.password).password(true).desired_width(ui.available_width()));
             if std::mem::take(&mut self.servers.focus_password) {
                 // A saved server whose password is not kept: the cursor waits here.
                 r.request_focus();
@@ -115,11 +127,15 @@ impl App {
         if self.form.need_personal {
             ui.add_space(4.0);
             label(ui, "Senha pessoal");
-            let r = ui.add(ui_kit::field(&mut self.form.personal).password(true).hint_text("a senha do seu nome (ou o código recebido)").desired_width(FORM_W));
+            let r = ui.add(ui_kit::field(&mut self.form.personal).password(true).hint_text("a senha do seu nome (ou o código recebido)").desired_width(ui.available_width()));
             submit |= enter(ui, &r);
         }
         ui.add_space(8.0);
-        ui.checkbox(&mut self.form.remember, "Lembrar a senha neste computador (protegida pelo Windows)");
+        #[cfg(target_os = "macos")]
+        const REMEMBER: &str = "Lembrar a senha neste computador (guardada nas Chaves do macOS)";
+        #[cfg(not(target_os = "macos"))]
+        const REMEMBER: &str = "Lembrar a senha neste computador (protegida pelo Windows)";
+        ui.checkbox(&mut self.form.remember, REMEMBER);
         if self.form.need_personal {
             ui.checkbox(&mut self.form.remember_device, "Lembrar este computador (não pedir a senha pessoal de novo)");
         }
@@ -134,7 +150,7 @@ impl App {
         if let Some(err) = &self.form.error {
             ui.add_space(12.0);
             ui_kit::notice_frame(ui_kit::Notice::Error).show(ui, |ui| {
-                ui.set_max_width(FORM_W - 28.0);
+                ui.set_max_width(ui.available_width() - 28.0);
                 ui.label(RichText::new(err).color(theme::GIZ));
             });
         }

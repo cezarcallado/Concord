@@ -57,6 +57,8 @@ struct ManagerInner {
     dc_encryption_enabled: bool,
     frame_cryptors: HashMap<(ParticipantIdentity, TrackSid), FrameCryptor>,
     data_packet_cryptor: Option<DataPacketCryptor>,
+    /// voxhub: the key index new sender cryptors start with (`set_sender_key_index`).
+    sender_key_index: i32,
 }
 
 #[derive(Clone)]
@@ -82,6 +84,7 @@ impl E2eeManager {
                 options,
                 frame_cryptors: HashMap::new(),
                 data_packet_cryptor,
+                sender_key_index: 0,
             })),
             state_changed: Default::default(),
         }
@@ -144,8 +147,19 @@ impl E2eeManager {
             }
         }
 
-        if !self.initialized() || publication.encryption_type() == EncryptionType::None {
+        // voxhub: in an encrypted room every received track goes through a cryptor, whatever its
+        // publication says. A track announced as unencrypted (a participant or a server lying, an
+        // app that joined without encryption) then plays nothing instead of plain media under the
+        // room's "encrypted" badge.
+        if !self.initialized() {
             return;
+        }
+        if publication.encryption_type() == EncryptionType::None {
+            log::warn!(
+                "track {} from {} is announced as unencrypted in an encrypted room: decrypting it anyway",
+                publication.sid(),
+                identity,
+            );
         }
 
         let frame_cryptor = self.setup_rtp_receiver(&identity, receiver);
@@ -187,8 +201,17 @@ impl E2eeManager {
             None
         };
 
-        if !self.initialized() || publication.encryption_type() == EncryptionType::None {
+        // voxhub: our own tracks are always encrypted in an encrypted room. The publication's
+        // encryption type is the server's echo of our AddTrackRequest; a server answering "none"
+        // must not make us send in the clear.
+        if !self.initialized() {
             return;
+        }
+        if publication.encryption_type() == EncryptionType::None {
+            log::warn!(
+                "the server reports our track {} as unencrypted in an encrypted room: encrypting it anyway",
+                publication.sid(),
+            );
         }
 
         let frame_cryptor = self.setup_rtp_sender(&identity, sender);
@@ -278,8 +301,17 @@ impl E2eeManager {
             options.key_provider.handle.clone(),
             sender,
         );
+        // voxhub: on the current key index from its first frame (not index 0, which may hold an
+        // older key of ours).
+        frame_cryptor.set_key_index(inner.sender_key_index);
         frame_cryptor.set_enabled(inner.enabled);
         frame_cryptor
+    }
+
+    /// voxhub: the key index our sender cryptors made from now on start with (the existing ones
+    /// are moved by the caller).
+    pub fn set_sender_key_index(&self, index: i32) {
+        self.inner.lock().sender_key_index = index;
     }
 
     fn setup_rtp_receiver(

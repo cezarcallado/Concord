@@ -98,6 +98,41 @@ pub fn watch_limit_text() -> String {
     format!("{ICON_TV} Você já está assistindo {MAX_WATCHED} transmissões, o máximo ao mesmo tempo. Pare de assistir uma para abrir outra.")
 }
 
+/// v1.1 (E1): the call header's badge in an end-to-end encrypted room.
+pub const E2EE_BADGE: &str = "Criptografada de ponta a ponta";
+/// v1.1 (E1): its explanation (hover).
+pub const E2EE_BADGE_HOVER: &str = "Voz, câmeras e transmissões são cifradas no computador de quem envia, com chaves que só quem está na sala recebe. Nem o servidor consegue ver ou ouvir. Ele ainda vê quem está na sala e quem fala.";
+
+/// v1.1 (E1): a DM call that stayed unencrypted because the other person's app is older.
+pub fn e2ee_plain_call_text(name: &str) -> String {
+    format!("Chamada sem criptografia de ponta a ponta: {name} usa uma versão antiga do concord.")
+}
+
+/// v1.1 (E1, audit): a DM call that stayed unencrypted for a reason this computer cannot tell
+/// (the other person has a device with keys, so it is not their app's version; or the device
+/// list was not read here): never blame their version then.
+pub const E2EE_PLAIN_CALL_GENERIC: &str = "Chamada sem criptografia de ponta a ponta.";
+
+/// v1.1 (E1, audit): which of the two to show for a plain DM call: the "old version" one only
+/// when the whole device list was read here and the other person has no device in it.
+pub fn e2ee_plain_call_note(name: &str, directory_read: bool, peer_has_device: bool) -> String {
+    if directory_read && !peer_has_device {
+        e2ee_plain_call_text(name)
+    } else {
+        E2EE_PLAIN_CALL_GENERIC.to_string()
+    }
+}
+
+/// v1.1 (E1): what a person's card says while their media does not decrypt here.
+pub fn e2ee_tile_text(state: vox_client_core::MediaE2eeState, name: &str) -> Option<String> {
+    use vox_client_core::MediaE2eeState as S;
+    match state {
+        S::MissingKey => Some(format!("Aguardando a chave de {name}…")),
+        S::DecryptionFailed => Some(format!("Não deu para descriptografar o áudio de {name}")),
+        _ => None,
+    }
+}
+
 /// Preview size for a tile that is `tile_px` physical pixels wide: the smallest class that covers
 /// it, so a small tile costs less and a focused one is sharp enough to check details.
 pub fn preview_size_for(tile_px: i32) -> (u32, u32) {
@@ -171,6 +206,10 @@ pub struct CallUi {
     /// repaint thread only runs while it is on screen (`App::meter_visible`), not while only the
     /// chat shows.
     pub meter_frame: Option<u64>,
+    /// I6: last frame the window had no room for the chat docked beside the cards (with the
+    /// stage's minimum): "Cards com o chat ao lado" shows the cards alone until it has
+    /// (`layout::dock_range`, `App::effective_mode`).
+    pub dock_squeezed: bool,
 }
 
 impl CallUi {
@@ -623,12 +662,34 @@ impl App {
         let painter = ui.painter_at(rect);
         painter.hline(rect.x_range(), rect.bottom() - 0.5, egui::Stroke::new(theme::stroke::HAIRLINE, theme::RISCO));
         let inner = rect.shrink2(Vec2::new(16.0, 0.0));
-        let mut left = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)));
-        left.label(RichText::new(ph::SPEAKER_HIGH).size(19.0).color(theme::NEVOA));
-        left.label(RichText::new(self.room_name()).font(theme::display(17.0)).color(theme::GIZ));
-        left.label(RichText::new(self.stage_meta()).size(13.0).color(theme::NEVOA));
+        // The buttons first (right to left); the room's name and the counts get what is left.
         let mut right = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::right_to_left(Align::Center)));
         self.stage_tools(&mut right, false);
+        // (The right-to-left cursor's right edge: where the buttons end, on their left.)
+        let room = Rect::from_min_max(inner.min, Pos2::new((right.cursor().max.x - 12.0).max(inner.left()), inner.bottom()));
+        let mut left = ui.new_child(egui::UiBuilder::new().max_rect(room).layout(Layout::left_to_right(Align::Center)));
+        left.set_clip_rect(room.intersect(ui.clip_rect()));
+        left.label(RichText::new(ph::SPEAKER_HIGH).size(19.0).color(theme::NEVOA));
+        left.add(egui::Label::new(RichText::new(self.room_name()).font(theme::display(17.0)).color(theme::GIZ)).truncate().selectable(false));
+        self.e2ee_header_badge(&mut left);
+        ui_kit::header_extra(&mut left, Some(self.stage_meta()), 13.0);
+        crate::layout::probe(ui.ctx(), "stage_title", left.min_rect());
+        crate::layout::probe(ui.ctx(), "stage_tools", Rect::from_min_max(Pos2::new(right.cursor().max.x, inner.top()), inner.max));
+    }
+
+    /// v1.1 (E1): "Criptografada de ponta a ponta" beside the room's name (or, for a DM call that
+    /// could not be, that it is not).
+    pub fn e2ee_header_badge(&self, ui: &mut egui::Ui) {
+        if self.voice.channel.is_none() {
+            return;
+        }
+        if self.voice.e2ee {
+            let r = ui.add(egui::Label::new(RichText::new(format!("{}  {E2EE_BADGE}", ph::LOCK_SIMPLE)).font(theme::body(12.5)).color(theme::ONLINE)).truncate().selectable(false)).on_hover_text(E2EE_BADGE_HOVER);
+            crate::layout::probe(ui.ctx(), "call_e2ee_badge", r.rect);
+        } else if self.voice.e2ee_plain_call {
+            let hover = self.voice.warning.clone().unwrap_or_default();
+            ui.add(egui::Label::new(RichText::new(format!("{}  Sem criptografia de ponta a ponta", ph::LOCK_SIMPLE_OPEN)).font(theme::body(12.5)).color(theme::AVISO)).truncate().selectable(false)).on_hover_text(hover);
+        }
     }
 
     /// The name of the room we are in (a private call's title for a DM call).
@@ -875,7 +936,10 @@ impl App {
         let me = self.my_id() == Some(uid);
         let small = rect.height() < SMALL_H;
         let id = egui::Id::new(("stage_card", tile.key));
-        let speaking = !m.muted && if me { self.sending_voice() } else { self.voice.speaking.contains(&uid.to_string()) };
+        // (Not `!m.muted`: a muted mic sends nothing, so it never puts anyone in the speaking set,
+        // but a sound played from the soundboard does, muted or not. A server-muted member can do
+        // neither: the hub refuses their sounds.)
+        let speaking = !m.server_muted && if me { self.sending_voice() } else { self.voice.speaking.contains(&uid.to_string()) };
         let cam = self.camera_key_of(uid);
         self.paint_sound_flash(painter, rect, uid, cam.is_none());
         let lead = if cam.is_some() { Lead::Camera } else { Lead::None };
@@ -913,8 +977,11 @@ impl App {
                 t
             }
             None => {
-                let r = (rect.height().min(rect.width()) * 0.2).clamp(12.0, 64.0);
                 let c = rect.center() - Vec2::new(0.0, if small { 8.0 } else { 14.0 });
+                // (Never so big that the speaking ring would leave the card, which clips it: a
+                // short strip card in a small window.)
+                let room = c.y - rect.top() - (ui_kit::speaking_ring_reach(0.0) + 2.0);
+                let r = (rect.height().min(rect.width()) * 0.2).clamp(12.0, 64.0).min(room).max(6.0);
                 // The person's picture, or the coloured initial while it loads / when there is none.
                 crate::avatars::draw_avatar(&mut self.avatars.store, painter, ui.ctx(), c, r, &m.user, crate::avatars::Surface::Tile);
                 if speaking {
@@ -926,6 +993,15 @@ impl App {
         };
         if speaking {
             ui_kit::paint_card_speaking(painter, rect);
+        }
+        // v1.1 (E1): their media does not decrypt here (yet).
+        if let Some(text) = self.voice.e2ee_states.get(&uid.to_string()).and_then(|s| e2ee_tile_text(*s, m.user.shown_name())).filter(|_| self.voice.e2ee && !me) {
+            let inset = if small { 6.0 } else { 10.0 };
+            let font = theme::body(if small { 11.0 } else { 12.0 });
+            let galley = painter.layout(format!("{}  {text}", ph::LOCK_SIMPLE), font, theme::AVISO, (rect.width() - 2.0 * inset).max(10.0));
+            let at = Pos2::new(rect.left() + inset, rect.top() + inset);
+            painter.rect_filled(Rect::from_min_size(at, galley.size()).expand(4.0), radius::ROW, Color32::from_black_alpha(170));
+            painter.galley(at, galley, theme::AVISO);
         }
         // The name tag opens the person's profile card (after the card's own area, so it is the
         // one under the pointer).
@@ -980,13 +1056,13 @@ impl App {
                 let w = if small { 110.0 } else { 170.0 };
                 child.add_space(((row.width() - w) / 2.0).max(0.0));
                 self.stream_audio_menu(&mut child, &m.user);
-                if ui_kit::button_sized(&mut child, Kind::Secondary, Size::Small, None, if small { "Parar" } else { "Parar de ouvir" }).clicked() {
+                if ui_kit::card_button(&mut child, false, Size::Small, Some(ph::STOP), if small { "Parar" } else { "Parar de ouvir" }).clicked() {
                     self.unwatch(&key);
                 }
             } else if pending {
                 painter.text(at_btn, Align2::CENTER_CENTER, "Abrindo...", theme::body(if small { 11.0 } else { 14.0 }), theme::NEVOA);
                 ctx.request_repaint_after(Duration::from_secs(1));
-            } else if centered_button(ui, at_btn, Kind::Secondary, Size::Small, Some(ph::SPEAKER_HIGH), "Ouvir").clicked() && same {
+            } else if centered_card_button(ui, at_btn, true, if small { Size::Small } else { Size::Normal }, Some(ph::SPEAKER_HIGH), if small { "Ouvir" } else { "Ouvir o áudio" }, (!same).then_some("Entre neste canal de voz para ouvir")).clicked() {
                 self.watch(&key);
             }
             if base.clicked() {
@@ -1018,7 +1094,7 @@ impl App {
                 let line = if n == 1 { "1 assistindo".to_string() } else { format!("{n} assistindo") };
                 painter.text(content.center() + Vec2::new(0.0, if small { 8.0 } else { 4.0 }), Align2::CENTER_CENTER, line, theme::body(if small { 10.0 } else { 13.0 }), theme::NEVOA);
             }
-            if !small && centered_button(ui, content.center() + Vec2::new(0.0, 34.0), Kind::Secondary, Size::Small, Some(ph::EYE), "Mostrar prévia").clicked() {
+            if !small && centered_card_button(ui, content.center() + Vec2::new(0.0, 34.0), false, Size::Small, Some(ph::EYE), "Mostrar prévia", None).clicked() {
                 self.set_self_preview(true);
             }
             if base.clicked() {
@@ -1026,7 +1102,7 @@ impl App {
             }
         } else if watching && self.stream_popped(&key) {
             painter.text(content.center() - Vec2::new(0.0, if small { 0.0 } else { 14.0 }), Align2::CENTER_CENTER, "Aberta em outra janela", theme::body(if small { 11.0 } else { 14.0 }), theme::NEVOA);
-            if !small && centered_button(ui, content.center() + Vec2::new(0.0, 16.0), Kind::Secondary, Size::Small, Some(ph::ARROW_SQUARE_OUT), "Trazer de volta").clicked() {
+            if !small && centered_card_button(ui, content.center() + Vec2::new(0.0, 16.0), false, Size::Small, Some(ph::ARROW_SQUARE_OUT), "Trazer de volta", None).clicked() {
                 self.pop_out_stream(&key, false);
             }
             if base.clicked() {
@@ -1070,11 +1146,15 @@ impl App {
                     painter.text(content.center() - Vec2::new(0.0, 30.0), Align2::CENTER_CENTER, ph::MONITOR, theme::body(30.0), theme::NEVOA);
                 }
                 let at_btn = content.center() + Vec2::new(0.0, if small { 0.0 } else { 10.0 });
-                if centered_button(ui, at_btn, Kind::Secondary, if small { Size::Small } else { Size::Normal }, Some(ph::PLAY), label).clicked() && same {
+                if centered_card_button(ui, at_btn, true, if small { Size::Small } else { Size::Normal }, Some(ph::PLAY), label, (!same).then_some("Entre neste canal de voz para assistir")).clicked() {
                     // Next to the streams already watched (a message past the limit).
                     self.watch(&key);
                 }
             }
+            // v1.1: resting the pointer on a live not watched yet shows its still picture.
+            let hint = if same { "Clique em Assistir para ver ao vivo" } else { "Entre neste canal de voz para assistir" };
+            let hovered = base.hovered() && !base.is_pointer_button_down_on();
+            self.stream_hover(ui, "card", content, hovered, &m.user, Some(hint));
             if base.clicked() {
                 self.toggle_pin(tile.key);
             }
@@ -1489,13 +1569,32 @@ fn paint_tag(painter: &egui::Painter, at: Pos2, max_w: f32, t: &Tag<'_>, small: 
     let name_font = theme::body(if small { 11.5 } else { 12.5 });
     let (pad, sp) = (7.0, 5.0);
     let lay = |s: &str, c: Color32| painter.layout_no_wrap(s.to_owned(), icon_font.clone(), c);
-    let pin = t.pin.then(|| lay(ph::PUSH_PIN, theme::GIZ));
-    let icon = t.icon.map(|(i, c)| lay(i, c));
-    let live = t.live.map(|s| painter.layout_no_wrap(s.to_owned(), theme::semibold(10.5), Color32::WHITE));
-    let marks = t.marks.map(|m| m.map(|(i, c)| lay(i, c)));
-    let viewers = t.viewers.map(|n| painter.layout_no_wrap(format!("{} {n}", ph::EYE), name_font.clone(), theme::NEVOA));
+    let mut pin = t.pin.then(|| lay(ph::PUSH_PIN, theme::GIZ));
+    let mut icon = t.icon.map(|(i, c)| lay(i, c));
+    let mut live = t.live.map(|s| painter.layout_no_wrap(s.to_owned(), theme::semibold(10.5), Color32::WHITE));
+    let mut marks = t.marks.map(|m| m.map(|(i, c)| lay(i, c)));
+    let mut viewers = t.viewers.map(|n| painter.layout_no_wrap(format!("{} {n}", ph::EYE), name_font.clone(), theme::NEVOA));
     let width = |g: &Option<std::sync::Arc<egui::Galley>>, extra: f32| g.as_ref().map_or(0.0, |g| g.size().x + extra);
-    let fixed = width(&pin, sp) + width(&icon, sp) + width(&live, 10.0 + sp) + marks.iter().map(|m| width(m, sp)).sum::<f32>() + width(&viewers, sp);
+    let fixed_of = |pin: &Option<_>, icon: &Option<_>, live: &Option<_>, marks: &[Option<_>; 3], viewers: &Option<_>| {
+        width(pin, sp) + width(icon, sp) + width(live, 10.0 + sp) + marks.iter().map(|m| width(m, sp)).sum::<f32>() + width(viewers, sp)
+    };
+    // I6, a small card: the extras give way (viewers, the pin, the icon, the marks, then "ao
+    // vivo") so the name keeps a few letters and nothing runs past the card.
+    const NAME_MIN: f32 = 28.0;
+    let mut fixed = fixed_of(&pin, &icon, &live, &marks, &viewers);
+    for step in 0..5 {
+        if 2.0 * pad + fixed + NAME_MIN <= max_w {
+            break;
+        }
+        match step {
+            0 => viewers = None,
+            1 => pin = None,
+            2 => icon = None,
+            3 => marks = [None, None, None],
+            _ => live = None,
+        }
+        fixed = fixed_of(&pin, &icon, &live, &marks, &viewers);
+    }
     let name_w = (max_w - 2.0 * pad - fixed).max(0.0);
     let name = crate::app::notify::fit_name(painter, t.name, name_font, theme::GIZ, name_w);
     let w = (2.0 * pad + fixed + name.size().x.min(name_w)).min(max_w).max(0.0);
@@ -1536,12 +1635,16 @@ fn paint_tag(painter: &egui::Painter, at: Pos2, max_w: f32, t: &Tag<'_>, small: 
     rect
 }
 
-/// A kit button centred on `at` (inside a card).
-fn centered_button(ui: &mut egui::Ui, at: Pos2, kind: Kind, size: Size, icon: Option<&str>, text: &str) -> egui::Response {
+/// A [`ui_kit::card_button`] centred on `at` (`primary`: the lamp). `disabled`: `Some(why)` greys
+/// it out and says why on hover (a live in another voice room).
+fn centered_card_button(ui: &mut egui::Ui, at: Pos2, primary: bool, size: Size, icon: Option<&str>, text: &str, disabled: Option<&str>) -> egui::Response {
     let h = if size == Size::Small { 26.0 } else { 32.0 };
     let r = Rect::from_center_size(at, Vec2::new(320.0, h));
     let mut c = ui.new_child(egui::UiBuilder::new().max_rect(r).layout(Layout::top_down(Align::Center)));
-    ui_kit::button_sized(&mut c, kind, size, icon, text)
+    match disabled {
+        None => ui_kit::card_button(&mut c, primary, size, icon, text),
+        Some(why) => c.add_enabled_ui(false, |ui| ui_kit::card_button(ui, primary, size, icon, text)).inner.on_disabled_hover_text(why),
+    }
 }
 
 /// One of the strip's scroll arrows. True when clicked.
@@ -1567,6 +1670,16 @@ fn audio_card(painter: &egui::Painter, body: Rect, small: bool, state: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plain_dm_call_blames_the_other_app_only_when_known() {
+        let old = e2ee_plain_call_note("Bia", true, false);
+        assert!(old.contains("Bia usa uma versão antiga"), "{old}");
+        // Bia has a device with keys: not her version (the caller's computer was not ready).
+        assert_eq!(e2ee_plain_call_note("Bia", true, true), E2EE_PLAIN_CALL_GENERIC);
+        // The device list was not read here: nothing is known about Bia.
+        assert_eq!(e2ee_plain_call_note("Bia", false, false), E2EE_PLAIN_CALL_GENERIC);
+    }
 
     #[test]
     fn at_most_four_streams_counting_the_ones_on_their_way() {

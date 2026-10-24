@@ -143,3 +143,45 @@ fn worker(shared: Arc<Shared>, device: Option<String>) {
     drop(io);
     info!("alert sounds: output closed (idle)");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::alerts::{palette_test_guard, set_palette, Palette};
+    use super::*;
+
+    /// A player whose stream counts as open, so `play` only queues into its mixer: no worker,
+    /// no device, nothing reaches the speakers.
+    fn silent_player() -> UiPlayer {
+        let p = UiPlayer::new();
+        p.shared.state.lock().running = true;
+        p
+    }
+
+    /// What the mixer plays for the queued alerts, start to end.
+    fn drain(p: &UiPlayer) -> Vec<i16> {
+        let mut all = Vec::new();
+        let mut block = [0i16; 960];
+        loop {
+            block.fill(0);
+            if !p.shared.mixer.mix_ui(&mut block) {
+                return all;
+            }
+            all.extend_from_slice(&block);
+        }
+    }
+
+    #[test]
+    fn the_mixer_receives_the_chosen_palette_from_the_next_alert() {
+        let _guard = palette_test_guard();
+        let p = silent_player();
+        for palette in [Palette::SinoSuave, Palette::Atual, Palette::Gota, Palette::Madeira, Palette::SinoSuave] {
+            set_palette(palette);
+            assert!(p.play(AlertKind::Mention, 1.0, None));
+            let want = AlertKind::Mention.samples_in(palette);
+            let got = drain(&p);
+            assert_eq!(&got[..want.len()], &want[..], "{palette:?}");
+            assert!(got[want.len()..].iter().all(|s| *s == 0), "{palette:?}: one alert, then silence");
+        }
+        assert_eq!(p.shared.mixer.ui_active(), 0);
+    }
+}

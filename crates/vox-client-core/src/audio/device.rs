@@ -7,6 +7,8 @@
 //! another app or the Bluetooth headset switched modes; any OS: the device went away) is reopened
 //! on that thread by itself, with the same settings, retrying with a growing delay while the
 //! device is missing: nobody has to leave and rejoin the room for the microphone to come back.
+//! The microphone goes further ([`super::mic_route`]): it changes device mid-call, falls back to
+//! the system default when the chosen one disappears, and notices a stream that died in silence.
 //!
 //! Mic: device -> mono f32 -> (resample to 48 kHz) -> 10 ms i16 chunks -> WebRTC APM
 //! (AEC3 + AGC + HPF, plus its noise suppressor at the "Padrão" level) -> AI denoiser (RNNoise at
@@ -20,14 +22,14 @@
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
+use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig, I24};
 use futures_util::FutureExt;
 use livekit::webrtc::audio_frame::AudioFrame;
 use livekit::webrtc::audio_source::native::NativeAudioSource;
@@ -36,7 +38,9 @@ use parking_lot::Mutex;
 use tracing::{info, warn};
 
 use super::denoise::{Denoiser, NoiseControl};
+use super::fake_mic::FakeMics;
 use super::gate::{GateProcessor, VoiceGate};
+use super::mic_route::{reopen_delay, MicBackend, MicOpen, MicRoute, MicStatus};
 use super::mixer::{Mixer, SourceId, MIX_10MS, MIX_CHANNELS, MIX_RATE};
 use super::resample::LinearResampler;
 use super::voicefx::VoiceChanger;
@@ -136,6 +140,13 @@ pub struct MicConfig {
     /// Noise suppression level (the AI denoiser reads it on every chunk) and the voice changer
     /// setting it carries.
     pub noise: Arc<NoiseControl>,
+    /// The chosen device is gone or will not open: capture the system default instead of nothing.
+    pub fall_back: bool,
+    /// Told when the microphone changes by itself or as asked (see [`MicStatus`]), on the audio
+    /// thread.
+    pub on_status: Option<Arc<dyn Fn(MicStatus) + Send + Sync>>,
+    /// Autotests: these made-up devices instead of the real ones.
+    pub fake: Option<FakeMics>,
 }
 
 #[derive(Clone)]
@@ -174,20 +185,25 @@ enum Opened {
 /// What the audio thread is told.
 enum Ctl {
     Stop,
-    /// The system invalidated a stream (`mic`: the microphone, else the speakers): reopen it.
-    Reopen { mic: bool },
-}
-
-/// Delays between attempts to reopen a lost stream: quick at first (a sample-rate change is over
-/// in a moment), then every 5 s while the device stays missing.
-fn reopen_delay(attempt: u32) -> Duration {
-    const STEPS_MS: [u64; 5] = [300, 1000, 2000, 3000, 5000];
-    Duration::from_millis(STEPS_MS[(attempt as usize).min(STEPS_MS.len() - 1)])
+    /// The system invalidated the microphone stream of this generation: reopen it.
+    MicLost { gen: u64 },
+    /// The system invalidated the speakers' stream: reopen it.
+    OutputLost,
+    /// The person picked another microphone (`None`: the system default).
+    SetMic(Option<String>),
 }
 
 /// Errors after which a cpal stream is dead and must be built again.
 fn stream_lost(kind: cpal::ErrorKind) -> bool {
-    matches!(kind, cpal::ErrorKind::StreamInvalidated | cpal::ErrorKind::DeviceNotAvailable)
+    use cpal::ErrorKind as E;
+    match kind {
+        E::StreamInvalidated | E::DeviceNotAvailable => true,
+        E::Xrun | E::DeviceChanged | E::RealtimeDenied => false,
+        // WASAPI's capture and render threads end after reporting anything else (the audio service
+        // restarted, another app took the device, a driver error): the stream will never call
+        // again. CoreAudio reports a failed render this way and carries on.
+        _ => cfg!(windows),
+    }
 }
 
 impl AudioIo {
@@ -207,36 +223,38 @@ impl AudioIo {
             .name("vox-audio-io".into())
             .spawn(move || {
                 let host = cpal::default_host();
-                let lost = |mic: bool| {
+                let out_lost = || {
                     let tx = reopen_tx.clone();
                     move || {
-                        let _ = tx.send(Ctl::Reopen { mic });
+                        let _ = tx.send(Ctl::OutputLost);
                     }
                 };
-                let mut mic_stream = mic.as_ref().and_then(|cfg| {
-                    let started = std::time::Instant::now();
-                    let res = open_mic(&host, cfg.clone(), lost(true));
-                    let _ = ready_tx.send(Opened::Mic(match &res {
-                        Ok(_) => Ok(()),
-                        Err(e) => Err(format!("{e:#}")),
-                    }));
-                    match res {
-                        Ok(s) => {
-                            info!(ms = started.elapsed().as_millis() as u64, "microphone opened");
-                            Some(s)
-                        }
-                        Err(e) => {
-                            warn!(error = %format!("{e:#}"), "microphone unavailable; continuing without mic");
-                            None
-                        }
+                let mut route = mic.map(|cfg| {
+                    let tx = reopen_tx.clone();
+                    let lost: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |gen| {
+                        let _ = tx.send(Ctl::MicLost { gen });
+                    });
+                    let (status, fall_back, wanted) = (cfg.on_status.clone(), cfg.fall_back, cfg.device.clone());
+                    let backend: Box<dyn MicBackend> = match cfg.fake.clone() {
+                        Some(fake) => Box::new(fake.backend(cfg)),
+                        None => Box::new(CpalMics { host: cpal::default_host(), cfg }),
+                    };
+                    let mut route = MicRoute::new(backend, lost, status, fall_back, wanted);
+                    let started = Instant::now();
+                    let res = route.start(started);
+                    match &res {
+                        Ok(()) => info!(ms = started.elapsed().as_millis() as u64, "microphone opened"),
+                        Err(e) => warn!(error = %e, "microphone unavailable; continuing without mic"),
                     }
+                    let _ = ready_tx.send(Opened::Mic(res));
+                    route
                 });
                 if gave_up.load(Ordering::Relaxed) {
                     return; // the caller already moved on; do not keep the mic open
                 }
                 let mut out_stream = playback.as_ref().and_then(|cfg| {
                     let started = std::time::Instant::now();
-                    let res = open_playback(&host, cfg.clone(), lost(false));
+                    let res = open_playback(&host, cfg.clone(), out_lost());
                     let _ = ready_tx.send(Opened::Playback(match &res {
                         Ok(_) => Ok(()),
                         Err(e) => Err(format!("{e:#}")),
@@ -255,11 +273,13 @@ impl AudioIo {
                 if gave_up.load(Ordering::Relaxed) {
                     return;
                 }
-                // Until told to stop: reopen what the system invalidates. `pending`: the streams
-                // waiting to be reopened, and the attempt number of each.
-                let mut pending: [Option<u32>; 2] = [None, None];
+                // Until told to stop: reopen what the system invalidates, follow the microphone.
+                // `out_retry`: the speakers' attempt number and when it is due.
+                let mut out_retry: Option<(u32, Instant)> = None;
                 loop {
-                    let wait = pending.iter().flatten().map(|a| reopen_delay(*a)).min();
+                    let now = Instant::now();
+                    let out_wait = out_retry.map(|(_, at)| at.saturating_duration_since(now));
+                    let wait = [route.as_ref().and_then(|r| r.next_wait(now)), out_wait].into_iter().flatten().min();
                     let msg = match wait {
                         Some(d) => match stop_rx.recv_timeout(d) {
                             Ok(m) => Some(m),
@@ -268,57 +288,41 @@ impl AudioIo {
                         },
                         None => Some(stop_rx.recv().unwrap_or(Ctl::Stop)),
                     };
-                    match msg {
-                        Some(Ctl::Stop) => break,
-                        Some(Ctl::Reopen { mic: is_mic }) => {
-                            let i = usize::from(!is_mic);
-                            if pending[i].is_none() {
-                                warn!(stream = if is_mic { "microphone" } else { "speakers" }, "audio stream lost; reopening it");
-                                pending[i] = Some(0);
-                                // Drop the dead stream now (it may still hold the device).
-                                if is_mic {
-                                    mic_stream = None;
-                                } else {
-                                    out_stream = None;
-                                }
-                            }
+                    let now = Instant::now();
+                    match (msg, route.as_mut()) {
+                        (Some(Ctl::Stop), _) => break,
+                        (Some(Ctl::MicLost { gen }), Some(r)) => r.on_lost(gen, now),
+                        (Some(Ctl::SetMic(device)), Some(r)) => r.set_device(device, now),
+                        (Some(Ctl::OutputLost), _) if out_retry.is_none() => {
+                            warn!("speaker stream lost; reopening it");
+                            out_retry = Some((0, now + reopen_delay(0)));
+                            // Drop the dead stream now (it may still hold the device).
+                            out_stream = None;
                         }
-                        None => {
-                            // A retry is due.
-                            if let (Some(n), Some(cfg)) = (pending[0], mic.as_ref()) {
-                                match open_mic(&host, cfg.clone(), lost(true)) {
-                                    Ok(s) => {
-                                        info!(attempt = n + 1, "microphone reopened");
-                                        mic_stream = Some(s);
-                                        pending[0] = None;
-                                    }
-                                    Err(e) => {
-                                        if n < 3 || n % 12 == 0 {
-                                            warn!(attempt = n + 1, error = %format!("{e:#}"), "microphone not back yet");
-                                        }
-                                        pending[0] = Some(n + 1);
-                                    }
+                        _ => {}
+                    }
+                    if let Some(r) = route.as_mut() {
+                        r.on_timer(now);
+                    }
+                    if let (Some((n, at)), Some(cfg)) = (out_retry, playback.as_ref()) {
+                        if now >= at {
+                            match open_playback(&host, cfg.clone(), out_lost()) {
+                                Ok(s) => {
+                                    info!(attempt = n + 1, "speaker output reopened");
+                                    out_stream = Some(s);
+                                    out_retry = None;
                                 }
-                            }
-                            if let (Some(n), Some(cfg)) = (pending[1], playback.as_ref()) {
-                                match open_playback(&host, cfg.clone(), lost(false)) {
-                                    Ok(s) => {
-                                        info!(attempt = n + 1, "speaker output reopened");
-                                        out_stream = Some(s);
-                                        pending[1] = None;
+                                Err(e) => {
+                                    if n < 3 || n % 12 == 0 {
+                                        warn!(attempt = n + 1, error = %format!("{e:#}"), "speaker output not back yet");
                                     }
-                                    Err(e) => {
-                                        if n < 3 || n % 12 == 0 {
-                                            warn!(attempt = n + 1, error = %format!("{e:#}"), "speaker output not back yet");
-                                        }
-                                        pending[1] = Some(n + 1);
-                                    }
+                                    out_retry = Some((n + 1, now + reopen_delay(n + 1)));
                                 }
                             }
                         }
                     }
                 }
-                drop(mic_stream);
+                drop(route);
                 drop(out_stream);
             })
             .expect("spawn audio io thread");
@@ -352,6 +356,14 @@ impl AudioIo {
             playback_ok: want_out && out_res.is_ok(),
             mic_error: if want_mic { mic_res.err() } else { None },
             playback_error: if want_out { out_res.err() } else { None },
+        }
+    }
+
+    /// Capture from another microphone (`None`: the system default), now. Does not wait: the
+    /// outcome comes back through [`MicConfig::on_status`]. Nothing happens without a microphone.
+    pub fn set_mic_device(&self, device: Option<String>) {
+        if let Some(tx) = &self.stop {
+            let _ = tx.send(Ctl::SetMic(device));
         }
     }
 }
@@ -402,17 +414,21 @@ fn find_device(host: &cpal::Host, name: Option<&str>, input: bool) -> Result<cpa
         } else {
             host.output_devices().context("enumerate output devices")?.collect()
         };
-        for d in devices {
-            if let Ok(desc) = d.description() {
-                if desc.name().to_lowercase().contains(&want) {
-                    return Ok(d);
-                }
-            }
-        }
-        return Err(anyhow!("no {} device matching {want:?}", if input { "input" } else { "output" }));
+        let named: Vec<(String, cpal::Device)> = devices.into_iter().filter_map(|d| Some((d.description().ok()?.name().to_lowercase(), d))).collect();
+        return match best_match(named.iter().map(|(n, _)| n.as_str()), &want) {
+            Some(i) => Ok(named.into_iter().nth(i).expect("an index into the list").1),
+            None => Err(anyhow!("no {} device matching {want:?}", if input { "input" } else { "output" })),
+        };
     }
     let d = if input { host.default_input_device() } else { host.default_output_device() };
     d.ok_or_else(|| anyhow!("no default {} device", if input { "input" } else { "output" }))
+}
+
+/// Which of the (lowercased) device names `want` means: the same name if there is one (the picker
+/// saves full names, and "microphone (headset)" must not open "headset microphone (headset)"), else
+/// the first one containing it (`--input-device usb`).
+fn best_match<'a>(names: impl Iterator<Item = &'a str> + Clone, want: &str) -> Option<usize> {
+    names.clone().position(|n| n == want).or_else(|| names.clone().position(|n| n.contains(want)))
 }
 
 fn device_name(d: &cpal::Device) -> String {
@@ -474,7 +490,7 @@ impl Drop for SinkState {
     }
 }
 
-struct MicState {
+pub(super) struct MicState {
     channels: usize,
     sink: SinkState,
     muted: Arc<AtomicBool>,
@@ -488,13 +504,16 @@ struct MicState {
     resampled: Vec<f32>,
     chunk: Vec<i16>,
     was_muted: bool,
+    /// Bumped by every callback, muted or not: the capture is alive ([`super::mic_route`]).
+    pulse: Arc<AtomicU64>,
 }
 
 impl MicState {
-    fn on_data<T: SizedSample>(&mut self, data: &[T])
+    pub(super) fn on_data<T: SizedSample>(&mut self, data: &[T])
     where
         f32: FromSample<T>,
     {
+        self.pulse.fetch_add(1, Ordering::Relaxed);
         // Mute wins over everything (gate, push-to-talk): no processing, nothing sent, meter blank.
         if self.muted.load(Ordering::Relaxed) {
             if !self.was_muted {
@@ -558,37 +577,76 @@ impl MicState {
     }
 }
 
-fn open_mic(host: &cpal::Host, cfg: MicConfig, on_lost: impl Fn() + Send + 'static) -> Result<cpal::Stream> {
-    let device = find_device(host, cfg.device.as_deref(), true)?;
-    let supported = device.default_input_config().context("default input config")?;
-    let config: StreamConfig = supported.config();
-    let channels = config.channels as usize;
-    let rate = config.sample_rate;
-    info!(device = %device_name(&device), rate, channels, format = ?supported.sample_format(), "opening microphone");
-    let state = MicState {
+impl Drop for MicState {
+    /// The stream is gone: the meter and the "speaking" ring must not stay on its last value.
+    fn drop(&mut self) {
+        self.gate.reset();
+    }
+}
+
+/// The capture chain for one stream of a device with this format: everything that depends on the
+/// format is here, so a new stream never inherits the previous device's.
+pub(super) fn new_mic_state(cfg: &MicConfig, channels: usize, rate: u32, pulse: Arc<AtomicU64>) -> MicState {
+    MicState {
         channels,
-        sink: SinkState::new(cfg.sink),
-        muted: cfg.muted,
-        apm: cfg.apm,
-        counters: cfg.counters,
-        gate: GateProcessor::new(cfg.gate),
+        sink: SinkState::new(cfg.sink.clone()),
+        muted: cfg.muted.clone(),
+        apm: cfg.apm.clone(),
+        counters: cfg.counters.clone(),
+        gate: GateProcessor::new(cfg.gate.clone()),
         fx: VoiceChanger::new(cfg.noise.clone()),
-        denoiser: Denoiser::new(cfg.noise),
+        denoiser: Denoiser::new(cfg.noise.clone()),
         resampler: (rate != MIX_RATE).then(|| LinearResampler::new(rate, MIX_RATE, 1)),
         mono: Vec::with_capacity(4096),
         resampled: Vec::with_capacity(4096),
         chunk: Vec::with_capacity(MIC_CHUNK),
         was_muted: false,
-    };
+        pulse,
+    }
+}
+
+/// The real devices, for [`MicRoute`].
+struct CpalMics {
+    host: cpal::Host,
+    cfg: MicConfig,
+}
+
+impl MicBackend for CpalMics {
+    fn open(&mut self, device: Option<&str>, on_lost: Box<dyn Fn() + Send>) -> Result<MicOpen, String> {
+        open_mic(&self.host, &self.cfg, device, on_lost).map_err(|e| format!("{e:#}"))
+    }
+
+    fn present(&mut self, name: &str) -> bool {
+        find_device(&self.host, Some(name), true).is_ok()
+    }
+
+    fn default_id(&mut self) -> Option<String> {
+        self.host.default_input_device().and_then(|d| d.id().ok()).map(|id| id.to_string())
+    }
+}
+
+fn open_mic(host: &cpal::Host, cfg: &MicConfig, name: Option<&str>, on_lost: impl Fn() + Send + 'static) -> Result<MicOpen> {
+    let device = find_device(host, name, true)?;
+    let supported = device.default_input_config().context("default input config")?;
+    let config: StreamConfig = supported.config();
+    let channels = config.channels as usize;
+    let rate = config.sample_rate;
+    info!(device = %device_name(&device), rate, channels, format = ?supported.sample_format(), "opening microphone");
+    let pulse = Arc::new(AtomicU64::new(0));
+    let state = new_mic_state(cfg, channels, rate, pulse.clone());
     let stream = match supported.sample_format() {
         SampleFormat::F32 => build_mic::<f32>(&device, &config, state, on_lost)?,
+        SampleFormat::F64 => build_mic::<f64>(&device, &config, state, on_lost)?,
         SampleFormat::I16 => build_mic::<i16>(&device, &config, state, on_lost)?,
+        SampleFormat::I24 => build_mic::<I24>(&device, &config, state, on_lost)?,
         SampleFormat::I32 => build_mic::<i32>(&device, &config, state, on_lost)?,
+        SampleFormat::I64 => build_mic::<i64>(&device, &config, state, on_lost)?,
+        SampleFormat::U8 => build_mic::<u8>(&device, &config, state, on_lost)?,
         SampleFormat::U16 => build_mic::<u16>(&device, &config, state, on_lost)?,
         other => return Err(anyhow!("unsupported mic sample format {other:?}")),
     };
     stream.play().context("start mic stream")?;
-    Ok(stream)
+    Ok(MicOpen { name: device_name(&device), id: device.id().ok().map(|id| id.to_string()), pulse, _stream: Box::new(stream) })
 }
 
 fn build_mic<T: SizedSample>(device: &cpal::Device, config: &StreamConfig, mut state: MicState, on_lost: impl Fn() + Send + 'static) -> Result<cpal::Stream>
@@ -838,6 +896,7 @@ mod tests {
             resampled: Vec::new(),
             chunk: Vec::new(),
             was_muted: false,
+            pulse: Arc::new(AtomicU64::new(0)),
         };
         (st, muted, mixer)
     }
@@ -985,13 +1044,38 @@ mod tests {
     fn lost_streams_are_reopened_with_a_growing_delay() {
         assert!(stream_lost(cpal::ErrorKind::StreamInvalidated), "macOS: the device's sample rate changed");
         assert!(stream_lost(cpal::ErrorKind::DeviceNotAvailable), "unplugged");
-        for k in [cpal::ErrorKind::Xrun, cpal::ErrorKind::DeviceChanged, cpal::ErrorKind::BackendError, cpal::ErrorKind::RealtimeDenied] {
+        for k in [cpal::ErrorKind::Xrun, cpal::ErrorKind::DeviceChanged, cpal::ErrorKind::RealtimeDenied] {
             assert!(!stream_lost(k), "{k:?} keeps the stream");
+        }
+        // WASAPI's stream thread ends after any of these: nobody would ever reopen it.
+        for k in [cpal::ErrorKind::BackendError, cpal::ErrorKind::DeviceBusy, cpal::ErrorKind::HostUnavailable] {
+            assert_eq!(stream_lost(k), cfg!(windows), "{k:?}");
         }
         let d: Vec<Duration> = (0..8).map(reopen_delay).collect();
         assert_eq!(d[0], Duration::from_millis(300));
         assert!(d.windows(2).all(|w| w[0] <= w[1]));
         assert_eq!(d[7], Duration::from_secs(5), "then every 5 s");
+    }
+
+    #[test]
+    fn a_device_is_found_by_its_exact_name_before_a_part_of_one() {
+        let names = ["headset microphone (headset)", "microphone (headset)", "microphone (usb)"];
+        let find = |want| best_match(names.iter().copied(), want);
+        assert_eq!(find("microphone (headset)"), Some(1), "not the first one that contains it");
+        assert_eq!(find("usb"), Some(2), "a part of a name still works (--input-device)");
+        assert_eq!(find("webcam"), None);
+    }
+
+    #[test]
+    fn a_stream_going_away_blanks_the_meter_and_the_speaking_state() {
+        use crate::audio::gate::{GateConfig, GateMode};
+        let gate = Arc::new(VoiceGate::new(GateConfig { mode: GateMode::Manual, threshold_db: -60.0, hold_ms: 100 }));
+        let (mut st, _muted, _mixer) = mic_state(&gate, false);
+        st.on_data(&loud_chunk());
+        assert!(gate.is_open() && gate.level_db() > -30.0);
+        drop(st);
+        assert!(!gate.is_open(), "unplugged mid-word: nobody stays \"speaking\"");
+        assert_eq!(gate.level_db(), crate::audio::gate::MIN_DB);
     }
 
     #[test]

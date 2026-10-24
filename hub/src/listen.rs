@@ -214,6 +214,8 @@ mod tests {
     #[tokio::test]
     async fn ipv4_peers_on_a_dual_stack_socket_look_like_ipv4() {
         use axum::extract::ConnectInfo;
+        // reqwest has no provider of its own here (ring only); another test may not have set one yet.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let std_l = v6_socket(Ipv4Addr::LOCALHOST.to_ipv6_mapped(), 0, false).unwrap();
         let l = TcpListener::from_std(std_l).unwrap();
         let port = l.local_addr().unwrap().port();

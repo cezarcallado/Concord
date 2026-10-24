@@ -566,7 +566,7 @@ mod tests {
         for ev in [
             ServerEvent::UserOnline { user: u.clone() },
             ServerEvent::UserUpdated { user: u.clone() },
-            ServerEvent::Ready { user: u.clone(), channels: vec![], online: vec![u.clone()], voice: vec![], account: None, chat: None, server_id: None },
+            ServerEvent::Ready { user: u.clone(), channels: vec![], online: vec![u.clone()], voice: vec![], account: None, chat: None, server_id: None, stream_previews: false, e2ee: false },
             ServerEvent::MessageCreated { message: crate::Message { id: 1, channel_id: 2, author: u.clone(), content: "oi".into(), created_at_ms: 3, attachments: vec![], mentions: vec![], mention_everyone: false, reply: None, reactions: vec![] } },
         ] {
             let json = serde_json::to_string(&ev).unwrap();
@@ -581,7 +581,7 @@ mod tests {
         assert!(serde_json::from_str::<v052::ServerEvent>(&json).is_err());
         assert!(serde_json::from_str::<ServerEvent>(&json).is_ok());
         // Every other event keeps its shape: Ready has no presence field at all.
-        let ready = ServerEvent::Ready { user: User::new(1, "a"), channels: vec![], online: vec![], voice: vec![], account: None, chat: None, server_id: None };
+        let ready = ServerEvent::Ready { user: User::new(1, "a"), channels: vec![], online: vec![], voice: vec![], account: None, chat: None, server_id: None, stream_previews: false, e2ee: false };
         assert!(!serde_json::to_string(&ready).unwrap().contains("presence"));
     }
 

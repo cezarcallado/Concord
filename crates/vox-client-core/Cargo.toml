@@ -13,6 +13,8 @@ path = "src/bin/vox-cli.rs"
 vox-log = { workspace = true }
 vox-proto = { workspace = true }
 vox-capture = { workspace = true }
+# v1.1 (E0): this device's identity key for the hub's directory (the hub itself never links it).
+vox-e2ee = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["io-std", "io-util"] }
@@ -23,6 +25,11 @@ livekit = { version = "0.9.4", features = ["rustls-tls-webpki-roots"] }
 livekit-api = { version = "0.8.2", default-features = false, features = ["access-token"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+# v1.1 (T0, `tls.rs`): TLS to the hub with a pinned certificate, on the ring provider (all already
+# in the tree: the hub uses the same rustls / tokio-rustls / sha2).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+sha2 = "0.11.0"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 cpal = "0.18"
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
@@ -41,6 +48,9 @@ symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 jpeg-encoder = "0.7"
 libwebp-sys = "0.14"
+# Go Live hover previews (v1.1): the picture and icon travel as base64 in JSON (already in the
+# tree through the hub).
+base64 = "0.23.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_UI_WindowsAndMessaging", "Win32_System_Memory", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_HiDpi"] }
@@ -50,3 +60,5 @@ windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_
 # The item-12 live test runs a real hub (and its LiveKit) against real voice sessions.
 voxhub-server = { path = "../../hub" }
 tempfile = "3.27.0"
+# v1.1 (T0): certificates like the hub's for the pinned-TLS tests (already in the tree through it).
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }

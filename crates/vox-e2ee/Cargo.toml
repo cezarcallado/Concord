@@ -1,0 +1,24 @@
+[package]
+name = "vox-e2ee"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+description = "concord's end-to-end encryption (v1.1, E0 and E2): per-device X25519 identities, the key-wrapping envelope, sealed DM lines and images, and the safety code. Client side only: the hub never links this crate."
+
+[dependencies]
+# X25519 for the device keys and the wrap's ephemeral keys (`static_secrets`: keys made from our
+# own random bytes and kept across runs; `zeroize`: secrets wiped on drop).
+x25519-dalek = { version = "=2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
+# Not used directly: pins x25519-dalek's curve to a version without RUSTSEC-2024-0344 (the timing
+# leak in `Scalar29::sub` / `Scalar52::sub`, fixed in 4.1.3).
+curve25519-dalek = { version = "4.1.3", default-features = false, features = ["zeroize"] }
+# HKDF-SHA256 and ChaCha20-Poly1305 (already in the tree through rustls).
+ring = "0.17.14"
+# OS randomness for keys and device ids (already in the tree: the hub uses the same version).
+getrandom = "0.4.3"
+zeroize = "1.8"
+# The public key as base64url in the hub's directory (already in the tree).
+base64 = "0.23.1"
+# E2 (DMs): the JSON plaintext of a sealed line (both already in the tree).
+serde = { workspace = true }
+serde_json = { workspace = true }

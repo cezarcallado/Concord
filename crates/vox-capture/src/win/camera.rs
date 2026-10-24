@@ -981,6 +981,8 @@ struct Synthetic {
     /// `VOX_FAKE_CAMERA_FORMAT=yuy2`: deliver packed YUY2 like a USB camera (exercises the
     /// YUY2 upload and conversion path); the picture is rendered as NV12 first.
     yuy2: Option<Vec<u8>>,
+    /// `VOX_FAKE_CAMERA_NOISE`: the picture is rendered here first (see [`fake_noise`]).
+    scratch: Vec<u8>,
 }
 
 impl Synthetic {
@@ -994,7 +996,7 @@ impl Synthetic {
         let yuy2 = std::env::var("VOX_FAKE_CAMERA_FORMAT")
             .is_ok_and(|v| v.eq_ignore_ascii_case("yuy2"))
             .then(|| vec![0u8; width as usize * height as usize * 3 / 2]);
-        Ok(Self { width, height, fps, timer: OwnedHandle(timer), index: 0, slow: false, yuy2 })
+        Ok(Self { width, height, fps, timer: OwnedHandle(timer), index: 0, slow: false, yuy2, scratch: Vec::new() })
     }
 
     fn arm(timer: HANDLE, fps: u32) -> Result<()> {
@@ -1028,11 +1030,28 @@ impl Synthetic {
     /// # Safety
     /// `dst` is a mapped staging texture of that format and size with row pitch `pitch`.
     unsafe fn render_to(&mut self, dst: *mut u8, pitch: usize) {
+        let noise = fake_noise();
+        if noise > 0 && self.yuy2.is_none() {
+            // Rendered in memory first: the mapped texture is write-combined (reads crawl).
+            let (w, h) = (self.width as usize, self.height as usize);
+            let mut buf = std::mem::take(&mut self.scratch);
+            buf.resize(w * h * 3 / 2, 0);
+            self.render(buf.as_mut_ptr(), w);
+            add_noise(&mut buf[..w * h], noise, self.index);
+            for r in 0..h * 3 / 2 {
+                std::ptr::copy_nonoverlapping(buf.as_ptr().add(r * w), dst.add(r * pitch), w);
+            }
+            self.scratch = buf;
+            return;
+        }
         let Some(mut nv12) = self.yuy2.take() else {
             return self.render(dst, pitch);
         };
         let (w, h) = (self.width as usize, self.height as usize);
         self.render(nv12.as_mut_ptr(), w);
+        if noise > 0 {
+            add_noise(&mut nv12[..w * h], noise, self.index);
+        }
         for r in 0..h {
             let y = &nv12[r * w..r * w + w];
             let uv = &nv12[w * h + (r / 2) * w..w * h + (r / 2) * w + w];
@@ -1100,6 +1119,29 @@ impl Synthetic {
                     px[1] = 152;
                 }
             }
+        }
+    }
+}
+
+/// `VOX_FAKE_CAMERA_NOISE=<n>` (v1.1 G5): luma noise of +-n levels on the synthetic camera, like a
+/// real sensor's. The flat picture alone compresses to ~1/3 of a camera's bitrate, which no real
+/// webcam does, and that skews the bandwidth estimate of a camera + Go Live test. 0 = none.
+fn fake_noise() -> u8 {
+    static N: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VOX_FAKE_CAMERA_NOISE").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(64))
+}
+
+/// Add +-`n` of pseudo-random noise to a luma plane (xorshift; new noise every frame).
+fn add_noise(y: &mut [u8], n: u8, frame: u64) {
+    let span = 2 * n as u64 + 1;
+    let mut s = 0x9E37_79B9_7F4A_7C15u64 ^ frame.wrapping_mul(0xD1B5_4A32_D192_ED03);
+    for chunk in y.chunks_mut(4) {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        for (k, p) in chunk.iter_mut().enumerate() {
+            let d = ((s >> (k * 16)) & 0xFFFF) % span;
+            *p = (*p as i32 + d as i32 - n as i32).clamp(16, 235) as u8;
         }
     }
 }

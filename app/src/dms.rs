@@ -23,6 +23,8 @@ use vox_proto::{
 
 use crate::context_menu::{Lead, Origin};
 use super::{now_ms, App, Center, Screen, GREEN};
+use crate::backend::e2ee::dm::{self as e2dm, SendMode};
+use crate::backend::e2ee::E2eeBackend;
 use crate::backend::Cmd;
 
 /// The voice "channel" of a DM call inside the app (real channel ids are positive).
@@ -36,6 +38,13 @@ const ROW_AVATAR: f32 = 28.0;
 const ICON_PHONE: &str = crate::theme::ph::PHONE;
 /// The honest one-liner under every DM header.
 pub const HOST_NOTE: &str = "Mensagens ficam guardadas no servidor de quem hospeda";
+/// v1.1 (E2): the same, for an end-to-end encrypted conversation.
+pub const HOST_NOTE_E2E: &str = "Mensagens ficam guardadas criptografadas no servidor de quem hospeda: só os aparelhos de vocês dois conseguem ler";
+/// v1.1 (E2): the safety code dialog and its buttons; the banner when it changed after a check.
+pub const SAFETY_TITLE: &str = "Verificar código de segurança";
+pub const VERIFY: &str = "Marcar como verificado";
+pub const UNVERIFY: &str = "Desmarcar";
+pub const REVERIFY: &str = "Verifique de novo";
 
 // ---------------------------------------------------------------- backend calls
 
@@ -47,8 +56,9 @@ pub enum DmCmd {
     People,
     Open(UserId),
     History { dm: DmId, before: Option<DmMessageId> },
-    /// `reply_to`: the line this one answers (v0.8).
-    Send { dm: DmId, content: String, reply_to: Option<DmMessageId> },
+    /// `reply_to`: the line this one answers (v0.8). `mode` (v1.1 E2): to whom, and whether the
+    /// person agreed to send it unencrypted in an encrypted conversation.
+    Send { dm: DmId, content: String, reply_to: Option<DmMessageId>, mode: SendMode },
     Delete { dm: DmId, id: DmMessageId },
     Read { dm: DmId, up_to: DmMessageId },
     Block { user: UserId, blocked: bool },
@@ -81,17 +91,56 @@ impl DmCmd {
     }
 }
 
-/// Run one call against the hub (on the backend's runtime).
-pub async fn run(hub: &HubClient, cmd: DmCmd) -> DmEv {
+/// Run one call against the hub (on the backend's runtime). Every line that comes back passes
+/// through `e2` first (v1.1 E2: sealed lines are opened, `backend/e2ee/dm.rs`), and a line to
+/// somebody with a device key is sealed.
+pub async fn run(hub: &HubClient, e2: &E2eeBackend, cmd: DmCmd) -> DmEv {
     let err = |e: anyhow::Error| error_text(&e);
     match cmd {
-        DmCmd::List => DmEv::Listed(hub.dms().await),
+        DmCmd::List => {
+            let mut reply = hub.dms().await;
+            if let DmsReply::Ready(list) = &mut reply {
+                e2.open_convs(hub, list).await;
+            }
+            DmEv::Listed(reply)
+        }
         DmCmd::People => DmEv::People(hub.dm_people().await.map_err(err)),
-        DmCmd::Open(user) => DmEv::Opened(hub.open_dm(user).await.map_err(err)),
-        DmCmd::History { dm, before } => DmEv::History { dm, before, result: hub.dm_messages(dm, before, HISTORY_PAGE).await.map_err(err) },
-        DmCmd::Send { dm, content, reply_to } => {
-            let req = vox_proto::DmSendRequest { content: content.clone(), attachments: Vec::new(), reply_to };
-            let result = hub.send_dm_request(dm, &req).await.map_err(err);
+        DmCmd::Open(user) => {
+            let mut result = hub.open_dm(user).await.map_err(err);
+            if let Ok(c) = &mut result {
+                e2.open_convs(hub, std::slice::from_mut(c)).await;
+            }
+            DmEv::Opened(result)
+        }
+        DmCmd::History { dm, before } => {
+            let mut result = hub.dm_messages(dm, before, HISTORY_PAGE).await.map_err(err);
+            if let Ok(page) = &mut result {
+                e2.open_lines(hub, page).await;
+            }
+            DmEv::History { dm, before, result }
+        }
+        DmCmd::Send { dm, content, reply_to, mode } => {
+            let mut req = vox_proto::DmSendRequest { content: content.clone(), attachments: Vec::new(), reply_to, sealed: None };
+            e2.prepare(hub).await;
+            match e2.plan(dm, mode).await {
+                Ok(e2dm::Plan::Seal) => match e2.seal_line(dm, mode.peer, &content, Vec::new()) {
+                    Ok(body) => {
+                        req.content = String::new();
+                        req.sealed = Some(body);
+                    }
+                    Err(e) => return DmEv::Sent { dm, content, result: Err(e) },
+                },
+                Ok(e2dm::Plan::Plain) => {}
+                Err(e) => return DmEv::Sent { dm, content, result: Err(e) },
+            }
+            let result = match hub.send_dm_request(dm, &req).await {
+                Ok(m) => {
+                    let mut v = vec![m];
+                    e2.open_lines(hub, &mut v).await;
+                    v.pop().ok_or_else(|| "a mensagem voltou repetida".to_string())
+                }
+                Err(e) => Err(err(e)),
+            };
             DmEv::Sent { dm, content, result }
         }
         cmd => {
@@ -114,6 +163,8 @@ pub fn error_text(e: &anyhow::Error) -> String {
         Some(s) if s.status == 403 && s.message == ERR_DM_BLOCKED => "Não dá: um de vocês bloqueou o outro.".into(),
         Some(s) if s.status == 403 => "Você só pode apagar as suas próprias mensagens.".into(),
         Some(s) if s.status == 409 && s.message == ERR_CALL_BUSY => "A pessoa está em outra chamada agora. Ela vai ver que você ligou.".into(),
+        // v1.1 (E1): the hub's own text (an older app shows it as is too).
+        Some(s) if s.status == 409 && s.message == vox_proto::ERR_E2EE_CALL_REQUIRED => vox_proto::ERR_E2EE_CALL_REQUIRED.into(),
         Some(s) if s.status == 409 => "Essa chamada já terminou.".into(),
         Some(s) if s.status == 429 => "Calma: espere um instante e tente de novo.".into(),
         Some(s) if s.status == 400 => format!("A mensagem precisa ter de 1 a {DM_MESSAGE_MAX_CHARS} caracteres."),
@@ -184,6 +235,16 @@ pub struct DmUi {
     pub flashes: u32,
     /// The last call that ended (DM, why), for messages and the autotest.
     pub last_end: Option<(DmId, CallEndReason)>,
+    /// v1.1 (E2): this computer's local lines about a person's keys ("O código de segurança de
+    /// Fulano mudou", "Fulano adicionou um aparelho"), by person: (when, text). Shown among the
+    /// lines of the conversation with them; never sent anywhere.
+    pub notes: HashMap<UserId, Vec<(i64, String)>>,
+    /// "Enviar sem criptografia?" is open for this DM (the question).
+    pub ask_plain: Option<(DmId, String)>,
+    /// The person said yes: the next send in this DM may go out unencrypted (just this once).
+    plain_ok_once: Option<DmId>,
+    /// "Verificar código de segurança" is open for this person.
+    pub safety_for: Option<UserId>,
 }
 
 impl DmUi {
@@ -276,6 +337,32 @@ pub fn insert_line(msgs: &mut Vec<DmMessage>, m: DmMessage) {
         Ok(i) => msgs[i] = m,
         Err(i) => msgs.insert(i, m),
     }
+}
+
+/// v1.1 (E2): the question before an encrypted conversation goes out in the clear.
+pub fn plain_question(name: &str) -> String {
+    format!("{name} não tem nenhum aparelho com criptografia. Enviar sem criptografia?")
+}
+
+/// v1.1 (E2): the question when the device list could not be read (whether the line could be
+/// encrypted is unknown).
+pub fn unknown_question(name: &str) -> String {
+    format!("Não foi possível confirmar agora se {name} tem um aparelho com criptografia. Enviar sem criptografia?")
+}
+
+/// v1.1 (E2): the safety code's explanation.
+pub fn safety_text(name: &str) -> String {
+    format!("Compare este código com {name} pessoalmente ou numa chamada. Se for igual, ninguém está no meio.")
+}
+
+/// v1.1 (E2): the local line when somebody's keys changed.
+pub fn code_changed_text(name: &str) -> String {
+    format!("O código de segurança de {name} mudou (aparelho novo ou reinstalação).")
+}
+
+/// v1.1 (E2): the local line for each device somebody added.
+pub fn device_added_text(name: &str, label: &str) -> String {
+    format!("{name} adicionou um aparelho: {label}")
 }
 
 /// What a call line says.
@@ -410,6 +497,13 @@ impl App {
             return;
         }
         let text = self.dms.input.trim().to_string();
+        // E2: an encrypted conversation never goes out in the clear without asking.
+        if !text.is_empty() || self.images.pending_for(crate::chat_images::Target::Dm(dm)) > 0 {
+            if let Some(q) = self.dm_plain_question(dm) {
+                self.dms.ask_plain = Some((dm, q));
+                return;
+            }
+        }
         if text.chars().count() <= DM_MESSAGE_MAX_CHARS && self.send_with_images(crate::chat_images::Target::Dm(dm), text.clone()) {
             return;
         }
@@ -420,9 +514,61 @@ impl App {
             self.notice = Some(format!("A mensagem passou de {DM_MESSAGE_MAX_CHARS} caracteres."));
             return;
         }
+        let Some(mode) = self.dm_send_mode(dm) else { return };
         self.dms.input.clear();
         let extras = self.take_send_extras(crate::chat_images::Target::Dm(dm), &text);
-        self.backend.send(Cmd::Dm(DmCmd::Send { dm, content: text, reply_to: extras.reply_to }));
+        self.backend.send(Cmd::Dm(DmCmd::Send { dm, content: text, reply_to: extras.reply_to, mode }));
+    }
+
+    /// v1.1 (E2): how a line in `dm` goes out (the backend seals it when it can).
+    pub fn dm_send_mode(&self, dm: DmId) -> Option<SendMode> {
+        let peer = self.dms.conv(dm)?.peer.id;
+        Some(SendMode { peer, plain_ok: self.dms.plain_ok_once == Some(dm) })
+    }
+
+    /// v1.1 (E2): `dm` was end-to-end encrypted (on this computer, or its lines say so).
+    pub fn dm_was_sealed(&self, dm: DmId) -> bool {
+        self.privacy.view.sealed_dms.contains(&dm)
+            || self.dms.logs.get(&dm).is_some_and(|l| l.msgs.iter().any(e2dm::is_e2e))
+            || self.dms.conv(dm).and_then(|c| c.last_message.as_ref()).is_some_and(e2dm::is_e2e)
+    }
+
+    /// v1.1 (E2): the next line of `dm` would go out unencrypted although the conversation was
+    /// encrypted: the question to ask first ("Fulano não tem nenhum aparelho com criptografia.
+    /// Enviar sem criptografia?"). `None` while this computer is still registering (the backend
+    /// waits for the device list and refuses rather than go plain).
+    pub fn dm_plain_question(&self, dm: DmId) -> Option<String> {
+        use crate::backend::e2ee::E2eeStatus;
+        let conv = self.dms.conv(dm)?;
+        let v = &self.privacy.view;
+        if self.dms.plain_ok_once == Some(dm) || v.can_seal_for(conv.peer.id) || v.status == E2eeStatus::Starting || !self.dm_was_sealed(dm) {
+            return None;
+        }
+        let peer_has_one = v.devices_of.get(&conv.peer.id).is_some_and(|d| !d.is_empty());
+        Some(if peer_has_one && v.status != E2eeStatus::Active {
+            "Este computador está sem criptografia agora. Enviar sem criptografia?".to_string()
+        } else {
+            plain_question(conv.peer.shown_name())
+        })
+    }
+
+    /// v1.1 (E2): the backend refused to send in `dm` in the clear (an encrypted conversation it
+    /// cannot encrypt now, or a device list it could not read): ask, as [`Self::dm_plain_question`]
+    /// does before sending. Whether it asked.
+    pub(crate) fn dm_refused_plain(&mut self, dm: DmId, error: &str) -> bool {
+        let Some(name) = self.dms.conv(dm).map(|c| c.peer.shown_name().to_string()) else { return false };
+        let q = if error == e2dm::DIRECTORY_UNKNOWN {
+            unknown_question(&name)
+        } else if error == e2dm::REFUSED_PLAIN {
+            plain_question(&name)
+        } else if error == e2dm::THIS_DEVICE_OFF {
+            "Este computador está sem criptografia agora. Enviar sem criptografia?".to_string()
+        } else {
+            return false;
+        };
+        tracing::info!(dm, "e2ee: asking before sending without encryption");
+        self.dms.ask_plain = Some((dm, q));
+        true
     }
 
     /// Viewer counts ("👁") come from the hub's voice state, which never has a private call: they
@@ -752,7 +898,9 @@ impl App {
                     if self.dms.input.is_empty() && self.dms.selected == Some(dm) {
                         self.dms.input = content;
                     }
-                    self.notice = Some(format!("Mensagem não enviada: {e}"));
+                    if !self.dm_refused_plain(dm, &e) {
+                        self.notice = Some(format!("Mensagem não enviada: {e}"));
+                    }
                 }
             },
             DmEv::Done { cmd, result } => match (cmd, result) {
@@ -1001,6 +1149,12 @@ impl App {
         let opts = icon_button(ui, crate::theme::ph::DOTS_THREE, "Opções", IconState::Normal);
         egui::Popup::menu(&opts).frame(crate::ui_kit::popup_frame(ui.style())).style(crate::ui_kit::menu_style).show(|ui| {
             let pos = ui.min_rect().left_top();
+            // v1.1 (E2): the safety code with this person.
+            let why = (!self.privacy.view.safety.contains_key(&peer.id)).then_some("Disponível quando vocês dois tiverem criptografia neste servidor");
+            if crate::ui_kit::menu_item(ui, crate::theme::ph::SHIELD, SAFETY_TITLE, false, why) {
+                self.dms.safety_for = Some(peer.id);
+            }
+            crate::ui_kit::menu_separator(ui);
             self.person_menu_ui(ui, &peer, Origin::Dm, Lead::None, pos);
         });
         ui.add_space(6.0);
@@ -1032,10 +1186,149 @@ impl App {
         }
     }
 
+    /// v1.1 (E2): "Enviar sem criptografia?" and "Verificar código de segurança".
+    fn e2e_windows(&mut self, ctx: &egui::Context) {
+        use crate::theme::{self, ph, space};
+        use crate::ui_kit::{self, IconState, Kind};
+        if let Some((dm, question)) = self.dms.ask_plain.clone() {
+            let mut answer = None;
+            let was_sealed = self.dm_was_sealed(dm);
+            egui::Window::new("Enviar sem criptografia?")
+                .id(egui::Id::new("dm_ask_plain"))
+                .title_bar(false)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .frame(ui_kit::dialog_frame(&ctx.global_style()))
+                .show(ctx, |ui| {
+                    ui.set_width(ui_kit::dialog_w(ctx, 420.0));
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    ui_kit::dialog_title(ui, &format!("{}  Enviar sem criptografia?", ph::LOCK_SIMPLE_OPEN));
+                    ui.add(egui::Label::new(RichText::new(&question).font(theme::body(13.5)).color(theme::TEXTO)).wrap());
+                    ui_kit::hint(
+                        ui,
+                        if was_sealed {
+                            "Esta conversa era criptografada de ponta a ponta. Sem criptografia, quem hospeda o servidor consegue ler a mensagem."
+                        } else {
+                            "Sem criptografia, quem hospeda o servidor consegue ler a mensagem."
+                        },
+                    );
+                    ui.add_space(space::S);
+                    ui.horizontal(|ui| {
+                        if ui_kit::button(ui, Kind::Danger, Some(ph::LOCK_SIMPLE_OPEN), "Enviar sem criptografia").clicked() {
+                            answer = Some(true);
+                        }
+                        if ui_kit::button(ui, Kind::Secondary, None, "Cancelar").clicked() {
+                            answer = Some(false);
+                        }
+                    });
+                });
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                answer = Some(false);
+            }
+            match answer {
+                Some(true) => {
+                    self.dms.ask_plain = None;
+                    tracing::info!(dm, "e2ee: the person agreed to send without encryption");
+                    self.dms.plain_ok_once = Some(dm);
+                    if self.dms.selected == Some(dm) {
+                        self.send_dm();
+                    }
+                    self.dms.plain_ok_once = None;
+                }
+                Some(false) => self.dms.ask_plain = None,
+                None => {}
+            }
+        }
+        let Some(peer_id) = self.dms.safety_for else { return };
+        let Some(peer) = self.dms.conv_with(peer_id).map(|c| c.peer.clone()) else {
+            self.dms.safety_for = None;
+            return;
+        };
+        let safety = self.privacy.view.safety.get(&peer_id).cloned();
+        let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let mut mark = None;
+        egui::Window::new(SAFETY_TITLE)
+            .id(egui::Id::new("dm_safety_code"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(ui_kit::dialog_frame(&ctx.global_style()))
+            .show(ctx, |ui| {
+                let w = ui_kit::dialog_w(ctx, 440.0);
+                ui.set_width(w);
+                ui.spacing_mut().item_spacing.y = 8.0;
+                ui.horizontal(|ui| {
+                    ui_kit::dialog_title(ui, &format!("{}  {SAFETY_TITLE}", ph::SHIELD));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui_kit::icon_button(ui, ph::X, "Fechar", IconState::Normal).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                let Some(s) = safety else {
+                    ui_kit::hint(ui, format!("{} ainda não tem um aparelho com criptografia neste servidor (ou este computador ainda não tem).", peer.shown_name()));
+                    return;
+                };
+                ui.add(egui::Label::new(RichText::new(safety_text(peer.shown_name())).font(theme::body(13.5)).color(theme::TEXTO)).wrap());
+                ui.add_space(space::S);
+                let groups: Vec<&str> = s.code.split(' ').collect();
+                egui::Frame::new().fill(theme::NOITE).corner_radius(8.0).inner_margin(egui::Margin::symmetric(16, 12)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.vertical_centered(|ui| {
+                        for row in groups.chunks(3) {
+                            ui.label(RichText::new(row.join("   ")).font(egui::FontId::monospace(22.0)).color(theme::GIZ));
+                        }
+                    });
+                });
+                if s.verified {
+                    ui.label(RichText::new(format!("{}  Verificado neste computador", ph::CHECK_CIRCLE)).font(theme::semibold(13.0)).color(theme::ONLINE));
+                } else if s.reverify {
+                    ui_kit::notice_frame(ui_kit::Notice::Warning).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui_kit::notice_text(ui, ui_kit::Notice::Warning, &format!("{REVERIFY}: o código de segurança de {} mudou desde que você verificou.", peer.shown_name()));
+                    });
+                }
+                ui.add_space(space::S);
+                ui.horizontal(|ui| {
+                    if s.verified {
+                        if ui_kit::button(ui, Kind::Secondary, None, UNVERIFY).clicked() {
+                            mark = Some(false);
+                        }
+                    } else if ui_kit::button(ui, Kind::Primary, Some(ph::CHECK), VERIFY).clicked() {
+                        mark = Some(true);
+                    }
+                    if ui_kit::button(ui, Kind::Ghost, None, "Fechar").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if let Some(on) = mark {
+            self.backend.send(Cmd::E2ee(crate::backend::e2ee::E2eeCmd::Verify { user: peer_id, on }));
+        }
+        if close {
+            self.dms.safety_for = None;
+        }
+    }
+
+    /// v1.1 (E2): somebody's keys changed (`E2eeEv::PeerKeys`): the local lines in the
+    /// conversation with them.
+    pub(crate) fn dm_peer_keys(&mut self, user: UserId, added: &[String]) {
+        let name = self.dms.conv_with(user).map(|c| c.peer.shown_name().to_string()).or_else(|| self.online.iter().find(|u| u.id == user).map(|u| u.shown_name().to_string())).unwrap_or_else(|| "Esta pessoa".into());
+        let at = now_ms();
+        let notes = self.dms.notes.entry(user).or_default();
+        notes.push((at, code_changed_text(&name)));
+        for label in added {
+            notes.push((at, device_added_text(&name, label)));
+        }
+    }
+
     /// "Nova mensagem" (the people picker) and the incoming-call prompt, in the kit's frames.
     pub(super) fn dm_windows(&mut self, ctx: &egui::Context) {
         use crate::theme::{self, ph, space};
         use crate::ui_kit::{self, IconState, Kind};
+        self.e2e_windows(ctx);
         if self.dms.picker.open {
             let mut open = !ctx.input(|i| i.key_pressed(egui::Key::Escape));
             let mut pick = None;
@@ -1047,7 +1340,9 @@ impl App {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .frame(ui_kit::dialog_frame(&ctx.global_style()))
                 .show(ctx, |ui| {
-                    ui.set_width(PICKER_W);
+                    // (I6: narrower and shorter in a small or zoomed-in window.)
+                    let picker_w = ui_kit::dialog_w(ctx, PICKER_W);
+                    ui.set_width(picker_w);
                     ui.spacing_mut().item_spacing.y = 6.0;
                     ui.horizontal(|ui| {
                         ui_kit::dialog_title(ui, "Nova mensagem");
@@ -1058,7 +1353,7 @@ impl App {
                         });
                     });
                     ui_kit::hint(ui, "Uma conversa só entre vocês dois. Escolha a pessoa:");
-                    let r = ui.add(ui_kit::field(&mut self.dms.picker.filter).hint_text(format!("{}  Procurar pelo nome", ph::MAGNIFYING_GLASS)).desired_width(PICKER_W));
+                    let r = ui.add(ui_kit::field(&mut self.dms.picker.filter).hint_text(format!("{}  Procurar pelo nome", ph::MAGNIFYING_GLASS)).desired_width(picker_w));
                     if !r.has_focus() && self.dms.picker.filter.is_empty() {
                         r.request_focus();
                     }
@@ -1071,7 +1366,7 @@ impl App {
                     let me = self.my_id();
                     let people: Vec<User> = filter_people(&self.dms.picker.people, &self.dms.picker.filter, me).into_iter().cloned().collect();
                     ui.add_space(space::S);
-                    egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 230.0).clamp(60.0, 320.0)).auto_shrink([false, true]).show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         let typed = !self.dms.picker.filter.trim().is_empty();
                         for (i, u) in people.iter().enumerate() {
@@ -1106,7 +1401,7 @@ impl App {
             .anchor(egui::Align2::CENTER_TOP, [0.0, 60.0])
             .frame(ui_kit::dialog_frame(&ctx.global_style()).inner_margin(egui::Margin { left: 24, right: 24, top: 22, bottom: 20 }))
             .show(ctx, |ui| {
-                ui.set_width(RING_W);
+                ui.set_width(ui_kit::dialog_w(ctx, RING_W));
                 ui.vertical_centered(|ui| {
                     ui.spacing_mut().item_spacing.y = 4.0;
                     ui.label(RichText::new(format!("{}  Chamada recebida", ph::PHONE_INCOMING)).font(theme::semibold(12.5)).color(theme::NEVOA));
@@ -1175,7 +1470,7 @@ mod tests {
     }
 
     fn line(id: DmMessageId, dm: DmId, author: UserId, at: i64) -> DmMessage {
-        DmMessage { id, dm_id: dm, author: User::new(author, format!("u{author}")), content: format!("m{id}"), created_at_ms: at, kind: DmMessageKind::Text, call_secs: 0, attachments: vec![], reply: None, reactions: vec![] }
+        DmMessage { id, dm_id: dm, author: User::new(author, format!("u{author}")), content: format!("m{id}"), created_at_ms: at, kind: DmMessageKind::Text, call_secs: 0, attachments: vec![], reply: None, reactions: vec![], sealed: None, sealed_attachments: vec![] }
     }
 
     const ME: UserId = 1;

@@ -8,7 +8,7 @@
 
 <p align="center">English · <a href="README.pt-BR.md">Português</a></p>
 
-concord is a lightweight, self-hosted, Discord-style app for small groups of friends. It has text channels, voice rooms, cameras and Go Live screen sharing. The server runs on someone's PC in the group, like TeamSpeak, so nothing goes through a company in the middle.
+concord is a lightweight, self-hosted, Discord-style app for small groups of friends. It has text channels, voice rooms, cameras and Go Live screen sharing. The server runs on someone's PC in the group, like TeamSpeak, so nothing goes through a company in the middle. Since v1.1 the connection to the server uses TLS, and direct messages and calls are end-to-end encrypted.
 
 The app is called concord. It was called voxhub until v1.0.0. It is a personal project, independent of Discord.
 
@@ -33,7 +33,7 @@ The interface is in Portuguese (pt-BR). People, servers and conversations in the
 | Windows 11, NVIDIA RTX (NVENC) | Works: voice, cameras, Go Live with app audio, hosting |
 | CPU encoding (no hardware encoder, or acceleration turned off) | Works: tested by forcing the CPU encoder on Windows 11 |
 | Laptops with two GPUs (AMD/Intel + NVIDIA) | Supported, little real-world testing |
-| macOS on Apple Silicon (M1 or later) | Works: chat, voice, watching and sharing (screen, window, app audio, camera). Not yet: menu bar icon, notifications, global push-to-talk, hosting from the app |
+| macOS on Apple Silicon (M1 or later) | Works: chat, voice, watching and sharing (screen, window, app audio, camera), TLS, end-to-end encrypted DMs and calls with Windows users (tested both ways), keyboard shortcuts while concord has focus. Not yet: menu bar icon, notifications, global shortcuts and push-to-talk, hosting from the app |
 | Windows on ARM, Intel Macs, Linux | Not supported yet |
 
 ## Quick start with Claude
@@ -55,11 +55,14 @@ The [CLAUDE.md](CLAUDE.md) file in the root tells Claude how to download or buil
 
 On the [Releases](../../releases) page:
 
-- **`concord-v1.0.2-PUBLICO.zip`** is the Windows app. Extract the folder (don't run it from inside the zip) and open `concord.exe`.
-- **`concord-1.0.2-mac-arm64.zip`** is the Mac app (Apple Silicon, macOS 13 or later). Drag `concord.app` to Applications; `LEIA-ME-MAC.txt` explains the first open and the permissions.
-- **`concord-servidor-v1.0.2.zip`** is the standalone server (optional, see below).
+- **`concord-v1.1.0-PUBLICO.zip`** is the Windows app. Extract the folder (don't run it from inside the zip) and open `concord.exe`.
+- **`concord-1.1.0-mac-arm64.zip`** is the Mac app (Apple Silicon, macOS 13 or later). Drag `concord.app` to Applications; `LEIA-ME-MAC.txt` explains the first open and the permissions.
+- **`concord-servidor-v1.1.0.zip`** is the standalone server (optional, see below).
 
-The executables aren't digitally signed. The first time, Windows may show "Windows protected your PC": choose "More info" and then "Run anyway". Download concord only from this repository or from the person who hosts your group.
+The apps aren't digitally signed. Download concord only from this repository or from the person who hosts your group. The first time:
+
+- **Windows** may show "Windows protected your PC": choose "More info" and then "Run anyway".
+- **macOS** says it can't verify the app. Try to open it once, then go to System Settings → Privacy & Security and click "Open Anyway". Or run `xattr -dr com.apple.quarantine /Applications/concord.app` in Terminal.
 
 ## Host a server
 
@@ -76,12 +79,14 @@ The server stays on while the app is open or in the tray. Whoever creates the se
 
 For a PC that keeps the server running without the app:
 
-1. Download `concord-servidor-v1.0.2.zip` and extract it to a permanent folder.
+1. Download `concord-servidor-v1.1.0.zip` and extract it to a permanent folder.
 2. Run `baixar-livekit.bat`. It downloads LiveKit from its official release and checks the hash.
 3. Run `liberar-firewall.bat` and accept the Windows prompt. It allows the server and LiveKit through Windows Firewall on all networks, for IPv4 and IPv6 (`remover-firewall.bat` undoes it). It's in the server zip from v1.0.2.
 4. Run `iniciar-servidor.bat`. On the first run it creates `data\config.toml`. **Set `server_password`** before you invite anyone, then start it again. From v1.0.2, a few seconds after it starts, the server window shows a connection check (IPv4/IPv6, CGNAT, Windows Firewall) and what to fix.
 5. Open `concord.exe` on the same PC and connect to `127.0.0.1` to become the owner.
 6. Make the server reachable. From v1.0.2 it listens on IPv6 as well as IPv4, so friends who have IPv6 can usually join through this PC's IPv6 address without port forwarding, even behind CGNAT (invites made on the server include it; some routers block incoming IPv6 until you allow it in their IPv6 firewall settings). Otherwise use a VPN (safer), or forward TCP 7890, 7880, 7881 and UDP 7882 to this PC.
+
+To update a 1.0.x server, close it, copy the new `bin\concord-server.exe` over the old one and start it again. Keep the `data\` folder; the old `config.toml` works as it is (without a `tls` line the server uses `tls = "auto"`).
 
 `LEIA-ME-SERVIDOR.txt` inside the zip has the full steps.
 
@@ -94,8 +99,10 @@ Invite codes can expire, have a use limit, and be revoked at any time. A code hi
 
 ## Compatibility and limits
 
-- **No TLS yet:** traffic between the app and the server isn't encrypted, except voice and video. Prefer a VPN to opening ports. See [SECURITY.md](SECURITY.md).
-- **Router and ISP:** if your ISP uses CGNAT, your friends can't reach your PC directly. The app detects this and explains the options; a VPN works in that case, and so does IPv6 with the standalone server from v1.0.2.
+- **TLS (v1.1):** between a 1.1 app and a 1.1 server everything is encrypted. The server makes its own certificate; invites carry its fingerprint, and an address typed by hand is trusted on first use, like SSH. A VPN is still safer than opening ports. See [SECURITY.md](SECURITY.md).
+- **End-to-end encryption (v1.1):** direct messages (text and images) and direct calls are end-to-end encrypted between 1.1 apps; voice rooms are encrypted when an admin turns it on for the room. Text channels get it in 1.2.
+- **Older apps and servers:** 1.0 apps still work on a 1.1 server, without TLS and without entering encrypted rooms (the server can require TLS with `tls = "required"`). TLS, end-to-end encryption and stopping a sound for everyone need the server updated to 1.1.
+- **Router and ISP:** if your ISP uses CGNAT, your friends can't reach your PC directly. The app detects this and explains the options; a VPN works in that case, and so does IPv6.
 - **Encoders:** NVENC, AMD and Intel (through Media Foundation) and a CPU fallback. The app tests each one on first start. If viewers report broken video, it switches automatically.
 - **Go Live audio:** captures audio from the app you share only (Windows 10 2004+ process loopback). Your voice chat isn't captured.
 - **Private channels:** people without access can't read or join them. They can still notice that messages were sent, because message numbers skip.
@@ -116,9 +123,9 @@ Where data is kept:
 
 | What | Where |
 |---|---|
-| Settings, saved servers, encoder test results | `%APPDATA%\concord\` |
-| Servers you host from the app, soundboard cache, logs | `%LOCALAPPDATA%\concord\` |
-| Saved passwords and login tokens | Inside those files, encrypted with Windows DPAPI for your Windows user |
+| Settings, saved servers, encryption keys, encoder test results | `%APPDATA%\concord\` (Mac: `~/Library/Application Support/concord/`) |
+| Servers you host from the app, soundboard cache, logs | `%LOCALAPPDATA%\concord\` (Mac logs: `~/Library/Logs/concord/`) |
+| Saved passwords, login tokens and this computer's encryption key | Windows: inside those files, encrypted with DPAPI for your Windows user. Mac: `secrets.json`, readable only by your Mac user (not the Keychain, since v1.1) |
 | A standalone server's secrets and messages | The server's `data\` folder |
 
 None of these files are part of this repository. Never share a server's `data\` folder.
@@ -163,6 +170,6 @@ Keep IP addresses, passwords, invite codes, logs and `data\` files out of public
 
 ## License
 
-The code is MIT. See [LICENSE](LICENSE). The concord logo is not covered by the MIT license; please don't use it for other projects. Third-party libraries, fonts and icons are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+The code is MIT. See [LICENSE](LICENSE). The concord logo is not covered by the MIT license; please don't use it for other projects. Third-party libraries, fonts and icons are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Colour emoji: [Twemoji](https://github.com/jdecked/twemoji) © Twitter, Inc and other contributors, CC-BY 4.0.
 
 Made by Cezar Callado · cezar.callado@gmail.com

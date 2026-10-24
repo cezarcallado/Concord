@@ -45,7 +45,10 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::audio::device::{new_voice_apm, AudioIo, MicConfig, MicSink, PlaybackConfig};
-use crate::audio::{AlertKind, AudioPrefs, Mixer, NoiseControl, SourceId, UserAudio, VoiceGate, MIX_CHANNELS, MIX_RATE};
+use crate::audio::fake_mic::FakeMics;
+use crate::audio::MicStatus;
+use crate::audio::speaking::{self, Speakers};
+use crate::audio::{AlertKind, AudioPrefs, Mixer, NoiseControl, SoundTag, SourceId, UserAudio, VoiceGate, MIX_CHANNELS, MIX_RATE};
 use crate::audio::sine::SineGenerator;
 use crate::golive::publish::{paced, ProducerThread};
 use crate::golive::camera::{camera_failure_pt, ActiveCamera, CameraOptions, CameraPublication, PreviewFactory};
@@ -70,6 +73,8 @@ pub struct VoiceConfig {
     /// Publish a sine tone of this frequency as the "microphone" instead of a real device
     /// (headless tests; the tone is generated in-process and never played locally).
     pub mic_test_tone: Option<f32>,
+    /// Autotests: made-up microphones instead of the real ones ([`crate::audio::fake_mic`]).
+    pub fake_mics: Option<FakeMics>,
     /// Saved local listening settings by participant identity, applied before any track
     /// subscribes.
     pub user_audio: HashMap<String, UserAudio>,
@@ -81,6 +86,14 @@ pub struct VoiceConfig {
     /// Noise suppression level ("Supressão de ruído"), owned by the caller so the UI can change
     /// it mid-call. `None` = the default level ("IA leve").
     pub noise: Option<Arc<NoiseControl>>,
+    /// v1.1 (T0): the hub's certificate pin, when the hub was reached over TLS. A `wss://` LiveKit
+    /// URL (the hub's own port) is then reached through a local [`crate::tls::Tunnel`] in pinned
+    /// TLS; without it a `wss://` URL is refused (never the SDK's own web-PKI TLS).
+    pub tls_pin: Option<crate::tls::Pin>,
+    /// v1.1 (E1): the room is end-to-end encrypted ([`vox_proto::VoiceJoinResponse::e2ee`]):
+    /// every track we publish is encrypted with our own media key, which only the other people's
+    /// directory devices in the room get ([`crate::media_e2ee`]). `None`: a plain room.
+    pub e2ee: Option<crate::media_e2ee::MediaE2ee>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +101,11 @@ pub enum VoiceEvent {
     Connected { room: String, identity: String, participants: Vec<String> },
     ParticipantJoined { identity: String, name: String },
     ParticipantLeft { identity: String },
-    /// Identities currently speaking (may include ourselves).
+    /// Identities currently speaking, sent whenever the set changes (v1.1: see
+    /// [`crate::audio::speaking`]): remote voices by their decoded level, LiveKit's active
+    /// speakers for people whose audio is not arriving, and whoever has a soundboard sound
+    /// playing. Our own identity is in it only while one of our soundboard sounds plays (our own
+    /// voice is shown from our gate).
     ActiveSpeakers { identities: Vec<String> },
     ShareStarted { identity: String },
     ShareStopped { identity: String },
@@ -113,12 +130,24 @@ pub enum VoiceEvent {
     /// The voice server stopped (or resumed) accepting our microphone: a moderator server-muted
     /// us (item 12). While muted the mic is not published at all; it comes back by itself.
     ServerMuted { muted: bool },
+    /// Our microphone changed: as asked ([`VoiceSession::set_input_device`]) or by itself (the
+    /// chosen one went away or came back).
+    Mic(MicStatus),
+    /// A session that joined without a microphone has one now: it is published and can be
+    /// unmuted, the "no microphone" state is over.
+    MicAvailable,
     /// Our Go Live (`camera == false`) or camera restarted on another encoder because its video
     /// was unstable: keyframe requests without pause on a clean uplink that a viewer confirmed
     /// (it decoded badly while its own network lost nothing), or WebRTC dropping our frames (v0.7).
     /// `label` is Portuguese ("NVIDIA GeForce GTX 1650 (NVENC)", "Processador (sem aceleração)"),
     /// `backend` is "nvenc" / "mf" / "software".
     EncoderSwitched { camera: bool, label: String, backend: String },
+    /// v1.1 (E1, encrypted rooms only): how `identity`'s media decrypts here (our own identity:
+    /// how ours encrypts), sent when it changes. `MissingKey`: "Aguardando a chave de Fulano…";
+    /// `DecryptionFailed`: "Não deu para descriptografar o áudio de Fulano".
+    E2eeState { identity: String, state: crate::media_e2ee::MediaE2eeState },
+    /// v1.1 (E1): `identity` is in the room with this directory device (hex id), first heard now.
+    E2eePeerDevice { identity: String, device_id: String },
 }
 
 /// Budget for `Room::connect` (signal WebSocket + ICE/DTLS). The SDK's own limits add up to 20 s
@@ -209,7 +238,8 @@ pub struct JoinReport {
 /// here. Returns the error to hand to the caller.
 async fn join_failed(step: JoinStep, started: Instant, source: anyhow::Error, url: &str) -> anyhow::Error {
     let elapsed = started.elapsed();
-    let tcp_probe = if step == JoinStep::Media {
+    // Over TLS the URL is the hub's port, so "its port + 1" says nothing about LiveKit's ICE-TCP.
+    let tcp_probe = if step == JoinStep::Media && !url.starts_with("wss:") {
         match probe_tcp(url, 1, SIGNAL_PROBE_TIMEOUT).await {
             Ok(ms) => format!("reachable in {ms} ms"),
             Err(e) => format!("unreachable ({e:#})"),
@@ -419,8 +449,11 @@ struct Inner {
     muted: Arc<AtomicBool>,
     deafened: Arc<AtomicBool>,
     muted_before_deafen: AtomicBool,
-    /// The microphone was wanted but is not available: the session stays muted for good.
+    /// The microphone was wanted but is not available: the session stays muted until one shows
+    /// up ([`publish_late_mic`]).
     mic_unavailable: AtomicBool,
+    /// What a microphone that shows up after the join is published with.
+    mic_late: Mutex<Option<LateMic>>,
     volume: Arc<AtomicU32>,
     mixer: Arc<Mixer>,
     /// No output device was asked for (`VoiceConfig::playback == false`): somebody pulls the mix
@@ -469,6 +502,48 @@ struct Inner {
     viewer_tx: mpsc::UnboundedSender<ViewerNotice>,
     /// Item 12: the microphone while the server does not accept it.
     server_mute: ServerMute,
+    /// Who is speaking (v1.1): sends [`VoiceEvent::ActiveSpeakers`] when it changes.
+    speakers: Arc<Speakers>,
+    /// v1.1 (E1): the key exchange of an encrypted room (`None`: a plain room, or left).
+    e2ee: Mutex<Option<crate::media_e2ee::Engine>>,
+    /// Its messages, sent in order by one task.
+    e2ee_tx: Option<mpsc::UnboundedSender<(Vec<String>, Vec<u8>)>>,
+    /// The key index our own cryptors use (checked against new publications).
+    e2ee_index: std::sync::atomic::AtomicU8,
+    e2ee_tick: Mutex<Option<JoinHandle<()>>>,
+    /// The SFU's active speakers (another person) arrived in this encrypted room (logged once).
+    e2ee_sfu_speakers: AtomicBool,
+}
+
+/// Takes still frames of a session's running Go Live (v1.1 hover pictures); it does not keep the
+/// session alive.
+#[derive(Clone)]
+pub struct ShareSnapshots(std::sync::Weak<Inner>);
+
+impl ShareSnapshots {
+    /// One frame of the running share, taken from the capture's preview tap (no second capture),
+    /// within `timeout`. `None` when the session is gone, nothing with a picture is shared, or no
+    /// frame came (the tap's settings are put back then).
+    pub async fn take(&self, timeout: Duration) -> Option<crate::golive::thumbnail::Nv12Image> {
+        let p = {
+            let inner = self.0.upgrade()?;
+            // (The share's lock is not held while waiting: stopping or switching never waits here.)
+            let slot = inner.share.lock().await;
+            slot.active.as_ref()?.preview_handle()?
+        };
+        p.request_snapshot();
+        let until = Instant::now() + timeout;
+        loop {
+            if let Some(f) = p.take_snapshot() {
+                return Some(f);
+            }
+            if Instant::now() >= until {
+                p.cancel_snapshot();
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    }
 }
 
 /// A joined voice channel. Call [`VoiceSession::leave`] to disconnect cleanly.
@@ -476,6 +551,9 @@ pub struct VoiceSession {
     inner: Arc<Inner>,
     event_task: JoinHandle<()>,
     report: JoinReport,
+    /// v1.1 (T0): the local pinned-TLS tunnel to the hub's port, for the whole session (the SDK
+    /// reconnects through it); closed with the session.
+    _tunnel: Option<crate::tls::Tunnel>,
 }
 
 /// Which of one participant's microphone publications (`sids`) to play: the one already picked
@@ -501,9 +579,32 @@ impl VoiceSession {
     /// Every step is logged with its timing, and a failure logs the full error chain.
     pub async fn connect(url: &str, token: &str, cfg: VoiceConfig) -> Result<(VoiceSession, mpsc::UnboundedReceiver<VoiceEvent>)> {
         let t0 = Instant::now();
-        info!(url, mic = cfg.mic, playback = cfg.playback, "voice join: start");
+        info!(url, mic = cfg.mic, playback = cfg.playback, tls = cfg.tls_pin.is_some(), "voice join: start");
 
-        // ---- step 1: can we even reach the signal port?
+        // ---- step 0 (v1.1): over TLS the signalling goes through the hub's port, in pinned TLS
+        // from a local tunnel the SDK talks plain WebSocket to.
+        // Audit (T0): a session pinned to the hub's certificate never sends its LiveKit token in
+        // the clear: a `ws://` (or any other) URL from the hub is refused before any connection
+        // (rule 5, "once there is a pin, never plain"). A `wss://` one goes only through the
+        // pinned tunnel, so whatever host it names, only the hub's certificate can answer it.
+        let scheme = url::Url::parse(url).map(|u| u.scheme().to_string()).unwrap_or_default();
+        if cfg.tls_pin.is_some() && scheme != "wss" {
+            return Err(join_failed(JoinStep::Signal, t0, anyhow!("the hub is reached over TLS but gave a voice server URL that is not wss:// ({scheme}): refused, the voice token is not sent in the clear"), url).await);
+        }
+        let tunnel = if scheme == "wss" {
+            let Some(pin) = cfg.tls_pin else {
+                return Err(join_failed(JoinStep::Signal, t0, anyhow!("a wss:// voice server needs the hub's certificate pin"), url).await);
+            };
+            match crate::tls::Tunnel::open(url, pin).await {
+                Ok(t) => Some(t),
+                Err(e) => return Err(join_failed(JoinStep::Signal, t0, e, url).await),
+            }
+        } else {
+            None
+        };
+        let sdk_url = tunnel.as_ref().map_or_else(|| url.to_string(), |t| t.url());
+
+        // ---- step 1: can we even reach the signal port? (The real one: the hub's, over TLS.)
         let signal_ms = match probe_tcp(url, 0, SIGNAL_PROBE_TIMEOUT).await {
             Ok(ms) => {
                 info!(signal_ms = ms, "voice join: signal port reachable (tcp)");
@@ -514,13 +615,31 @@ impl VoiceSession {
 
         // ---- step 2: signal WebSocket + ICE/DTLS, in a task so a native stall cannot block us
         let mut options = RoomOptions::default();
+        // v1.1 (E1): frame encryption with per-sender keys. The deprecated `e2ee` field on purpose:
+        // `encryption` would also encrypt the data channel under one global key index (which our
+        // per-sender keys overwrite), breaking the key exchange and rx-health on it. Data packets
+        // stay as they are; media is AES-GCM per sender, keys from `media_e2ee`.
+        if cfg.e2ee.is_some() {
+            let key_provider = livekit::e2ee::key_provider::KeyProvider::new(livekit::e2ee::key_provider::KeyProviderOptions {
+                // Random keys: ratcheting forward can never find a working one.
+                ratchet_window_size: 0,
+                ratchet_salt: vox_e2ee::media::RATCHET_SALT.to_vec(),
+                failure_tolerance: -1,
+                key_ring_size: vox_e2ee::media::KEY_RING as i32,
+                key_derivation_algorithm: livekit::e2ee::key_provider::KeyDerivationAlgorithm::HKDF,
+            });
+            #[allow(deprecated)]
+            {
+                options.e2ee = Some(livekit::e2ee::E2eeOptions { encryption_type: livekit::e2ee::EncryptionType::Gcm, key_provider });
+            }
+        }
         options.auto_subscribe = false;
         options.adaptive_stream = false;
         options.dynacast = false;
         // No SDK-internal retries: they would hide the real error behind a longer wait. The user
         // gets a retry button instead.
         options.join_retries = 0;
-        let (u, t) = (url.to_string(), token.to_string());
+        let (u, t) = (sdk_url, token.to_string());
         let mut task = AbortOnDrop(tokio::spawn(async move { Room::connect(&u, &t, options).await }));
         let connected = match tokio::time::timeout(CONNECT_TIMEOUT, &mut task.0).await {
             Ok(Ok(Ok(c))) => c,
@@ -540,7 +659,7 @@ impl VoiceSession {
         let room_ms = t0.elapsed().as_millis() as u64;
         let identity = room.local_participant().identity().0.clone();
         let room_name = room.name();
-        info!(room = %room_name, identity = %identity, url, signal_ms, room_ms, "voice join: room connected");
+        info!(room = %room_name, identity = %identity, url, signal_ms, room_ms, e2ee = cfg.e2ee.is_some(), "voice join: room connected");
 
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let (viewer_tx, viewer_rx) = mpsc::unbounded_channel();
@@ -550,6 +669,19 @@ impl VoiceSession {
             prefs.set_user_audio(who, a.sanitized());
         }
         prefs.set_others_muted(cfg.others_muted);
+        let speakers = {
+            let tx = ev_tx.clone();
+            Speakers::new(&identity, move |identities| {
+                let _ = tx.send(VoiceEvent::ActiveSpeakers { identities });
+            })
+        };
+        let (e2ee_send, e2ee_recv) = match cfg.e2ee {
+            Some(_) => {
+                let (t, r) = mpsc::unbounded_channel();
+                (Some(t), Some(r))
+            }
+            None => (None, None),
+        };
         let inner = Arc::new(Inner {
             room,
             identity: identity.clone(),
@@ -557,6 +689,7 @@ impl VoiceSession {
             deafened: Arc::new(AtomicBool::new(false)),
             muted_before_deafen: AtomicBool::new(false),
             mic_unavailable: AtomicBool::new(false),
+            mic_late: Mutex::new(None),
             volume: Arc::new(AtomicU32::new(cfg.output_volume.unwrap_or(1.0).clamp(0.0, 2.0).to_bits())),
             mixer: mixer.clone(),
             headless: !cfg.playback,
@@ -584,9 +717,18 @@ impl VoiceSession {
             remote_cams: Mutex::new(HashMap::new()),
             cams_live: Mutex::new(HashSet::new()),
             events: ev_tx,
+            speakers,
             viewer_tx,
             server_mute: ServerMute::default(),
+            e2ee: Mutex::new(cfg.e2ee.as_ref().map(|c| crate::media_e2ee::Engine::new(&room_name, &identity, c))),
+            e2ee_tx: e2ee_send,
+            e2ee_index: std::sync::atomic::AtomicU8::new(0),
+            e2ee_tick: Mutex::new(None),
+            e2ee_sfu_speakers: AtomicBool::new(false),
         });
+        // v1.1 (E1): my first media key (index 0, where new sender cryptors start) before anything
+        // is published, and a Hello to everybody present.
+        start_e2ee(&inner, e2ee_recv);
         // From here on, dropping the in-flight join (the user cancelled) closes the room instead of
         // leaving a ghost participant behind.
         let mut guard = CloseOnDrop(Some(inner.clone()));
@@ -603,6 +745,7 @@ impl VoiceSession {
         // (see audio::device) with the playback mix as far-end reference.
         let mic_source = cfg.mic.then(|| NativeAudioSource::new(AudioSourceOptions::default(), MIX_RATE, 1, 0));
         let counters = Arc::new(StreamCounters::default());
+        let (mic_status_tx, mic_status_rx) = mpsc::unbounded_channel::<MicStatus>();
         let mic_cfg = match (&mic_source, cfg.mic_test_tone) {
             (Some(src), None) => Some(MicConfig {
                 device: cfg.input_device.clone(),
@@ -612,6 +755,11 @@ impl VoiceSession {
                 counters: counters.clone(),
                 gate: inner.gate.clone(),
                 noise: noise.clone(),
+                fall_back: true,
+                on_status: Some(Arc::new(move |s| {
+                    let _ = mic_status_tx.send(s);
+                })),
+                fake: cfg.fake_mics.clone(),
             }),
             _ => None,
         };
@@ -720,9 +868,13 @@ impl VoiceSession {
             }
         }
         if report.mic_error.is_some() {
-            // Listen-only: stay muted so the others see the truth.
+            // Listen-only: stay muted so the others see the truth. The audio thread keeps looking
+            // for a microphone; one that opens is published then.
             inner.mic_unavailable.store(true, Ordering::Relaxed);
             inner.muted.store(true, Ordering::Relaxed);
+            if let Some(source) = mic_source.clone() {
+                *inner.mic_late.lock() = Some(LateMic { source, counters: counters.clone(), start_muted: cfg.start_muted });
+            }
         }
         *inner.audio_io.lock() = io;
         report.total = t0.elapsed();
@@ -746,10 +898,10 @@ impl VoiceSession {
         }
         let _ = inner.events.send(VoiceEvent::Connected { room: room_name, identity, participants });
 
-        let event_task = tokio::spawn(run_events(inner.clone(), room_rx, viewer_rx));
+        let event_task = tokio::spawn(run_events(inner.clone(), room_rx, viewer_rx, mic_status_rx));
         *inner.rx_health.lock() = Some(tokio::spawn(rx_health_guard(Arc::downgrade(&inner))));
         guard.0 = None; // the session owns the room now
-        Ok((VoiceSession { inner, event_task, report }, ev_rx))
+        Ok((VoiceSession { inner, event_task, report, _tunnel: tunnel }, ev_rx))
     }
 
     /// What happened to the optional parts of the join (mic, speakers).
@@ -763,6 +915,11 @@ impl VoiceSession {
 
     pub fn room_name(&self) -> String {
         self.inner.room.name()
+    }
+
+    /// v1.1 (E1): this session's media is end-to-end encrypted.
+    pub fn is_e2ee(&self) -> bool {
+        self.inner.e2ee_tx.is_some()
     }
 
     pub fn is_muted(&self) -> bool {
@@ -794,6 +951,15 @@ impl VoiceSession {
         self.inner.mic.lock().is_some()
     }
 
+    /// Capture from another microphone from now on (`None`: the system default): the old one
+    /// stops at once and the track goes on, nobody has to rejoin. Does not wait for the device;
+    /// the outcome comes as [`VoiceEvent::Mic`].
+    pub fn set_input_device(&self, device: Option<String>) {
+        if let Some(io) = self.inner.audio_io.lock().as_ref() {
+            io.set_mic_device(device);
+        }
+    }
+
     /// Mute stops sending immediately (callback early-outs) but keeps the device open.
     pub fn set_muted(&self, muted: bool) {
         self.inner.set_muted(muted);
@@ -815,6 +981,8 @@ impl VoiceSession {
         for sub in inner.remote_audio.lock().values() {
             sub.publication.set_enabled(!deafened);
         }
+        // The paused tracks no longer tell who speaks: LiveKit's speakers do meanwhile.
+        inner.speakers.set_deafened(deafened);
         info!(deafened, "deafen toggled");
     }
 
@@ -894,10 +1062,50 @@ impl VoiceSession {
     /// false when the clip was not queued: deafened, no open output device, or too many clips at
     /// once.
     pub fn play_sound(&self, clip: &crate::soundboard::SoundPcm) -> bool {
+        self.play_sound_by(clip, crate::audio::NO_TAG)
+    }
+
+    /// [`VoiceSession::play_sound`] for a sound `by` played (their user id), so
+    /// [`VoiceSession::stop_sounds`] can stop it.
+    pub fn play_sound_by(&self, clip: &crate::soundboard::SoundPcm, by: SoundTag) -> bool {
         if self.is_deafened() || !(self.has_playback() || self.inner.headless) {
             return false;
         }
-        self.inner.mixer.play_sound(clip.samples.clone(), clip.channels)
+        self.inner.mixer.play_sound_by(clip.samples.clone(), clip.channels, by)
+    }
+
+    /// Stop (5 ms fade) the soundboard clips `by` played, or all of them (`None`). Returns how
+    /// many were playing.
+    pub fn stop_sounds(&self, by: Option<SoundTag>) -> usize {
+        self.inner.mixer.stop_sounds(by)
+    }
+
+    /// Stop (5 ms fade) only the newest playing copy of `clip` that `by` started (a play the hub
+    /// refused; an older sound of theirs goes on). Returns whether one was playing.
+    pub fn stop_clip(&self, clip: &crate::soundboard::SoundPcm, by: SoundTag) -> bool {
+        self.inner.mixer.stop_clip(&clip.samples, by)
+    }
+
+    /// How much longer the soundboard clips `by` started play here (`None`: none is playing).
+    pub fn sound_left(&self, by: SoundTag) -> Option<std::time::Duration> {
+        self.inner.mixer.sound_left(by)
+    }
+
+    /// Stop the local previews ("Ouvir só aqui") still playing.
+    pub fn stop_previews(&self) -> usize {
+        self.inner.mixer.stop_previews()
+    }
+
+    /// The soundboard part of the speaking set: `identity` played a sound lasting `length`
+    /// (`None`: it was stopped). They count as speaking until then, whether or not this app
+    /// plays the clip (muted soundboard, deafened): everyone else in the room hears it.
+    pub fn sound_speaking(&self, identity: &str, length: Option<std::time::Duration>) {
+        self.inner.speakers.sound(identity, length);
+    }
+
+    /// The speaking set as last sent.
+    pub fn speaking(&self) -> Vec<String> {
+        self.inner.speakers.current()
     }
 
     /// Hear a clip locally without the room (the "preview" button): like an alert it is not
@@ -906,7 +1114,7 @@ impl VoiceSession {
         if !(self.has_playback() || self.inner.headless) {
             return false;
         }
-        self.inner.mixer.play_ui(clip.to_stereo(), gain)
+        self.inner.mixer.play_preview(clip.to_stereo(), gain)
     }
 
     /// The soundboard's volume (1.0 = the clip's own level) and personal mute; changes apply to
@@ -934,6 +1142,12 @@ impl VoiceSession {
     /// Video path of the running share (pre-encoded or raw + software encoder).
     pub async fn share_path(&self) -> Option<VideoPath> {
         self.inner.share.lock().await.active.as_ref().and_then(|s| s.path)
+    }
+
+    /// Snapshots of the running share for its hover picture (v1.1), usable from another task
+    /// for as long as this session lives (see [`ShareSnapshots`]).
+    pub fn share_snapshots(&self) -> ShareSnapshots {
+        ShareSnapshots(Arc::downgrade(&self.inner))
     }
 
     /// The running share has an audio capture going.
@@ -980,6 +1194,11 @@ impl VoiceSession {
 
     /// Start Go Live (replaces a running share).
     pub async fn start_share(&self, source: ShareSource, opts: ShareOptions) -> Result<()> {
+        // Unattended tests never capture the person's screen, windows or sound (fails loudly).
+        if let Some(why) = crate::golive::publish::test_capture_refusal(&source, opts.audio_pid) {
+            tracing::error!("{why}");
+            bail!(why);
+        }
         let mut slot = self.inner.share.lock().await;
         let reuse = match slot.active.take() {
             Some(old) => Some(old.stop()),
@@ -1008,6 +1227,10 @@ impl VoiceSession {
     /// publication, hub `streaming` untouched). On failure the old source keeps streaming when it
     /// is still alive; the error is Portuguese, ready to show. `Err` also when not sharing.
     pub async fn switch_share(&self, req: SwitchRequest) -> Result<SwitchReport> {
+        if let Some(why) = crate::golive::publish::test_capture_refusal(&req.source, req.audio_pid) {
+            tracing::error!("{why}");
+            bail!(why);
+        }
         let mut slot = self.inner.share.lock().await;
         let Some(share) = slot.active.as_mut() else {
             bail!("Você não está transmitindo.");
@@ -1409,6 +1632,11 @@ impl VoiceSession {
         if let Some(t) = inner.rx_health.lock().take() {
             t.abort();
         }
+        if let Some(t) = inner.e2ee_tick.lock().take() {
+            t.abort();
+        }
+        // Our media keys (and what we knew of the others') are wiped.
+        inner.e2ee.lock().take();
         inner.mic_tone.lock().take();
         {
             let mut slot = inner.share.lock().await;
@@ -1625,9 +1853,11 @@ impl Inner {
     /// Open the tile of our own Go Live preview (native viewer only) and make its sink: the
     /// share's capture feeds it small frames while the app asks for them.
     fn open_share_preview(&self) -> Option<SharePreview> {
+        // Without the native viewer there is no tile, but the tap still gives the hover picture
+        // its snapshots (v1.1): frames for the tile go nowhere then.
         let stream = match Viewer::get() {
             Ok(v) if v.is_native() => v.open_tile(SELF_SHARE_KEY, TileStyle { mirror: false, fill: false }, self.viewer_tx.clone()),
-            _ => return None,
+            _ => ViewerStream::null(),
         };
         Some(SharePreview::new(stream, self.share_preview_counters.clone(), *self.share_preview_cfg.lock()))
     }
@@ -1815,9 +2045,28 @@ impl Inner {
                 let c = counters.clone();
                 // (`MIX_CHANNELS` = 2: the shared sound keeps its stereo image, so measure it.)
                 let stereo = source == TrackSource::ScreenshareAudio;
+                // A microphone also tells who is speaking, from what is decoded (v1.1).
+                let mut level = (source == TrackSource::Microphone).then(|| self.speakers.add_track(&identity));
                 let task = tokio::spawn(async move {
-                    while let Some(frame) = stream.next().await {
+                    loop {
+                        // Only while someone speaks is the wait bounded: audio that stops coming
+                        // (paused track, network) must not leave the ring on.
+                        let next = match level.as_mut() {
+                            Some(l) if l.speaking() => match tokio::time::timeout(speaking::STALL, stream.next()).await {
+                                Ok(f) => f,
+                                Err(_) => {
+                                    l.stalled();
+                                    continue;
+                                }
+                            },
+                            _ => stream.next().await,
+                        };
+                        let Some(frame) = next else { break };
                         mixer.push(id, &frame.data);
+                        if let Some(l) = level.as_mut() {
+                            let ms = (frame.samples_per_channel * 1000 / frame.sample_rate.max(1)).max(1);
+                            l.frame(&frame.data, ms);
+                        }
                         if stereo {
                             c.audio_stereo(&frame.data);
                         } else {
@@ -2253,6 +2502,7 @@ async fn run_events(
     inner: Arc<Inner>,
     mut room_rx: mpsc::UnboundedReceiver<RoomEvent>,
     mut viewer_rx: mpsc::UnboundedReceiver<ViewerNotice>,
+    mut mic_rx: mpsc::UnboundedReceiver<MicStatus>,
 ) {
     loop {
         tokio::select! {
@@ -2270,6 +2520,14 @@ async fn run_events(
                     inner.unwatch(&key, "viewer window closed");
                 }
             }
+            // (Without a microphone the sender is gone and this branch sits out.)
+            Some(status) = mic_rx.recv() => {
+                info!(?status, "microphone");
+                if status != MicStatus::Lost && inner.mic_late.lock().is_some() {
+                    tokio::spawn(publish_late_mic(inner.clone()));
+                }
+                let _ = inner.events.send(VoiceEvent::Mic(status));
+            }
         }
     }
 }
@@ -2282,6 +2540,10 @@ fn handle_room_event(inner: &Inner, ev: RoomEvent) -> bool {
     match ev {
         RoomEvent::ParticipantConnected(p) => {
             info!(identity = %ident(&p), "participant joined");
+            inner.e2ee_input(|e, _| {
+                e.connected(&ident(&p));
+                Vec::new()
+            });
             emit(VoiceEvent::ParticipantJoined { identity: ident(&p), name: p.name() });
         }
         RoomEvent::ParticipantDisconnected(p) => {
@@ -2292,6 +2554,11 @@ fn handle_room_event(inner: &Inner, ev: RoomEvent) -> bool {
             if inner.audio_only.lock().remove(&identity) {
                 emit(VoiceEvent::ShareKind { identity: identity.clone(), audio_only: false });
             }
+            inner.speakers.participant_left(&identity);
+            inner.e2ee_input(|e, now| {
+                e.left(&identity, now);
+                Vec::new()
+            });
             emit(VoiceEvent::ParticipantLeft { identity });
         }
         RoomEvent::TrackPublished { publication, participant } => {
@@ -2352,6 +2619,12 @@ fn handle_room_event(inner: &Inner, ev: RoomEvent) -> bool {
             }
             emit(VoiceEvent::ShareStarted { identity: ident(&p) });
         }
+        RoomEvent::DataReceived { participant: Some(p), topic, .. } if topic.as_deref() == Some(encoders::RX_HEALTH_TOPIC) && inner.e2ee_tx.is_some() && !inner.e2ee_keyed(&ident(&p)) => {
+            // v1.1 (E1): in an encrypted room only somebody who gets our keys can judge how our
+            // video decodes; a participant without them (an app that joined without encryption,
+            // one that never said Hello) decodes nothing and must not push our encoder down.
+            debug!(viewer = %ident(&p), "decode-health report from a participant without our keys ignored");
+        }
         RoomEvent::DataReceived { payload, topic, participant: Some(p), .. } if topic.as_deref() == Some(encoders::RX_HEALTH_TOPIC) => {
             match encoders::RxHealthReport::from_payload(&payload) {
                 Some(r) => {
@@ -2361,9 +2634,42 @@ fn handle_room_event(inner: &Inner, ev: RoomEvent) -> bool {
                 None => debug!(viewer = %ident(&p), bytes = payload.len(), "unreadable decode-health report ignored"),
             }
         }
+        RoomEvent::DataReceived { payload, topic, participant: Some(p), .. } if topic.as_deref() == Some(vox_e2ee::media::TOPIC) => {
+            inner.e2ee_input(|e, now| e.packet(&ident(&p), &payload, now));
+        }
+        RoomEvent::E2eeStateChanged { participant, state } => {
+            if let Some(s) = crate::media_e2ee::MediaE2eeState::from_livekit(state) {
+                let who = participant.identity().0.clone();
+                inner.e2ee_input(|e, now| e.state(&who, s, now));
+            }
+        }
+        RoomEvent::LocalTrackPublished { publication, .. } => {
+            // v1.1 (E1, audit): in an encrypted room every track of ours goes out through a sender
+            // cryptor (made by the SDK inside the publish). One without is taken down at once
+            // rather than left sending in the clear.
+            if inner.e2ee_tx.is_some() {
+                let sid = publication.sid();
+                let encrypted = inner.room.e2ee_manager().frame_cryptors().keys().any(|(who, s)| who.0 == inner.identity && *s == sid);
+                if !encrypted {
+                    warn!(%sid, "e2ee: our new track has no frame cryptor: unpublished");
+                    let local = inner.room.local_participant();
+                    tokio::spawn(async move {
+                        let _ = local.unpublish_track(&sid).await;
+                    });
+                }
+            }
+            // A new sender cryptor starts at index 0: it gets ours.
+            inner.e2ee_input(|e, _| e.local_published());
+        }
         RoomEvent::ActiveSpeakersChanged { speakers } => {
-            let identities = speakers.iter().map(|p| p.identity().0.clone()).collect();
-            emit(VoiceEvent::ActiveSpeakers { identities });
+            // Merged with the decoded levels and the soundboard; sent only when the set changes.
+            // v1.1 (E1): the SFU's own list comes from the audio-level header extension, outside
+            // the encrypted payload, so it keeps coming in an encrypted room (noted once, for the
+            // e2v gate).
+            if inner.e2ee_tx.is_some() && speakers.iter().any(|p| p.identity().0 != inner.identity) && !inner.e2ee_sfu_speakers.swap(true, Ordering::Relaxed) {
+                info!(count = speakers.len(), "e2ee: the SFU's active speakers arrive in this encrypted room");
+            }
+            inner.speakers.set_active(speakers.iter().map(|p| p.identity().0.clone()));
         }
         RoomEvent::Connected { participants_with_tracks } => {
             for (p, pubs) in participants_with_tracks {
@@ -2402,6 +2708,114 @@ fn handle_room_event(inner: &Inner, ev: RoomEvent) -> bool {
         _ => {}
     }
     true
+}
+
+// ---------------------------------------------------------------- end-to-end encryption (v1.1 E1)
+
+impl Inner {
+    /// Feed the key exchange (nothing in a plain room) and carry out what it decides.
+    fn e2ee_input(&self, f: impl FnOnce(&mut crate::media_e2ee::Engine, Instant) -> Vec<crate::media_e2ee::Action>) {
+        let actions = match self.e2ee.lock().as_mut() {
+            Some(e) => f(e, Instant::now()),
+            None => return,
+        };
+        self.e2ee_apply(actions);
+    }
+
+    fn e2ee_apply(&self, actions: Vec<crate::media_e2ee::Action>) {
+        use crate::media_e2ee::Action;
+        for a in actions {
+            match a {
+                Action::Send { to, payload } => {
+                    if let Some(tx) = &self.e2ee_tx {
+                        let _ = tx.send((to, payload));
+                    }
+                }
+                Action::SetKey { identity, idx, key } => match self.room.e2ee_manager().key_provider() {
+                    Some(kp) => {
+                        kp.set_key(&ParticipantIdentity(identity), idx as i32, key.0.to_vec());
+                    }
+                    None => warn!("e2ee: the room has no key provider"),
+                },
+                Action::UseIndex(idx) => {
+                    self.e2ee_index.store(idx, Ordering::Relaxed);
+                    self.e2ee_enforce_index();
+                }
+                Action::Event(e) => {
+                    let _ = self.events.send(e);
+                }
+            }
+        }
+    }
+
+    /// v1.1 (E1): `who` gets our media keys ([`crate::media_e2ee::Engine::keyed`]).
+    fn e2ee_keyed(&self, who: &str) -> bool {
+        self.e2ee.lock().as_ref().is_some_and(|e| e.keyed(who))
+    }
+
+    /// Every one of our sender cryptors on the current key index (LiveKit starts new ones at 0).
+    fn e2ee_enforce_index(&self) {
+        let idx = self.e2ee_index.load(Ordering::Relaxed) as i32;
+        // New sender cryptors start on it too (made inside the publish, before its first frame:
+        // index 0 may still hold an old key of ours that somebody who left has).
+        self.room.e2ee_manager().set_sender_key_index(idx);
+        // Test hook (`VOX_TEST_E2EE_RX_PLAIN=1`, background test mode only): this app's receivers
+        // stop decrypting, so a gate can prove that what arrives is really encrypted (nothing of
+        // it decodes then).
+        let rx_plain = crate::testmode::background() && std::env::var("VOX_TEST_E2EE_RX_PLAIN").is_ok_and(|v| v == "1");
+        for ((who, sid), c) in self.room.e2ee_manager().frame_cryptors() {
+            if rx_plain && who.0 != self.identity && c.enabled() {
+                c.set_enabled(false);
+                warn!(%sid, who = %who.0, "test hook: receiver cryptor disabled (VOX_TEST_E2EE_RX_PLAIN)");
+            }
+            if who.0 == self.identity && c.key_index() != idx {
+                c.set_key_index(idx);
+                debug!(%sid, idx, "e2ee: sender cryptor moved to the current key index");
+            }
+        }
+    }
+}
+
+/// v1.1 (E1): start the key exchange of an encrypted room (`rx`: its outgoing messages; `None` in
+/// a plain room): my first key and the Hello, then the sender and the timers.
+fn start_e2ee(inner: &Arc<Inner>, rx: Option<mpsc::UnboundedReceiver<(Vec<String>, Vec<u8>)>>) {
+    let Some(mut rx) = rx else { return };
+    let weak = Arc::downgrade(inner);
+    // One task sends them all, in order (a key before the switch that needs it).
+    tokio::spawn(async move {
+        while let Some((to, payload)) = rx.recv().await {
+            let Some(inner) = weak.upgrade() else { return };
+            let local = inner.room.local_participant();
+            drop(inner);
+            let packet = DataPacket {
+                payload,
+                topic: Some(vox_e2ee::media::TOPIC.to_string()),
+                reliable: true,
+                destination_identities: to.iter().map(|t| ParticipantIdentity(t.clone())).collect(),
+            };
+            if let Err(e) = local.publish_data(packet).await {
+                warn!(?to, error = %e, "e2ee: key exchange message not sent");
+            }
+        }
+    });
+    let present: Vec<String> = inner.room.remote_participants().keys().map(|k| k.0.clone()).collect();
+    inner.e2ee_input(|e, now| e.start(&present, now));
+    let weak = Arc::downgrade(inner);
+    *inner.e2ee_tick.lock() = Some(tokio::spawn(async move {
+        let mut n = 0u32;
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let Some(inner) = weak.upgrade() else { return };
+            if inner.e2ee.lock().is_none() {
+                return;
+            }
+            inner.e2ee_input(|e, now| e.tick(now));
+            n = n.wrapping_add(1);
+            if n % 5 == 0 {
+                inner.e2ee_enforce_index();
+            }
+        }
+    }));
 }
 
 // ---------------------------------------------------------------- server mute (item 12)
@@ -2443,6 +2857,51 @@ impl ServerMute {
         *self.held.lock() = Some((track, counters));
         self.on.store(true, Ordering::Relaxed);
     }
+}
+
+/// A session that joined without a microphone: what publishing one takes.
+struct LateMic {
+    source: NativeAudioSource,
+    counters: Arc<StreamCounters>,
+    start_muted: bool,
+}
+
+/// A microphone opened in a session that joined without one: publish it, the way the join would
+/// have, and lift the "no microphone" state. (A failed publish stays listen-only until the next
+/// time the microphone changes.)
+async fn publish_late_mic(inner: Arc<Inner>) {
+    let _one = inner.server_mute.busy.lock().await;
+    let Some(late) = inner.mic_late.lock().take() else { return };
+    let track = LocalAudioTrack::create_audio_track("microphone", RtcAudioSource::Native(late.source.clone()));
+    let local = inner.room.local_participant();
+    let keep_muted = late.start_muted || inner.deafened.load(Ordering::Relaxed);
+    if mic_allowed(&local) {
+        let publishing = local.publish_track(LocalTrack::Audio(track.clone()), mic_publish_options());
+        let publication = match tokio::time::timeout(PUBLISH_TIMEOUT, publishing).await {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                warn!(error = %e, "could not publish the microphone that showed up");
+                *inner.mic_late.lock() = Some(late);
+                return;
+            }
+            Err(_) => {
+                warn!("the microphone that showed up: publish got no answer");
+                *inner.mic_late.lock() = Some(late);
+                return;
+            }
+        };
+        if keep_muted {
+            publication.mute();
+        }
+        *inner.mic.lock() = Some(MicPublished { publication, track, counters: late.counters });
+    } else {
+        inner.server_mute.hold(track, late.counters);
+    }
+    inner.muted_before_deafen.store(late.start_muted, Ordering::Relaxed);
+    inner.muted.store(keep_muted, Ordering::Relaxed);
+    inner.mic_unavailable.store(false, Ordering::Relaxed);
+    info!("microphone published after the join");
+    let _ = inner.events.send(VoiceEvent::MicAvailable);
 }
 
 /// Our LiveKit permission changed: follow what it says about the microphone. Taken away, the
@@ -2497,6 +2956,33 @@ async fn apply_mic_permission(inner: Arc<Inner>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit (T0): a session pinned to the hub never sends its LiveKit token in the clear: a
+    /// `ws://` URL (here pointing at a listener that would see it) is refused before any
+    /// connection, and a `wss://` one without a pin is refused too.
+    #[test]
+    fn a_pinned_session_never_sends_the_voice_token_in_the_clear() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            for url in [format!("ws://127.0.0.1:{port}"), format!("WS://127.0.0.1:{port}"), format!("http://127.0.0.1:{port}")] {
+                let cfg = VoiceConfig { tls_pin: Some([7u8; 32]), ..Default::default() };
+                let err = match VoiceSession::connect(&url, "the-livekit-token", cfg).await {
+                    Ok(_) => panic!("{url}: joined in the clear"),
+                    Err(e) => format!("{e:#}"),
+                };
+                assert!(err.contains("not wss://"), "{url}: {err}");
+            }
+            let err = match VoiceSession::connect(&format!("wss://127.0.0.1:{port}"), "the-livekit-token", VoiceConfig::default()).await {
+                Ok(_) => panic!("wss without a pin"),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(err.contains("certificate pin"), "{err}");
+            let nobody = tokio::time::timeout(Duration::from_millis(300), l.accept()).await;
+            assert!(nobody.is_err(), "something connected: {nobody:?}");
+        });
+    }
 
     fn facts(items: &[(TrackSource, &str, bool)]) -> Vec<PubFacts> {
         items.iter().map(|(s, n, m)| (*s, n.to_string(), *m)).collect()

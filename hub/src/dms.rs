@@ -15,8 +15,10 @@
 //!   order), each side's read pointer (unread counts survive restarts and agree across devices)
 //!   and whether each side opened it (an opened, still empty DM is listed only for the opener).
 //! - `dm_messages`: their own id space (channel moderation, `POST /api/messages/{id}/delete`,
-//!   can never reach them). `format` is `plain` today; it is the hook for end-to-end encryption
-//!   (another format = `body` is ciphertext the hub cannot read).
+//!   can never reach them). `format` is `plain`, or `e2e1` (v1.1, E2): `body` is then the sealed
+//!   line the app made, ciphertext the hub stores and hands back but never reads. A sealed line's
+//!   `content` on the wire is the placeholder an older app shows; it gets no `[imagem]` marker
+//!   (its images are sealed too) and no reply excerpt (`chat.rs`). Call lines are always plain.
 //! - `dm_blocks`: who blocked whom.
 
 use axum::extract::rejection::JsonRejection;
@@ -36,7 +38,14 @@ use crate::util::now_ms;
 type ApiResult<T> = Result<Json<T>, ApiErr>;
 
 /// Message `format` of a readable (not end-to-end encrypted) message.
-const FORMAT_PLAIN: &str = "plain";
+pub const FORMAT_PLAIN: &str = "plain";
+/// Message `format` of an end-to-end encrypted line (E2).
+pub const FORMAT_SEALED: &str = DM_FORMAT_SEALED;
+
+/// Is this a base64url body (no padding) the hub can store as a sealed line?
+fn is_sealed_body(s: &str) -> bool {
+    !s.is_empty() && s.len() <= DM_SEALED_MAX_BYTES && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -200,22 +209,26 @@ impl Pair {
     }
 }
 
-const MSG_COLS: &str = "id, dm_id, author_id, kind, body, call_secs, created_at_ms, reply_to";
+const MSG_COLS: &str = "id, dm_id, author_id, kind, body, call_secs, created_at_ms, reply_to, format";
 
 fn msg_row(pair: &Pair) -> impl Fn(&rusqlite::Row) -> rusqlite::Result<DmMessage> + '_ {
     move |r| {
+        let body: String = r.get(4)?;
+        let (content, sealed) = if r.get::<_, String>(8)? == FORMAT_SEALED { (DM_SEALED_PLACEHOLDER.to_string(), Some(body)) } else { (body, None) };
         Ok(DmMessage {
             id: r.get(0)?,
             dm_id: r.get(1)?,
             author: pair.get(r.get(2)?),
             kind: DmMessageKind::from_wire(&r.get::<_, String>(3)?),
-            content: r.get(4)?,
+            content,
             call_secs: r.get::<_, i64>(5)?.clamp(0, u32::MAX as i64) as u32,
             created_at_ms: r.get(6)?,
             attachments: Vec::new(),
             // (A placeholder until `chat::fill_dm_lines`.)
             reply: r.get::<_, Option<DmMessageId>>(7)?.map(ReplyRef::gone),
             reactions: Vec::new(),
+            sealed,
+            sealed_attachments: Vec::new(),
         })
     }
 }
@@ -223,36 +236,40 @@ fn msg_row(pair: &Pair) -> impl Fn(&rusqlite::Row) -> rusqlite::Result<DmMessage
 /// Add a line (a message, or a call line written by the hub) and move the conversation up; the
 /// author has read their own line.
 pub fn insert_line(conn: &mut Connection, c: &ConvRow, author: UserId, kind: DmMessageKind, body: &str, call_secs: u32, owner: &str) -> rusqlite::Result<DmMessage> {
-    insert_line_with(conn, c, author, kind, body, call_secs, owner, &[], None).map(|r| r.expect("no attachments to check"))
+    insert_line_with(conn, c, author, kind, FORMAT_PLAIN, body, call_secs, owner, &[], None).map(|r| r.expect("no attachments to check"))
 }
 
 /// [`insert_line`] with images: `attachments` must be the author's pending uploads (checked in the
 /// same transaction); the stored text gets the `[imagem]` marker. `reply_to` must be a text line of
-/// the same conversation, otherwise the line is not a reply.
+/// the same conversation, otherwise the line is not a reply. `format` [`FORMAT_SEALED`] (E2):
+/// `body` is the sealed line, stored as is; its images must be sealed uploads; no marker.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_line_with(
     conn: &mut Connection,
     c: &ConvRow,
     author: UserId,
     kind: DmMessageKind,
+    format: &str,
     body: &str,
     call_secs: u32,
     owner: &str,
     attachments: &[AttachmentId],
     reply_to: Option<DmMessageId>,
 ) -> rusqlite::Result<Result<DmMessage, crate::attachments::LinkError>> {
+    let sealed = format == FORMAT_SEALED;
+    let format = if sealed { FORMAT_SEALED } else { FORMAT_PLAIN };
     let tx = conn.transaction()?;
-    if let Err(e) = crate::attachments::check_pending(&tx, author, attachments)? {
+    if let Err(e) = crate::attachments::check_pending(&tx, author, attachments, sealed)? {
         return Ok(Err(e));
     }
     let reply = crate::chat::resolve_dm_reply(&tx, c.id, reply_to, owner)?;
-    let body = &with_attachment_marker(body, attachments.len());
+    let body = &if sealed { body.to_string() } else { with_attachment_marker(body, attachments.len()) };
     let now = now_ms();
     // A fresh id: a deleted line's id never comes back (read pointers and the apps' caches use it).
     let id = crate::ids::insert_with(&tx, crate::ids::Seq::DmMessages, |id| {
         tx.execute(
             "INSERT INTO dm_messages (id, dm_id, author_id, kind, format, body, call_secs, created_at_ms, reply_to) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![id, c.id, author, kind.wire_name(), FORMAT_PLAIN, body, call_secs as i64, now, reply.as_ref().map(|r| r.id)],
+            params![id, c.id, author, kind.wire_name(), format, body, call_secs as i64, now, reply.as_ref().map(|r| r.id)],
         )?;
         Ok(id)
     })?;
@@ -260,7 +277,9 @@ pub fn insert_line_with(
     tx.execute(&format!("UPDATE dm_conversations SET last_activity_ms = ?, {side} = MAX({side}, ?) WHERE id = ?"), params![now, id, c.id])?;
     let pair = Pair::load(&tx, c, owner)?;
     let linked = crate::attachments::link(&tx, attachments, crate::attachments::Owner::Dm(id))?;
-    let msg = DmMessage { id, dm_id: c.id, author: pair.get(author), content: body.to_string(), created_at_ms: now, kind, call_secs, attachments: linked, reply, reactions: Vec::new() };
+    let (content, sealed_body, attachments, sealed_attachments) =
+        if sealed { (DM_SEALED_PLACEHOLDER.to_string(), Some(body.to_string()), Vec::new(), linked) } else { (body.to_string(), None, linked, Vec::new()) };
+    let msg = DmMessage { id, dm_id: c.id, author: pair.get(author), content, created_at_ms: now, kind, call_secs, attachments, reply, reactions: Vec::new(), sealed: sealed_body, sealed_attachments };
     tx.commit()?;
     Ok(Ok(msg))
 }
@@ -393,15 +412,30 @@ async fn messages(State(s): State<AppState>, AuthUser(me): AuthUser, Path(id): P
     Ok(Json(s.db.call(move |c| list_lines(c, &conv, q.before, limit, &owner)).await?))
 }
 
-/// `POST /api/dms/{id}/messages`
+/// `POST /api/dms/{id}/messages` (E2: `sealed` instead of `content`)
 async fn send(State(s): State<AppState>, AuthUser(me): AuthUser, Path(id): Path<DmId>, body: Result<Json<DmSendRequest>, JsonRejection>) -> ApiResult<DmMessage> {
     let Json(req) = body?;
     let conv = conversation_of(&s, me.id, id).await?;
     let content = req.content.trim().to_string();
     let n = content.chars().count();
-    if (n == 0 && req.attachments.is_empty()) || n > DM_MESSAGE_MAX_CHARS {
-        return Err(ApiErr::new(StatusCode::BAD_REQUEST, format!("message must be 1-{DM_MESSAGE_MAX_CHARS} characters")));
-    }
+    let format = match &req.sealed {
+        Some(sealed) => {
+            if !content.is_empty() {
+                return Err(ApiErr::new(StatusCode::BAD_REQUEST, "an encrypted message has no readable text"));
+            }
+            if !is_sealed_body(sealed) {
+                return Err(ApiErr::new(StatusCode::BAD_REQUEST, format!("an encrypted message must be 1-{DM_SEALED_MAX_BYTES} characters of base64url")));
+            }
+            FORMAT_SEALED
+        }
+        None => {
+            if (n == 0 && req.attachments.is_empty()) || n > DM_MESSAGE_MAX_CHARS {
+                return Err(ApiErr::new(StatusCode::BAD_REQUEST, format!("message must be 1-{DM_MESSAGE_MAX_CHARS} characters")));
+            }
+            FORMAT_PLAIN
+        }
+    };
+    let content = req.sealed.clone().unwrap_or(content);
     let (a, b) = (me.id, conv.peer_of(me.id));
     if s.db.call(move |c| blocked_between(c, a, b)).await? {
         return Err(blocked_err());
@@ -413,7 +447,7 @@ async fn send(State(s): State<AppState>, AuthUser(me): AuthUser, Path(id): Path<
     let (c2, owner, me_id, ids, reply_to) = (conv.clone(), s.owner(), me.id, req.attachments.clone(), req.reply_to);
     let message = s
         .db
-        .call(move |db| insert_line_with(db, &c2, me_id, DmMessageKind::Text, &content, 0, &owner, &ids, reply_to))
+        .call(move |db| insert_line_with(db, &c2, me_id, DmMessageKind::Text, format, &content, 0, &owner, &ids, reply_to))
         .await?
         .map_err(crate::attachments::link_err)?;
     tell_both(&s, &conv, &ServerEvent::DmMessageCreated { message: message.clone() });
@@ -519,9 +553,11 @@ async fn block(State(s): State<AppState>, AuthUser(me): AuthUser, Path(other): P
     Ok(Json(OkResponse { ok: true }))
 }
 
-/// The LiveKit address for a call token (the same host the client used for the hub).
-pub fn livekit_url(s: &AppState, headers: &HeaderMap) -> String {
-    crate::api::livekit_url(headers, &s.cfg)
+/// The LiveKit address for a call token (the same host the client used for the hub; v1.1: the
+/// hub's own port over TLS, see `api::livekit_url`). The call handlers get it through
+/// `api::LkUrl`.
+pub fn livekit_url(s: &AppState, headers: &HeaderMap, transport: crate::tls::Transport) -> String {
+    crate::api::livekit_url(headers, &s.cfg, transport)
 }
 
 #[cfg(test)]

@@ -91,7 +91,8 @@ impl HubClient {
         self.send_dm_request(dm, &body).await
     }
 
-    /// `POST /api/dms/{id}/messages` with everything a line can carry (images, a reply).
+    /// `POST /api/dms/{id}/messages` with everything a line can carry (images, a reply, or E2's
+    /// sealed body with an empty `content`).
     pub async fn send_dm_request(&self, dm: DmId, body: &DmSendRequest) -> Result<DmMessage> {
         self.dm_post("send dm", &format!("api/dms/{dm}/messages"), body).await
     }
@@ -125,12 +126,26 @@ impl HubClient {
 
     /// `POST /api/dms/{id}/call`: ring (or join this DM's call). The answer has the private room's token.
     pub async fn dm_call(&self, dm: DmId) -> Result<DmCallResponse> {
-        self.dm_post("call", &format!("api/dms/{dm}/call"), &serde_json::json!({})).await
+        self.dm_call_with(dm, false).await
     }
 
     /// `POST /api/dms/{id}/call/accept`
     pub async fn dm_call_accept(&self, dm: DmId) -> Result<DmCallResponse> {
-        self.dm_post("answer call", &format!("api/dms/{dm}/call/accept"), &serde_json::json!({})).await
+        self.dm_call_accept_with(dm, false).await
+    }
+
+    /// v1.1 (E1): [`HubClient::dm_call`] saying whether this app can encrypt the call
+    /// (`?e2ee=1`): the call is then encrypted when the other person has a device with keys.
+    pub async fn dm_call_with(&self, dm: DmId, e2ee: bool) -> Result<DmCallResponse> {
+        let q = if e2ee { "?e2ee=1" } else { "" };
+        self.dm_post("call", &format!("api/dms/{dm}/call{q}"), &serde_json::json!({})).await
+    }
+
+    /// v1.1 (E1): [`HubClient::dm_call_accept`] saying whether this app can encrypt the call; an
+    /// encrypted call refuses an answer without it (`409` [`vox_proto::ERR_E2EE_CALL_REQUIRED`]).
+    pub async fn dm_call_accept_with(&self, dm: DmId, e2ee: bool) -> Result<DmCallResponse> {
+        let q = if e2ee { "?e2ee=1" } else { "" };
+        self.dm_post("answer call", &format!("api/dms/{dm}/call/accept{q}"), &serde_json::json!({})).await
     }
 
     /// `POST /api/dms/{id}/call/decline`

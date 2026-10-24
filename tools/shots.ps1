@@ -27,7 +27,12 @@
 #               The pictures may be shared: VOX_SHOT_PRIVACY=1 swaps the PC's microphones, speakers
 #               and video card for generic names, and the work folder (logs, test sounds: every path
 #               a picture can show) is C:\Users\Public\concord-shots, never the user's own profile.
-param([string]$OutDir = "dist\design\shots-phase1", [switch]$Stage, [switch]$Nav, [switch]$Phase3, [switch]$Phase3b, [switch]$Calladex,
+#               -Resp (v1.1 I6): the responsive matrix instead (autotest roles `resp-a` / `resp-b`):
+#               every screen at 760x440, 1024x640, 1280x720 and 1920x1080 at zoom 1.0 / 1.25 / 1.5 and
+#               2560x1440 at 2.0, saved as <scene>__<w>x<h>-z<zoom>.png, the layout rules checked at
+#               each (the breaks are logged as "AUTOTEST resp DEFECT"), then the host panel the same
+#               way. VOX_RESP_COMBOS=760x440@1.25,1280x720@1 and VOX_RESP_SCENES=canal,dm,host narrow it.
+param([string]$OutDir = "dist\design\shots-phase1", [switch]$Stage, [switch]$Nav, [switch]$Phase3, [switch]$Phase3b, [switch]$Calladex, [switch]$Resp,
   [string]$Window = "", [double]$Zoom = 1.0, [string]$Prefix = "", [string]$Assets = "")
 $ErrorActionPreference = "Continue"
 $R = Split-Path $PSScriptRoot -Parent
@@ -56,7 +61,7 @@ function Wait-Exit($p, $secs) {
 }
 
 # The gallery: no server.
-if (-not $Stage -and -not $Nav -and -not $Phase3 -and -not $Phase3b -and -not $Calladex) {
+if (-not $Stage -and -not $Nav -and -not $Phase3 -and -not $Phase3b -and -not $Calladex -and -not $Resp) {
   $k = Start-Process "$B\concord.exe" -ArgumentList "--autotest kit --hold 2 --name kit --run-id kit --log-dir `"$G\kit`"" -PassThru
   $null = $k.Handle
   "kit : " + (Wait-Exit $k 60)
@@ -81,6 +86,45 @@ use_external_ip = false
 $hub = Start-Process "$B\concord-server.exe" -ArgumentList "--data-dir `"$d`" --livekit-bin `"$LK`" --log-dir `"$G\hub\log`"" -WindowStyle Hidden -PassThru
 Start-Sleep 4
 $srv = "--server http://127.0.0.1:7997 --password x"
+if ($Resp) {
+  # Test windows to stream, as many streamers (VOX_RESP_STREAMERS, 1 to 3; 3 by default) and a
+  # camera; the owner goes through the matrix.
+  $n = if ($env:VOX_RESP_STREAMERS) { [Math]::Max(1, [Math]::Min(3, [int]$env:VOX_RESP_STREAMERS)) } else { 3 }
+  $env:VOX_RESP_STREAMERS = "$n"
+  $tws = @(1..$n) | ForEach-Object { Start-Process "$B\examples\test_window.exe" -RedirectStandardOutput "$G\tw$_.txt" -PassThru }
+  Start-Sleep 5
+  $hw = @(1..$n) | ForEach-Object { [int64]((Get-Content "$G\tw$_.txt" -ErrorAction SilentlyContinue | Select-String -Pattern '^hwnd=(\d+)' | Select-Object -First 1).Matches.Groups[1].Value) }
+  $parts = @()
+  $names = @("lua", "sol", "mar")
+  for ($i = 0; $i -lt $n; $i++) {
+    $parts += Start-Process "$B\concord.exe" -ArgumentList "--autotest resp-b $srv --name $($names[$i]) --hwnd $($hw[$i]) --run-id resp --log-dir `"$G\$($names[$i])`"" -PassThru
+    Start-Sleep 2
+  }
+  $parts += Start-Process "$B\concord.exe" -ArgumentList "--autotest resp-b $srv --name rio --mode cam --run-id resp --log-dir `"$G\rio`"" -PassThru
+  Start-Sleep 3
+  $s = Start-Process "$B\concord.exe" -ArgumentList "--autotest resp-a $srv --name dono --run-id resp --log-dir `"$G\dono`"" -PassThru
+  $null = $s.Handle
+  "resp : " + (Wait-Exit $s 3600)
+  Start-Sleep 3
+  foreach ($p in $parts + $tws) { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } }
+  if (-not $hub.HasExited) { Stop-Process -Id $hub.Id -Force }
+  Start-Sleep 1
+  Get-CimInstance Win32_Process -Filter "Name='livekit-server.exe'" | Where-Object { $_.CommandLine -match [regex]::Escape($G) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+  if (-not $env:VOX_RESP_SCENES -or $env:VOX_RESP_SCENES -match 'host') {
+    # The host panel: a server hosted inside the app (the gate's host-mode environment).
+    $env:VOX_HOST_DIR = "$G\host"; $env:VOX_HOST_OFFLINE = "1"; $env:VOX_HOST_BIND = "127.0.0.1"
+    $env:VOX_HOST_FIRST_BLOCK = "1"; $env:VOX_HOST_LAN = "127.0.0.1/8"; $env:VOX_HOST_LIVEKIT_BIN = $LK
+    $h = Start-Process "$B\concord.exe" -ArgumentList "--autotest resp-a --mode host --name dono --run-id resp --log-dir `"$G\host-log`"" -PassThru
+    $null = $h.Handle
+    "resp host : " + (Wait-Exit $h 900)
+    foreach ($k in "VOX_HOST_DIR", "VOX_HOST_OFFLINE", "VOX_HOST_BIND", "VOX_HOST_FIRST_BLOCK", "VOX_HOST_LAN", "VOX_HOST_LIVEKIT_BIN") { Remove-Item "Env:$k" -ErrorAction SilentlyContinue }
+    Start-Sleep 1
+    Get-CimInstance Win32_Process -Filter "Name='livekit-server.exe'" | Where-Object { $_.CommandLine -match [regex]::Escape("$G\host") } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+  }
+  Get-ChildItem "$G" -Recurse -Filter *.log | Select-String -Pattern 'AUTOTEST resp DEFECT' | ForEach-Object { $_.Line -replace '^.*AUTOTEST resp DEFECT ', 'DEFECT ' }
+  "{0} pictures" -f (Get-ChildItem $Out -Filter *.png).Count
+  return
+}
 if ($Calladex) {
   # Three members online first (they are the card's entries), then the owner takes the pictures.
   $parts = @()

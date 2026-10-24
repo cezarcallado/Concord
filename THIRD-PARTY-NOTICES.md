@@ -4,25 +4,6 @@ concord (called voxhub before v1.0.1) embeds the following assets in the desktop
 (`concord.exe`) and, for the logo, in the server (`concord-server.exe`). Rust crate dependencies
 are listed in `Cargo.lock`; vendored code keeps its own license files under `vendor/`.
 
-## Main components
-
-| Component | Use | License |
-|---|---|---|
-| [LiveKit server](https://github.com/livekit/livekit) | Voice and video server (SFU). Downloaded by `hub/scripts/fetch-livekit.ps1` (checksum-pinned), not included in the repository | Apache-2.0 |
-| [LiveKit Rust SDK](https://github.com/livekit/rust-sdks) (`livekit` 0.9.4, modified copy in `vendor/livekit`) | WebRTC client. Modification: a stereo audio option (see `vendor/livekit/README.voxhub.md`) | Apache-2.0 |
-| libwebrtc (through `webrtc-sys`) | WebRTC | BSD-3-Clause |
-| [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) (subset with its model in `vendor/deep_filter`) | Noise suppression "IA máxima" | MIT OR Apache-2.0 |
-| [tract](https://github.com/sonos/tract) | Model inference | MIT OR Apache-2.0 |
-| [nnnoiseless](https://github.com/jneem/nnnoiseless) (RNNoise) | Noise suppression "IA leve" | BSD-3-Clause |
-| [symphonia](https://github.com/pdeljanov/Symphonia) | Soundboard audio decoding | MPL-2.0 |
-| libopus (inside libwebrtc) | Opus decoding | BSD-3-Clause |
-| libwebp (through `libwebp-sys`) | WebP images | BSD-3-Clause |
-| [egui / eframe](https://github.com/emilk/egui) | Interface | MIT OR Apache-2.0 |
-| [attohttpc](https://github.com/sbstp/attohttpc) (through `igd-next`) | Router UPnP control in host mode | MPL-2.0 |
-| [axum](https://github.com/tokio-rs/axum), tokio, rusqlite/SQLite, reqwest, rustls, image, argon2 | Server and utilities | MIT / Apache-2.0 (SQLite: public domain) |
-
-Each crate's license can also be checked on crates.io or with `cargo license`.
-
 ## Logo (v1.0.1)
 
 - Files: `app/assets/logo/concord.ico` and `app/assets/logo/concord-logo-{16,24,32,48,64,128,256,512}.png`
@@ -55,6 +36,11 @@ Each crate's license can also be checked on crates.io or with `cargo license`.
   47d54ca1ebb14fd864695f1d39dc734f39017c33 (SHA-256 413e7357809ddd12fd80a96a8a396de0e401638d4acd3cb3e37532f0472ac682)
 - Modification: a static instance at wght=600, wdth=100, opsz=18 (fontTools `varLib.instancer`),
   renamed "Bricolage Grotesque SemiBold"; no glyph was changed.
+
+## QR code (v1.1)
+
+- The `qrcode` crate (https://github.com/kennytm/qrcode-rust), default features off, for the Pix
+  QR code in the desktop app. Copyright (c) 2016 kennytm. License: MIT OR Apache-2.0.
 
 ## Icons
 
@@ -89,6 +75,22 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## Emoji (v1.1)
+
+### Twemoji
+
+- Files: `app/assets/emoji/atlas.png` (the pictures) and `app/assets/emoji/index.txt` (which
+  emoji is where); attribution and license notice in `app/assets/emoji/LICENSE-Twemoji.txt`.
+- Twemoji © Twitter, Inc and other contributors. Graphics licensed under CC-BY 4.0:
+  https://creativecommons.org/licenses/by/4.0/
+- Source: the maintained Twemoji fork, https://github.com/jdecked/twemoji, release tag `v15.1.0`,
+  `assets/72x72/<code points>.png` (fetched from
+  `https://cdn.jsdelivr.net/gh/jdecked/twemoji@v15.1.0/assets/72x72/`).
+- Changes: only the emoji the app uses (its reaction, sound and status picks plus common ones)
+  were taken; each was scaled from 72×72 to 48×48 pixels and packed with the others into one PNG
+  atlas with a shared palette of 256 colours. The pictures themselves were not edited. They are
+  drawn in colour over the monochrome emoji font's glyphs.
+
 ## egui's bundled fonts (unchanged, kept as fallbacks)
 
 Ubuntu-Light (Ubuntu Font Licence 1.0), Hack (MIT / Bitstream Vera), Noto Emoji (SIL OFL 1.1) and
@@ -117,3 +119,23 @@ MIT and/or Apache-2.0; these are not (or not only):
 - **Zlib**: `foldhash`, `zlib-rs`. **CC0-1.0**: `tiny-keccak`.
 
 Host mode also brings in `igd-next` and `xmltree` (both MIT), for the router's UPnP.
+
+## TLS between the app and the server (v1.1)
+
+The server makes its own self-signed certificate with `rcgen` 0.14 and its DER encoder `yasna`
+0.6 (both MIT OR Apache-2.0, per their Cargo metadata). The TLS itself is `rustls` /
+`tokio-rustls` on the `ring` provider, and the first request line is read with `httparse` (all
+already in the tree, licenses above). `Cargo.lock` also lists `x509-parser` and its ASN.1 crates
+(`asn1-rs`, `der-parser`, `oid-registry`, ...) as optional dependencies of `rcgen`; they are not
+built into concord.
+
+## End-to-end encryption keys (v1.1)
+
+The app's per-device identity keys and their key-wrapping envelope (`crates/vox-e2ee`) use
+`x25519-dalek` 2.0.1 (BSD-3-Clause; Copyright (c) 2017-2021 isis agora lovecruft, 2019-2021
+DebugSteven) and `curve25519-dalek` 4.1.3 (BSD-3-Clause; Copyright (c) 2016-2021 isis agora
+lovecruft, 2016-2021 Henry de Valence), with `curve25519-dalek-derive` 0.1 (its build-time
+macros) and `rand_core` 0.6 (both MIT OR Apache-2.0). The HKDF and ChaCha20-Poly1305 are `ring`'s,
+the randomness `getrandom`'s and the wiping `zeroize`'s (already in the tree, licenses above).
+`Cargo.lock` also lists `fiat-crypto` as an optional backend of `curve25519-dalek`; it is not built
+into concord. The server does not link any of it.

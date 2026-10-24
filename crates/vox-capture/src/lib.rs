@@ -1326,6 +1326,18 @@ pub fn window_icon(hwnd: isize, max_size: u32) -> Result<RgbaImage> {
     imp::window_icon(hwnd, max_size)
 }
 
+// ---------- What a shared window is (Go Live hover cards, v1.1) ----------
+
+mod game;
+pub use game::{looks_like_game, program_name, AppInfo};
+
+/// The program that owns window `hwnd`: its own name (never the window's title) and whether it
+/// looks like a game ([`looks_like_game`]). `None` when the window or its process is gone (or the
+/// process cannot be queried, e.g. elevated).
+pub fn window_app(hwnd: isize) -> Option<AppInfo> {
+    imp::window_app(hwnd)
+}
+
 // ---------- Privacy permissions (macOS) ----------
 //
 // macOS asks the person before an app may record the screen (and the sound of other apps, which
@@ -1473,6 +1485,9 @@ mod imp {
     }
     pub fn window_icon(_: isize, _: u32) -> Result<RgbaImage> {
         unsupported()
+    }
+    pub fn window_app(_: isize) -> Option<AppInfo> {
+        None
     }
 
     #[derive(Clone)]

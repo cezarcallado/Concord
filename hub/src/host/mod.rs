@@ -69,6 +69,9 @@ pub struct Hosted {
     pub ports: PortBlock,
     /// The server password (for people without an invite; shown to the host).
     pub password: String,
+    /// v1.1 (T0): "Aceitar apps antigos sem conexão protegida" (`tls = "auto"`; off is
+    /// `"required"`).
+    pub accept_old_apps: bool,
 }
 
 /// What this module keeps in a hosted server's `config.toml`.
@@ -82,6 +85,8 @@ struct HostedConfig {
     api_key: String,
     api_secret: String,
     use_external_ip: bool,
+    /// v1.1 (T0): `auto` or `required` (a hosted server always speaks TLS).
+    tls: crate::tls::TlsMode,
 }
 
 /// A TOML basic string.
@@ -107,7 +112,8 @@ fn write_config(dir: &Path, c: &HostedConfig) -> Result<()> {
          server_name = {name}\n\
          server_password = {password}\n\
          bind = \"{bind_ip}:{hub}\"\n\
-         public_host = {public}\n\n\
+         public_host = {public}\n\
+         tls = \"{tls}\"\n\n\
          [livekit]\n\
          api_key = {key}\n\
          api_secret = {secret}\n\
@@ -126,6 +132,7 @@ fn write_config(dir: &Path, c: &HostedConfig) -> Result<()> {
         tcp = c.ports.rtc_tcp,
         udp = c.ports.rtc_udp,
         ext = c.use_external_ip,
+        tls = if c.tls == crate::tls::TlsMode::Required { "required" } else { "auto" },
     );
     let path = dir.join("config.toml");
     let tmp = dir.join("config.toml.tmp");
@@ -149,6 +156,7 @@ fn read_config(dir: &Path) -> Result<HostedConfig> {
         api_key: cfg.livekit.api_key,
         api_secret: cfg.livekit.api_secret,
         use_external_ip: cfg.livekit.use_external_ip,
+        tls: cfg.tls,
     })
 }
 
@@ -156,7 +164,18 @@ fn read_config(dir: &Path) -> Result<HostedConfig> {
 pub fn load(dir: &Path) -> Result<Hosted> {
     let c = read_config(dir)?;
     let id = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    Ok(Hosted { id, dir: dir.to_path_buf(), name: c.name, ports: c.ports, password: c.password })
+    Ok(Hosted { id, dir: dir.to_path_buf(), name: c.name, ports: c.ports, password: c.password, accept_old_apps: c.tls != crate::tls::TlsMode::Required })
+}
+
+/// v1.1 (T0): "Aceitar apps antigos sem conexão protegida" for the hosted server in `dir`
+/// (`tls = "auto"`, or `"required"` when off). Kept in its `config.toml`; a running server also
+/// takes it at once ([`HostRunner::set_accept_old_apps`]).
+pub fn set_accept_old_apps(dir: &Path, on: bool) -> Result<()> {
+    let mut c = read_config(dir)?;
+    c.tls = if on { crate::tls::TlsMode::Auto } else { crate::tls::TlsMode::Required };
+    write_config(dir, &c)?;
+    tracing::info!(dir = %dir.display(), tls = c.tls.as_str(), "host: old apps setting changed");
+    Ok(())
 }
 
 /// Every hosted server under `root`, oldest first.
@@ -195,6 +214,7 @@ pub fn create(root: &Path, name: &str) -> Result<Hosted> {
         api_key: format!("API{}", random_hex::<8>()),
         api_secret: random_hex::<32>(),
         use_external_ip: false,
+        tls: crate::tls::TlsMode::Auto,
     };
     write_config(&dir, &cfg)?;
     tracing::info!(id, name, dir = %dir.display(), "host: server created");
@@ -285,6 +305,11 @@ pub struct HostStatus {
     pub stun_ip: Option<Ipv4Addr>,
     pub public_v6: Option<Ipv6Addr>,
     pub reach: Option<Reach>,
+    /// v1.1 (T0): the SHA-256 of the server's TLS certificate, once it runs (its "Código do
+    /// servidor" is shown to the host).
+    pub tls_pin: Option<[u8; 32]>,
+    /// v1.1 (T0): "Aceitar apps antigos sem conexão protegida".
+    pub accept_old_apps: bool,
 }
 
 impl HostStatus {
@@ -302,6 +327,8 @@ impl HostStatus {
             stun_ip: None,
             public_v6: None,
             reach: None,
+            tls_pin: None,
+            accept_old_apps: h.accept_old_apps,
         }
     }
 
@@ -340,6 +367,9 @@ pub struct HostRunner {
     status: Arc<Mutex<HostStatus>>,
     stop_tx: watch::Sender<bool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    dir: PathBuf,
+    /// The running hub's TLS policy (v1.1), once it runs.
+    tls: Arc<Mutex<Option<crate::tls::Policy>>>,
 }
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
@@ -350,16 +380,28 @@ impl HostRunner {
     pub fn start(hosted: &Hosted, opts: RunOptions, wake: Wake) -> HostRunner {
         let status = Arc::new(Mutex::new(HostStatus::new(hosted)));
         let (stop_tx, stop_rx) = watch::channel(false);
-        let (st, h) = (status.clone(), hosted.clone());
+        let tls = Arc::new(Mutex::new(None));
+        let (st, h, t) = (status.clone(), hosted.clone(), tls.clone());
         let thread = std::thread::Builder::new()
             .name("host".into())
-            .spawn(move || run(h, opts, st, stop_rx, wake))
+            .spawn(move || run(h, opts, st, stop_rx, wake, t))
             .map_err(|e| tracing::error!("host: cannot start a thread: {e}"))
             .ok();
         if thread.is_none() {
             status.lock().unwrap_or_else(|e| e.into_inner()).phase = Phase::Failed("Não foi possível iniciar o servidor.".into());
         }
-        HostRunner { status, stop_tx, thread }
+        HostRunner { status, stop_tx, thread, dir: hosted.dir.clone(), tls }
+    }
+
+    /// v1.1 (T0): "Aceitar apps antigos sem conexão protegida": saved in the server's
+    /// `config.toml` and applied at once to new connections of the running server.
+    pub fn set_accept_old_apps(&self, on: bool) -> Result<()> {
+        set_accept_old_apps(&self.dir, on)?;
+        if let Some(p) = self.tls.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            p.set(if on { crate::tls::TlsMode::Auto } else { crate::tls::TlsMode::Required });
+        }
+        self.status.lock().unwrap_or_else(|e| e.into_inner()).accept_old_apps = on;
+        Ok(())
     }
 
     pub fn status(&self) -> HostStatus {
@@ -403,7 +445,7 @@ fn set(status: &Mutex<HostStatus>, wake: &Wake, f: impl FnOnce(&mut HostStatus))
     wake();
 }
 
-fn run(h: Hosted, opts: RunOptions, status: Arc<Mutex<HostStatus>>, stop_rx: watch::Receiver<bool>, wake: Wake) {
+fn run(h: Hosted, opts: RunOptions, status: Arc<Mutex<HostStatus>>, stop_rx: watch::Receiver<bool>, wake: Wake, tls: Arc<Mutex<Option<crate::tls::Policy>>>) {
     let rt = match crate::runtime() {
         Ok(rt) => rt,
         Err(e) => {
@@ -411,7 +453,7 @@ fn run(h: Hosted, opts: RunOptions, status: Arc<Mutex<HostStatus>>, stop_rx: wat
             return;
         }
     };
-    let result = rt.block_on(serve(&h, opts, status.clone(), stop_rx, wake.clone()));
+    let result = rt.block_on(serve(&h, opts, status.clone(), stop_rx, wake.clone(), tls));
     match result {
         Ok(()) => set(&status, &wake, |s| s.phase = Phase::Stopped),
         Err(e) => {
@@ -431,7 +473,7 @@ struct NetFound {
     mapped: Option<Mapped>,
 }
 
-async fn serve(h: &Hosted, opts: RunOptions, status: Arc<Mutex<HostStatus>>, stop_rx: watch::Receiver<bool>, wake: Wake) -> Result<()> {
+async fn serve(h: &Hosted, opts: RunOptions, status: Arc<Mutex<HostStatus>>, stop_rx: watch::Receiver<bool>, wake: Wake, tls: Arc<Mutex<Option<crate::tls::Policy>>>) -> Result<()> {
     let mut cfg = read_config(&h.dir)?;
     let bind_ip = opts.bind_ip;
     let block = ports::choose(Some(cfg.ports), opts.first_block, |b| ports::block_is_free(b, bind_ip))
@@ -474,8 +516,11 @@ async fn serve(h: &Hosted, opts: RunOptions, status: Arc<Mutex<HostStatus>>, sto
     let served = crate::serve_until(hub_opts, move |server| {
         let addr = server.addr;
         tracing::info!(id = %st2.lock().unwrap_or_else(|e| e.into_inner()).id, %addr, "host: server running");
+        *tls.lock().unwrap_or_else(|e| e.into_inner()) = Some(server.tls_policy());
+        let pin = server.tls_pin();
         set(&st2, &wake2, |s| {
             s.hub_addr = Some(addr);
+            s.tls_pin = pin;
             s.phase = Phase::Running;
         });
         keep_mapped(stop_rx, mapper, block, local, mapped, st2, wake2)
@@ -682,7 +727,7 @@ mod tests {
 
     #[test]
     fn invites_carry_the_reachable_addresses() {
-        let h = Hosted { id: "x".into(), dir: PathBuf::new(), name: "s".into(), ports: PortBlock::DEFAULT, password: String::new() };
+        let h = Hosted { id: "x".into(), dir: PathBuf::new(), name: "s".into(), ports: PortBlock::DEFAULT, password: String::new(), accept_old_apps: true };
         let mut s = HostStatus::new(&h);
         s.lan = Some((Ipv4Addr::new(192, 168, 0, 20), 24));
         s.router_wan = Some("203.0.113.7".parse().unwrap());

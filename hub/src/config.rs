@@ -37,6 +37,10 @@ pub struct Config {
     /// Delete chat images older than this many days (the messages stay, with "[imagem]").
     /// 0 (the default) keeps them forever.
     pub attachment_retention_days: u32,
+    /// v1.1: TLS on the hub's port (`tls.rs`). `auto` (the default): TLS for the apps that speak
+    /// it, plain HTTP for older ones; `required`: older apps get a "update" message (this PC's own
+    /// connections may still be plain); `off`: no TLS, as before 1.1.
+    pub tls: crate::tls::TlsMode,
     pub livekit: LiveKitConfig,
 }
 
@@ -80,6 +84,7 @@ impl Default for Config {
             max_attachment_storage_gb: 5.0,
             attachment_daily_mb: 200,
             attachment_retention_days: 0,
+            tls: crate::tls::TlsMode::Auto,
             livekit: LiveKitConfig::default(),
         }
     }
@@ -150,6 +155,13 @@ attachment_daily_mb = 200
 # makes room by deleting the oldest images.
 attachment_retention_days = 0
 
+# Protected connection (TLS, concord 1.1+). "auto": apps 1.1 and newer connect protected, older
+# apps still connect without protection. "required": only protected connections (older apps are
+# asked to update; this PC itself may still connect without). "off": no protection (not
+# recommended). The certificate lives in the tls folder next to this file: keep it when moving
+# the server, or everybody will need a new invite.
+tls = "auto"
+
 [livekit]
 # Generated on first run. Keep secret.
 api_key = "API{key}"
@@ -170,6 +182,15 @@ mod tests {
 
     fn parse(text: &str) -> Config {
         toml::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn tls_is_auto_unless_set() {
+        assert_eq!(parse(&default_file("k", &"s".repeat(32))).tls, crate::tls::TlsMode::Auto);
+        assert_eq!(parse("server_name = \"x\"").tls, crate::tls::TlsMode::Auto, "a config from before 1.1");
+        assert_eq!(parse("tls = \"required\"").tls, crate::tls::TlsMode::Required);
+        assert_eq!(parse("tls = \"off\"").tls, crate::tls::TlsMode::Off);
+        assert!(toml::from_str::<Config>("tls = \"maybe\"").is_err());
     }
 
     #[test]

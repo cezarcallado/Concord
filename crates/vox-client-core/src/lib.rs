@@ -13,13 +13,16 @@ pub mod audio;
 pub mod golive;
 pub mod hub;
 pub mod images;
+pub mod media_e2ee;
 pub mod soundboard;
 pub mod stats;
 pub mod testmode;
+pub mod tls;
 pub mod token;
 pub mod voice;
 
 pub use golive::{ShareOptions, ShareSource};
 pub use hub::{HubClient, HubEvent, HubSender};
 pub use audio::{AlertKind, GateConfig, GateMode, MicTest, MicTestConfig, NoiseControl, NoiseLevel, UiPlayer, UserAudio, VoiceEffect, VoiceFxConfig, VoiceGate};
-pub use voice::{JoinError, JoinReport, JoinStep, VoiceConfig, VoiceEvent, VoiceSession, WatchLimit, MAX_WATCHED};
+pub use media_e2ee::{MediaDirectory, MediaE2ee, MediaE2eeState};
+pub use voice::{JoinError, JoinReport, JoinStep, ShareSnapshots, VoiceConfig, VoiceEvent, VoiceSession, WatchLimit, MAX_WATCHED};

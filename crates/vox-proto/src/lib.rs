@@ -14,15 +14,19 @@ use serde::{Deserialize, Serialize};
 mod attachment;
 mod chat;
 mod dm;
+mod e2ee;
 mod invite;
 mod profile;
 mod sound;
+mod stream_preview;
 pub use attachment::*;
 pub use chat::*;
 pub use dm::*;
+pub use e2ee::*;
 pub use invite::*;
 pub use profile::*;
 pub use sound::*;
+pub use stream_preview::*;
 
 pub type UserId = i64;
 pub type ChannelId = i64;
@@ -82,6 +86,9 @@ pub const ERR_TOO_MANY_ATTEMPTS: &str = "too many attempts";
 /// ([`SetPasswordRequest::owner_code`]). Added after v0.6.1 (older apps show the text).
 pub const ERR_OWNER_PROOF_REQUIRED: &str =
     "owner proof required: set the owner's first personal password from the server PC (127.0.0.1) or with the code shown in the server window";
+/// v1.1 (T0): the `426` a hub with `tls = "required"` gives a request in the clear from another
+/// computer (an app older than 1.1). Portuguese on purpose: an old app shows the hub's text as is.
+pub const ERR_TLS_REQUIRED: &str = "Este servidor exige o concord 1.1 ou mais novo (conexão protegida).";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoginResponse {
@@ -444,6 +451,36 @@ pub struct ChannelAccessRequest {
     pub private: Option<PrivateAccess>,
 }
 
+/// v1.1 (E1): `POST /api/channels/{id}/e2ee` (Admin and up): turn a voice channel's end-to-end
+/// encrypted calls on or off. Only while its room is empty: `409` [`ERR_ROOM_OCCUPIED`] otherwise
+/// ("Esvazie a sala para mudar isso."). `400` for a text channel, `404` unknown. Answers
+/// [`ChannelE2eeResponse`]; everybody gets the new channel list. A hub older than 1.1 answers
+/// `404` (the setting is then not offered).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ChannelE2eeRequest {
+    pub on: bool,
+}
+
+/// The answer of [`ChannelE2eeRequest`] (also to a `GET` of the same path, which changes nothing):
+/// the flag as stored and the people who may see the channel but have no device with encryption
+/// keys on this server (they use the old app, 1.0, or never opened 1.1 here), who cannot enter
+/// while it is on.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ChannelE2eeResponse {
+    pub on: bool,
+    #[serde(default)]
+    pub outdated: Vec<User>,
+}
+
+/// `409` of [`ChannelE2eeRequest`]: somebody is in the voice room.
+pub const ERR_ROOM_OCCUPIED: &str = "room occupied";
+/// `403` of a join token for an end-to-end encrypted room asked without `?e2ee=1` (an app older
+/// than 1.1). Portuguese on purpose: an older app shows the hub's text as is.
+pub const ERR_E2EE_REQUIRED: &str = "Esta sala usa criptografia de ponta a ponta. Atualize o concord para entrar.";
+/// `409` of a DM call's accept (or rejoin) without `?e2ee=1` when the call is end-to-end
+/// encrypted. Portuguese on purpose, as above.
+pub const ERR_E2EE_CALL_REQUIRED: &str = "Atualize o concord para atender esta chamada criptografada";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelRenameRequest {
     pub name: String,
@@ -504,6 +541,9 @@ pub const AUDIT_CHANNEL_REORDER: &str = "channel_reorder";
 /// A channel was made private, its access list changed, or it was made public again (v0.9;
 /// detail: the channel and, in Portuguese, who has access now).
 pub const AUDIT_CHANNEL_ACCESS: &str = "channel_access";
+/// v1.1 (E1): a voice channel's end-to-end encrypted calls were turned on or off (detail: the
+/// channel and "ligada" / "desligada").
+pub const AUDIT_CHANNEL_E2EE: &str = "channel_e2ee";
 /// Someone became the server's owner (detail: how, "codigo" or "pc-do-servidor").
 pub const AUDIT_CLAIM_OWNER: &str = "claim_owner";
 /// The owner handed the server over to the target.
@@ -554,6 +594,13 @@ pub struct Channel {
     /// no access to; one that has access sees the channel without the lock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private: Option<PrivateAccess>,
+    /// v1.1 (E1): the voice room's calls are end-to-end encrypted ("Chamada criptografada de ponta
+    /// a ponta", opt-in by an Admin, see [`ChannelE2eeRequest`]): voice, cameras and Go Live are
+    /// encrypted on the sender's computer with per-sender keys only the people in the room get
+    /// (`vox_e2ee::media`). The hub refuses a join token without `?e2ee=1` ([`ERR_E2EE_REQUIRED`]),
+    /// so an older app never enters. Absent from the JSON when off (byte-identical to before).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub e2ee: bool,
 }
 
 impl Channel {
@@ -632,6 +679,11 @@ pub struct VoiceJoinResponse {
     /// LiveKit access token for room `voice-<channel_id>`, identity = user id.
     pub livekit_token: String,
     pub room: String,
+    /// v1.1 (E1): the room is end-to-end encrypted (a channel with [`Channel::e2ee`], or a DM call
+    /// with [`crate::DmCall::e2ee`]): join with media encryption and the key exchange. Only ever
+    /// true for a request that said `?e2ee=1`. Absent when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub e2ee: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -721,6 +773,11 @@ pub enum ClientEvent {
     /// variant with `Error { "invalid event" }`; a client never sends it then, because the
     /// soundboard is hidden when `GET /api/sounds` is `404`.
     PlaySound { sound_id: SoundId },
+    /// v1.1 (no protocol bump): stop the sounds I played, for my voice channel. Only sent to a
+    /// hub whose `SoundPlayed` events carry `stoppable: true` (an older hub would answer the
+    /// unknown variant with `Error { "invalid event" }`). The hub relays it as
+    /// [`ServerEvent::SoundStopped`], at most once per play.
+    StopSound,
 }
 
 /// The exact error text a v0.2.0/v0.2.1 hub sends for an event it cannot parse. A client that
@@ -746,6 +803,15 @@ pub enum ServerEvent {
         /// older hub).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         server_id: Option<String>,
+        /// v1.1: the hub keeps Go Live hover previews (`PUT /api/me/stream-preview`, `GET
+        /// /api/users/{id}/stream-preview`, see [`stream_preview`](crate::stream_preview)). Absent
+        /// / false: an older hub, the app neither uploads nor asks.
+        #[serde(default, skip_serializing_if = "is_false")]
+        stream_previews: bool,
+        /// v1.1 (E0): the hub keeps the directory of device keys (`/api/e2ee/devices`, see
+        /// [`e2ee`](crate::e2ee)). Absent / false: an older hub, the app neither registers nor asks.
+        #[serde(default, skip_serializing_if = "is_false")]
+        e2ee: bool,
     },
     MessageCreated { message: Message },
     UserOnline { user: User },
@@ -766,7 +832,18 @@ pub enum ServerEvent {
     // ---- soundboard, no protocol bump (older clients log and skip events they do not know)
     /// Someone played a sound in the voice channel `channel_id`: only that channel's members get
     /// this (the player too). Each client plays the clip locally.
-    SoundPlayed { sound_id: SoundId, by: User, channel_id: ChannelId },
+    SoundPlayed {
+        sound_id: SoundId,
+        by: User,
+        channel_id: ChannelId,
+        /// v1.1: this hub relays [`ClientEvent::StopSound`] (absent / false: an older hub; the
+        /// player can then only stop the sound for itself).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stoppable: bool,
+    },
+    /// v1.1: `by` stopped the sounds they played in the voice channel `channel_id` (only that
+    /// channel's members get this, the player too). Older clients log and skip it.
+    SoundStopped { by: UserId, channel_id: ChannelId },
     /// The soundboard changed (upload, rename, delete): the full new list, to everybody.
     SoundsChanged { sounds: Vec<Sound> },
     // ---- direct messages and private calls (see `dm.rs`), no protocol bump. Every one of these
@@ -803,6 +880,10 @@ pub enum ServerEvent {
     ReactionChanged { channel_id: ChannelId, message_id: MessageId, emoji: String, user_id: UserId, added: bool },
     /// The same on a DM line: only to the two people of the conversation.
     DmReactionChanged { dm_id: DmId, message_id: DmMessageId, emoji: String, user_id: UserId, added: bool },
+    // ---- end-to-end encryption, E0 (v1.1, see `e2ee.rs`), no protocol bump (older clients log
+    // and skip it)
+    /// `user_id`'s devices changed (one registered, removed): the full new list, to everybody.
+    E2eeDevicesChanged { user_id: UserId, devices: Vec<E2eeDevice> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -900,7 +981,7 @@ mod tests {
         let ev = ServerEvent::VoiceStateChanged { member: m.clone() };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(matches!(serde_json::from_str::<v020::ServerEvent>(&json), Ok(v020::ServerEvent::VoiceStateChanged { .. })));
-        let ready = ServerEvent::Ready { user: user(1), channels: vec![], online: vec![user(1)], voice: vec![m], account: None, chat: None, server_id: None };
+        let ready = ServerEvent::Ready { user: user(1), channels: vec![], online: vec![user(1)], voice: vec![m], account: None, chat: None, server_id: None, stream_previews: false, e2ee: false };
         let json = serde_json::to_string(&ready).unwrap();
         assert!(matches!(serde_json::from_str::<v020::ServerEvent>(&json), Ok(v020::ServerEvent::Ready { .. })));
     }
@@ -1124,6 +1205,8 @@ mod tests {
             account: Some(Account { has_password: true, must_set_password: false, ..Default::default() }),
             chat: None,
             server_id: Some("0123456789abcdef0123456789abcdef".into()),
+            stream_previews: false,
+            e2ee: false,
         };
         assert!(matches!(serde_json::from_str::<v041::ServerEvent>(&serde_json::to_string(&ready).unwrap()), Ok(v041::ServerEvent::Ready { .. })));
         let msg = Message { id: 1, channel_id: 1, author: admin.clone(), content: "oi".into(), created_at_ms: 5, attachments: vec![], mentions: vec![], mention_everyone: false, reply: None, reactions: vec![] };
@@ -1353,7 +1436,7 @@ mod tests {
         assert_eq!((old.user, old.channel_id, old.streaming), (user(4), Some(5), true));
         let ev = serde_json::to_string(&ServerEvent::VoiceStateChanged { member: m.clone() }).unwrap();
         assert!(matches!(serde_json::from_str::<v050::ServerEvent>(&ev), Ok(v050::ServerEvent::VoiceStateChanged { .. })));
-        let ready = serde_json::to_string(&ServerEvent::Ready { user: user(4), channels: vec![], online: vec![user(4)], voice: vec![m], account: None, chat: None, server_id: None }).unwrap();
+        let ready = serde_json::to_string(&ServerEvent::Ready { user: user(4), channels: vec![], online: vec![user(4)], voice: vec![m], account: None, chat: None, server_id: None, stream_previews: false, e2ee: false }).unwrap();
         assert!(matches!(serde_json::from_str::<v050::ServerEvent>(&ready), Ok(v050::ServerEvent::Ready { voice, .. }) if voice.len() == 1));
     }
 
@@ -1434,7 +1517,7 @@ mod tests {
     }
 
     fn channel(id: i64, private: Option<PrivateAccess>) -> Channel {
-        Channel { id, name: format!("c{id}"), kind: ChannelKind::Text, position: id as i32, private }
+        Channel { id, name: format!("c{id}"), kind: ChannelKind::Text, position: id as i32, private, e2ee: false }
     }
 
     #[test]
@@ -1463,7 +1546,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<Channel>(&only_staff).unwrap().private, Some(PrivateAccess::default()));
         // Inside the events an old app parses.
         for ev in [
-            ServerEvent::Ready { user: user(1), channels: vec![ch.clone()], online: vec![], voice: vec![], account: None, chat: Some(ChatFeatures::ALL), server_id: None },
+            ServerEvent::Ready { user: user(1), channels: vec![ch.clone()], online: vec![], voice: vec![], account: None, chat: Some(ChatFeatures::ALL), server_id: None, stream_previews: false, e2ee: false },
             ServerEvent::ChannelsChanged { channels: vec![ch.clone(), channel(6, None)] },
         ] {
             let json = serde_json::to_string(&ev).unwrap();

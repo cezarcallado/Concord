@@ -229,7 +229,9 @@ impl App {
     pub(super) fn calladex_window(&mut self, ctx: &egui::Context) {
         let Some(dex) = self.calladex.as_ref() else { return };
         let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-        let max_list = (ctx.content_rect().height() * 0.55).clamp(160.0, 440.0);
+        // (I6: the list leaves the card's header and footer room in a short window.)
+        let h = ctx.content_rect().height();
+        let max_list = (h * 0.55).min(h - 230.0).clamp(60.0, 440.0);
         let store = &self.avatars.store;
         egui::Window::new("Calladex")
             .id(egui::Id::new("calladex_card"))
@@ -239,7 +241,7 @@ impl App {
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .frame(ui_kit::dialog_frame(&ctx.global_style()))
             .show(ctx, |ui| {
-                ui.set_width(CARD_W);
+                ui.set_width(ui_kit::dialog_w(ctx, CARD_W));
                 ui.spacing_mut().item_spacing.y = 6.0;
                 close |= header(ui, dex);
                 ui.add_space(space::M);

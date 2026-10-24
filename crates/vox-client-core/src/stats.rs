@@ -27,9 +27,28 @@ pub struct StreamCounters {
     /// audio is effectively mono.
     pub side_sq: AtomicU64,
     pub pairs: AtomicU64,
+    /// Audio (v1.1 E1, measurements): when the last chunk with sound in it (above
+    /// [`LOUD_MEAN_SQ`]) came, in ms since the process started, and the longest stretch without
+    /// such a chunk since [`StreamCounters::take_max_quiet_ms`] (a tone that stops being heard,
+    /// e.g. while keys rotate, shows here; silence frames keep the chunk count going).
+    pub loud_at_ms: AtomicU64,
+    pub max_quiet_ms: AtomicU64,
+}
+
+/// A chunk's mean square above this has sound in it (about -40 dBFS).
+pub const LOUD_MEAN_SQ: u64 = 107_000;
+
+fn process_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
 }
 
 impl StreamCounters {
+    /// The longest stretch without sound since the last call (then starts again).
+    pub fn take_max_quiet_ms(&self) -> u64 {
+        self.max_quiet_ms.swap(0, Ordering::Relaxed)
+    }
+
     pub fn frame(&self, width: u32, height: u32) {
         self.frames.fetch_add(1, Ordering::Relaxed);
         self.width.store(width, Ordering::Relaxed);
@@ -42,6 +61,13 @@ impl StreamCounters {
         let sq: u64 = samples.iter().map(|&s| (s as i64 * s as i64) as u64).sum();
         self.sum_sq.fetch_add(sq, Ordering::Relaxed);
         self.samples.fetch_add(samples.len() as u64, Ordering::Relaxed);
+        if !samples.is_empty() && sq / samples.len() as u64 > LOUD_MEAN_SQ {
+            let now = process_ms();
+            let before = self.loud_at_ms.swap(now, Ordering::Relaxed);
+            if before != 0 {
+                self.max_quiet_ms.fetch_max(now.saturating_sub(before), Ordering::Relaxed);
+            }
+        }
     }
 
     /// [`StreamCounters::audio`] for interleaved stereo, plus the energy of the difference

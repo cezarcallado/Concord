@@ -13,8 +13,11 @@ mod camera_cfg;
 mod chat_images;
 mod clipboard;
 mod context_menu;
+mod donate;
+mod e2ee_store;
 mod filedlg;
 mod forms;
+mod keybinds;
 mod host;
 mod layout;
 mod links;
@@ -23,14 +26,15 @@ mod migrate;
 mod platform;
 mod previews;
 mod profile;
-mod ptt;
 mod repaint_watch;
 mod roles;
 mod servers;
 mod settings;
+mod single_instance;
 mod soundboard;
 mod soundtrim;
 mod sources;
+mod stream_cards;
 mod theme;
 mod tray;
 mod ui_kit;
@@ -118,12 +122,37 @@ fn main() {
         // starts, and before anything reads it.
         std::env::set_var(vox_client_core::testmode::ENV, "1");
     }
+    // v1.1: one concord at a time. A second launch brings the running one to the front and quits
+    // (before anything else: no migration, no settings read). Never in a test mode
+    // (`single_instance::key`): the tests run many concords at once.
+    let test_mode = args.autotest.is_some()
+        || vox_client_core::testmode::background()
+        || args.settings_dir.is_some()
+        || std::env::var_os("VOX_AUTOTEST_SHOT_DIR").is_some();
+    let mut instance = None;
+    let mut instance_note = None;
+    if let Some(key) = single_instance::key_from_env(test_mode) {
+        match single_instance::acquire(&key) {
+            single_instance::Start::First(g) => instance = Some(g),
+            single_instance::Start::Running { signalled } => {
+                let log = vox_log::init("app", args.log_dir.as_deref(), false);
+                tracing::info!(signalled, key = %key, "concord is already running: asked it to show its window; this launch quits");
+                // (The log is written by its own thread: flushed when the guard goes.)
+                drop(log);
+                std::process::exit(0);
+            }
+            single_instance::Start::Unchecked(why) => instance_note = Some(why),
+        }
+    }
     // v1.0.1: the first start of concord copies what voxhub kept (`migrate.rs`), before anything
     // reads it. Never in an autotest (they must not touch the real profile).
     let migrated = if args.autotest.is_none() { migrate::run_at_startup() } else { None };
     let log = vox_log::init("app", args.log_dir.as_deref(), false);
     if let Some(line) = migrated {
         tracing::info!("{line}");
+    }
+    if let Some(why) = instance_note {
+        tracing::warn!(%why, "single instance: not checked");
     }
     // Configurações → Sobre → "Abrir pasta dos registros".
     app::set_log_dir(args.log_dir.clone().unwrap_or_else(|| vox_log::default_log_dir("app")));
@@ -151,6 +180,8 @@ fn main() {
             "avatar-b" => Role::AvatarB,
             "profile-a" => Role::ProfileA,
             "profile-b" => Role::ProfileB,
+            "micswitch-a" => Role::MicSwitchA,
+            "micswitch-b" => Role::MicSwitchB,
             "sound-a" => Role::SoundA,
             "sound-b" => Role::SoundB,
             "sound-trim" => Role::SoundTrim,
@@ -186,6 +217,32 @@ fn main() {
             "shots3b-host" => Role::Shots3bHost,
             "calladex" => Role::Calladex,
             "mac-view" => Role::MacView,
+            "uix-a" => Role::UixA,
+            "uix-b" => Role::UixB,
+            "keys-a" => Role::KeysA,
+            "thumbs-a" => Role::ThumbsA,
+            "thumbs-b" => Role::ThumbsB,
+            "thumbs-c" => Role::ThumbsC,
+            "tls-a" => Role::TlsA,
+            "tls-b" => Role::TlsB,
+            "tls-mitm" => Role::TlsMitm,
+            "tls-oldhub" => Role::TlsOldHub,
+            "e2ee-a" => Role::E2eeA,
+            "e2ee-a2" => Role::E2eeA2,
+            "e2ee-b" => Role::E2eeB,
+            "e2dm-a" => Role::E2dmA,
+            "e2dm-b" => Role::E2dmB,
+            "e2dm-a2" => Role::E2dmA2,
+            "e2dm-new" => Role::E2dmNew,
+            "e2v-a" => Role::E2vA,
+            "e2v-b" => Role::E2vB,
+            "e2v-c" => Role::E2vC,
+            "e2v-admin" => Role::E2vAdmin,
+            "emoji-a" => Role::EmojiA,
+            "resp-a" => Role::RespA,
+            "resp-b" => Role::RespB,
+            #[cfg(feature = "donate-test")]
+            "donate" => Role::Donate,
             _ => Role::Idle,
         };
         tracing::info!(role = r, own_settings_dir = args.settings_dir.is_some(), "AUTOTEST mode (the real settings are not read or written)");
@@ -219,10 +276,13 @@ fn main() {
         crate::settings::set_dir(dir);
     }
     let mut settings = if persist || crate::settings::dir_overridden() { Settings::load() } else { Settings::default() };
-    // macOS: saved passwords live in the Keychain; drop the ones no settings file mentions.
+    // v1.1 (E0): the identity keys live in e2ee.json next to settings.json (memory only otherwise).
+    crate::e2ee_store::set_persistent(persist || crate::settings::dir_overridden());
+    // macOS: saved passwords live in secrets.json (moved out of the Keychain once); drop the ones
+    // no settings file mentions.
     #[cfg(target_os = "macos")]
     if persist || crate::settings::dir_overridden() {
-        crate::settings::keychain_gc();
+        crate::settings::secrets_gc();
     }
     if !persist {
         // Autotest: alert sounds only run when VOX_NO_PLAYBACK is set (then they are just logged),
@@ -270,6 +330,14 @@ fn main() {
         #[cfg(not(target_os = "macos"))]
         vox_client_core::golive::Viewer::set_waker(move || r.wake());
     }
+    if let Some(mut g) = instance {
+        // A second launch's signal shows the window (`notify_tick`), even from the tray. Held
+        // until the app starts closing (`notify_on_exit`).
+        let r = repaint.clone();
+        g.listen(move || r.wake());
+        single_instance::hold(g);
+        tracing::info!("single instance: this is the running concord");
+    }
     let backend = Backend::start(repaint.clone());
 
     // (1060 × 660, or the design-review screenshots' size and display scale.)
@@ -308,6 +376,7 @@ fn main() {
         tracing::error!(error = %e, "ui failed");
     }
     tracing::info!("concord exited");
+    single_instance::release();
     drop(log);
     std::process::exit(EXIT_CODE.load(Ordering::Relaxed));
 }

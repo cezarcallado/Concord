@@ -19,6 +19,7 @@ use crate::host::nat::{self, Reach};
 /// How long the router search and the STUN question may take.
 const NET_TIMEOUT: Duration = Duration::from_secs(4);
 /// How long the firewall check may take (PowerShell reading ~1000 rules: 2-3 s usually).
+#[cfg(windows)]
 const FW_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// What the server knows about itself when it starts.

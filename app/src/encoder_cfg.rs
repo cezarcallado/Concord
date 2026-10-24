@@ -58,7 +58,7 @@ impl App {
                     None => AUTO.to_string(),
                     Some(id) => snap.options.iter().find(|o| o.id == id).map(|o| o.label.clone()).unwrap_or_else(|| AUTO.to_string()),
                 };
-                egui::ComboBox::from_id_salt("video_encoder").selected_text(current).width(forms::COMBO_W).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("video_encoder").selected_text(current).width(forms::combo_w(ui)).show_ui(ui, |ui| {
                     let auto = format!("{AUTO} · agora: {}", crate::app::shown_encoder_label(&snap.auto_label));
                     changed |= ui.selectable_value(&mut self.settings.video_encoder, None, auto).changed();
                     for o in &snap.options {

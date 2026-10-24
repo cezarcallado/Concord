@@ -10,11 +10,18 @@ description = "concord desktop app (egui): connect, chat, voice, Go Live."
 name = "concord"
 path = "src/main.rs"
 
+[features]
+# Only for the `donate` autotest role: a build with the Pix test key (`donate::TEST_PIX`). Never
+# for a release.
+donate-test = []
+
 [dependencies]
 vox-log = { workspace = true }
 vox-proto = { workspace = true }
 vox-capture = { workspace = true }
 vox-client-core = { path = "../crates/vox-client-core" }
+# v1.1 (E0): per-device identity keys, kept in e2ee.json (the hub never links it).
+vox-e2ee = { workspace = true }
 # "Criar / abrir servidor" (v0.8): the hub runs inside the app, as a library (nothing of it starts
 # until somebody hosts).
 voxhub-server = { path = "../hub" }
@@ -31,6 +38,8 @@ eframe = { version = "0.36", default-features = false, features = ["glow", "defa
 # (`theme::ph`), for button and row icons.
 egui-phosphor = { version = "0.14", default-features = false, features = ["subset"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
+# v1.1 (D1): the Pix QR code (no image or SVG output: `donate.rs` only reads its modules).
+qrcode = { version = "0.14", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 # The native file dialog (IFileOpenDialog) for "Foto de perfil".
@@ -41,3 +50,10 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphic
 # Saved passwords and login tokens in the login Keychain (MIT OR Apache-2.0; already in the tree
 # through the TLS stack).
 security-framework = { version = "3", default-features = false }
+
+[dev-dependencies]
+# Only for the colour emoji packer (`theme::emoji`'s ignored `pack_atlas` test): each Twemoji
+# picture saved as an indexed (palette) PNG, which `image` cannot write. Both crates are already
+# in the tree through `image`; nothing of them goes into the program.
+png = "0.18"
+color_quant = "1.1"

@@ -20,6 +20,10 @@
 //!   `Settings::device_token_servers`): the saved password and the token are sent only to an
 //!   address that answers as that server (`backend::Guard`). An entry saved before has none until
 //!   its next login at the address the user typed or picked (or through an accepted invite).
+//! - The server's certificate (v1.1, [`SavedServer::tls_pin`], and the token's own in
+//!   `Settings::device_token_pins`): once known, the app talks to the entry only over TLS with that
+//!   certificate, never in the clear (`backend/tls.rs`, the trust rules). The address stays
+//!   `http://host:port`: the pin decides the transport.
 //! - The home screen asks every entry's hub for `GET /api/health` in the background ([`Pinger`]):
 //!   at most every 30 s, only while the home screen shows, on a thread of its own with a short
 //!   timeout (the UI never waits for it).
@@ -122,6 +126,11 @@ pub struct SavedServer {
     /// with it. Not a secret.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub server_id: String,
+    /// v1.1 (T0): the SHA-256 of the server's TLS certificate, 64 hex digits, empty while unknown
+    /// (an older hub, or not logged in since). With it: pinned TLS only, never plain HTTP. Not a
+    /// secret.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub tls_pin: String,
 }
 
 /// The dedup key: normalized address + port (+ path) and name, case-insensitive. The same text
@@ -150,7 +159,7 @@ impl SavedServer {
     /// that network, see `InviteCode::candidate_urls`), then the one that worked last.
     pub fn candidate_urls(&self, local: &[(IpAddr, u8)]) -> Vec<String> {
         let mut out = if self.alt_port != 0 && !self.alt_addrs.is_empty() {
-            let code = InviteCode { token: [0u8; INVITE_TOKEN_LEN], hub_port: self.alt_port, addrs: self.alt_addrs.iter().map(AltAddr::to_invite).collect() };
+            let code = InviteCode { token: [0u8; INVITE_TOKEN_LEN], hub_port: self.alt_port, addrs: self.alt_addrs.iter().map(AltAddr::to_invite).collect(), tls_pin: None };
             code.candidate_urls(local)
         } else {
             Vec::new()
@@ -165,6 +174,11 @@ impl SavedServer {
     /// The server's identity, if known.
     pub fn server_id(&self) -> Option<String> {
         Some(self.server_id.clone()).filter(|id| vox_proto::is_server_id(id))
+    }
+
+    /// v1.1 (T0): the server's certificate pin, if known.
+    pub fn tls_pin(&self) -> Option<[u8; 32]> {
+        vox_proto::tls_pin_from_hex(&self.tls_pin)
     }
 
     /// Every address this entry may keep a login token under.
@@ -273,6 +287,9 @@ pub struct Login<'a> {
     pub hosted: Option<String>,
     /// v1.0.1: the server's identity, when this login confirmed it (`Ev::LoggedIn::pin`).
     pub server_id: Option<&'a str>,
+    /// v1.1 (T0): the server's certificate, when this login may keep it (pinned TLS, or seen for
+    /// the first time on a login that confirmed the server).
+    pub tls_pin: Option<[u8; 32]>,
     pub now_ms: i64,
 }
 
@@ -306,8 +323,10 @@ impl Settings {
         if let Some(t) = self.device_token(&from, from_user) {
             if self.device_token(&to, to_user).is_none() {
                 let id = self.device_token_server(&from, from_user);
+                let pin = self.device_token_pin(&from, from_user);
                 self.set_device_token(&to, to_user, Some(&t));
                 self.set_device_token_server(&to, to_user, id.as_deref());
+                self.set_device_token_pin(&to, to_user, pin);
             }
             self.set_device_token(&from, from_user, None);
         }
@@ -373,6 +392,9 @@ impl Settings {
             if let Some(id) = l.server_id.filter(|id| vox_proto::is_server_id(id)) {
                 e.server_id = id.to_string();
             }
+            if let Some(pin) = l.tls_pin {
+                e.tls_pin = vox_proto::tls_pin_hex(&pin);
+            }
             e.last_used_ms = l.now_ms;
         }
         while self.servers.servers.len() > MAX_SERVERS {
@@ -412,6 +434,23 @@ impl Settings {
         self.sync_legacy_server();
     }
 
+    /// v1.1 (T0): "Confiar no novo código": the entries of this address and name, and the login
+    /// tokens saved there, take the certificate `pin` from now on.
+    pub fn trust_new_pin(&mut self, url: &str, username: &str, pin: [u8; 32]) {
+        let key = server_key(url, username);
+        let hex = vox_proto::tls_pin_hex(&pin);
+        let mut urls = vec![normalize_url(url)];
+        for e in self.servers.servers.iter_mut().filter(|e| e.key() == key || (e.username.trim().eq_ignore_ascii_case(username.trim()) && e.all_urls().contains(&normalize_url(url)))) {
+            e.tls_pin = hex.clone();
+            urls.extend(e.all_urls());
+        }
+        for u in urls {
+            if self.device_token(&u, username).is_some() {
+                self.set_device_token_pin(&u, username, Some(pin));
+            }
+        }
+    }
+
     /// "Renomear": a local nickname (empty: back to the hub's name).
     pub fn rename_server(&mut self, id: u64, nickname: &str) {
         if let Some(e) = self.servers.servers.iter_mut().find(|s| s.id == id) {
@@ -436,13 +475,16 @@ impl Settings {
             return Err("Esse endereço já está na lista com esse nome.".into());
         }
         if key != e.key() {
-            let token = self.server_device_token_at(&e).map(|(at, t)| (self.device_token_server(&at, &e.username), t));
+            // Audit (T0): the token's certificate pin goes along too (it used to be dropped here,
+            // and a token without a pin may go to a server without TLS).
+            let token = self.server_device_token_at(&e).map(|(at, t)| (self.device_token_server(&at, &e.username), self.device_token_pin(&at, &e.username), t));
             for u in self.owned_token_urls(&e) {
                 self.set_device_token(&u, &e.username, None);
             }
-            if let Some((server, t)) = token {
+            if let Some((server, pin, t)) = token {
                 self.set_device_token(&url, &e.username, Some(&t));
                 self.set_device_token_server(&url, &e.username, server.as_deref());
+                self.set_device_token_pin(&url, &e.username, pin);
             }
         }
         if let Some(s) = self.servers.servers.iter_mut().find(|s| s.id == id) {
@@ -610,8 +652,9 @@ impl Pinger {
         self.last.map_or(Duration::ZERO, |t| PING_EVERY.saturating_sub(now.saturating_duration_since(t)))
     }
 
-    /// Check `targets` (entry id, addresses in order) on a thread of its own; `wake` repaints.
-    pub fn start(&mut self, targets: Vec<(u64, Vec<String>)>, wake: impl Fn() + Send + 'static) {
+    /// Check `targets` (entry id, addresses in order, the certificate pin when known) on a thread
+    /// of its own; `wake` repaints.
+    pub fn start(&mut self, targets: Vec<(u64, Vec<String>, Option<[u8; 32]>)>, wake: impl Fn() + Send + 'static) {
         let (tx, rx) = channel();
         let spawned = std::thread::Builder::new().name("server-ping".into()).spawn(move || {
             let _ = tx.send(ping_all(targets));
@@ -635,16 +678,16 @@ impl Pinger {
     }
 }
 
-fn ping_all(targets: Vec<(u64, Vec<String>)>) -> Vec<(u64, bool)> {
+fn ping_all(targets: Vec<(u64, Vec<String>, Option<[u8; 32]>)>) -> Vec<(u64, bool)> {
     let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
-        return targets.into_iter().map(|(id, _)| (id, false)).collect();
+        return targets.into_iter().map(|(id, _, _)| (id, false)).collect();
     };
     rt.block_on(async move {
         let mut set = tokio::task::JoinSet::new();
-        for (id, urls) in targets {
+        for (id, urls, pin) in targets {
             set.spawn(async move {
                 for u in urls {
-                    if answers(&u).await {
+                    if answers(&u, pin).await {
                         return (id, true);
                     }
                 }
@@ -661,8 +704,23 @@ fn ping_all(targets: Vec<(u64, Vec<String>)>) -> Vec<(u64, bool)> {
     })
 }
 
-async fn answers(url: &str) -> bool {
-    let Ok(hub) = HubClient::new(url) else { return false };
+/// v1.1 (T0): a pinned entry is asked over TLS with its certificate only (another one shows as
+/// offline; a click then says why); one without a pin over TLS when the hub has it, else in the
+/// clear as before.
+async fn answers(url: &str, pin: Option<[u8; 32]>) -> bool {
+    let pin = match pin {
+        Some(p) => Some(p),
+        None => match tokio::time::timeout(PING_TIMEOUT, vox_client_core::tls::probe_url(url)).await {
+            Ok(vox_client_core::tls::Probe::Tls(p)) => Some(p),
+            Ok(vox_client_core::tls::Probe::NoTls) => None,
+            _ => return false,
+        },
+    };
+    let hub = match pin {
+        Some(p) => HubClient::new_pinned(url, p),
+        None => HubClient::new(url),
+    };
+    let Ok(hub) = hub else { return false };
     matches!(tokio::time::timeout(PING_TIMEOUT, hub.health()).await, Ok(Ok(h)) if h.ok)
 }
 
@@ -757,7 +815,7 @@ impl App {
             return;
         }
         let local = crate::host::local_addrs();
-        let targets: Vec<(u64, Vec<String>)> = self.settings.servers.servers.iter().map(|e| (e.id, e.candidate_urls(&local))).collect();
+        let targets: Vec<(u64, Vec<String>, Option<[u8; 32]>)> = self.settings.servers.servers.iter().map(|e| (e.id, e.candidate_urls(&local), e.tls_pin())).collect();
         let r = self.repaint.clone();
         self.servers.pinger.start(targets, move || r.wake());
     }
@@ -794,7 +852,10 @@ impl App {
         let hosted = e.hosted.clone().and_then(|h| self.hosted_by_id(&h));
         self.form.url = e.url.clone();
         self.form.user = e.username.clone();
-        self.form.remember = password.is_some();
+        // M1 (Mac): an entry whose remembered password cannot be read now (Keychain item gone or
+        // access denied, or another copy of the app rewrote the files) keeps "Lembrar a senha"
+        // ticked, so typing it once saves it again instead of silently forgetting it for good.
+        self.form.remember = password.is_some() || e.password_enc.is_some();
         self.form.password = password.unwrap_or_default();
         self.form.personal.clear();
         self.form.need_personal = false;
@@ -867,8 +928,9 @@ impl App {
     }
 
     /// A login went through: save or update its entry ("Salvar na lista de servidores").
-    /// `server_id`: the server's identity, when the login confirmed it (v1.0.1).
-    pub(crate) fn servers_logged_in(&mut self, url: &str, username: &str, server_name: &str, personal_typed: bool, server_id: Option<&str>) {
+    /// `server_id`: the server's identity, when the login confirmed it (v1.0.1). `tls_pin`: its
+    /// certificate, when the entry may keep it (v1.1).
+    pub(crate) fn servers_logged_in(&mut self, url: &str, username: &str, server_name: &str, personal_typed: bool, server_id: Option<&str>, tls_pin: Option<[u8; 32]>) {
         let entry = self.servers.joining.take();
         let invite = self.servers.pending_invite.take();
         let device_used = std::mem::take(&mut self.servers.device_used);
@@ -892,6 +954,7 @@ impl App {
             invite,
             hosted,
             server_id,
+            tls_pin,
             now_ms: crate::app::now_ms(),
         };
         let id = self.settings.remember_server(login);
@@ -970,8 +1033,10 @@ impl App {
             return true;
         }
         let mut act = None;
-        ui.allocate_ui_with_layout(egui::vec2(LIST_W, 0.0), Layout::top_down(Align::Min), |ui| {
-            ui.set_width(LIST_W);
+        // (I6: narrower in a small or zoomed-in window: the rows' buttons stay in it.)
+        let list_w = LIST_W.min(ui.available_width());
+        ui.allocate_ui_with_layout(egui::vec2(list_w, 0.0), Layout::top_down(Align::Min), |ui| {
+            ui.set_width(list_w);
             crate::ui_kit::title(ui, "Seus servidores");
             ui.add_space(10.0);
             let list = self.settings.servers.servers.clone();
@@ -1008,7 +1073,7 @@ impl App {
     fn server_row(&mut self, ui: &mut egui::Ui, e: &SavedServer, i: usize, n: usize, act: &mut Option<Act>) {
         // Logging in, or (my own server) getting it ready first.
         let joining_here = self.servers.joining == Some(e.id) && (self.form.busy || (e.hosted.is_some() && self.host.hosting()));
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(LIST_W, ROW_H), Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(LIST_W.min(ui.available_width()), ROW_H), Sense::click());
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
         let theme_fill = if resp.hovered() || joining_here { crate::theme::MOVEL } else { Color32::TRANSPARENT };
         ui.painter().rect_filled(rect, crate::theme::radius::BUTTON, theme_fill);
@@ -1093,7 +1158,7 @@ impl App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                let r = ui.add(ui_kit::field(text).hint_text(hint).desired_width(LIST_W - 150.0));
+                let r = ui.add(ui_kit::field(text).hint_text(hint).desired_width((LIST_W.min(ui.available_width()) - 150.0).max(80.0)));
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if ui_kit::button_sized(ui, Kind::Primary, Size::Small, None, "Salvar").clicked() || enter {
                     *act = Some(Act::SaveEdit);
@@ -1195,8 +1260,51 @@ mod tests {
             invite: None,
             hosted: None,
             server_id: None,
+            tls_pin: None,
             now_ms: 1_000,
         }
+    }
+
+    /// v1.1 (T0): the certificate pin stays with the entry and its token, and moves with them.
+    #[test]
+    fn the_tls_pin_stays_with_the_entry_and_its_token() {
+        let mut s = Settings::default();
+        let (p, q) = ([3u8; 32], [4u8; 32]);
+        let a = s.remember_server(login("192.0.2.10", "ana", "", false));
+        assert_eq!(s.server_entry(a).unwrap().tls_pin(), None, "a plain login: none");
+        s.remember_server(Login { entry: Some(a), tls_pin: Some(p), ..login("192.0.2.10", "ana", "", false) });
+        assert_eq!(s.server_entry(a).unwrap().tls_pin(), Some(p));
+        s.remember_server(Login { entry: Some(a), ..login("192.0.2.10", "ana", "", false) });
+        assert_eq!(s.server_entry(a).unwrap().tls_pin(), Some(p), "never forgotten by a login without one");
+        s.set_device_token("http://192.0.2.10:7890", "ana", Some("tok"));
+        s.set_device_token_pin("http://192.0.2.10:7890", "ana", Some(p));
+        assert_eq!(s.device_token_pin("http://192.0.2.10:7890", "Ana"), Some(p));
+        // The entry moves to another address: its token and the token's pin go along.
+        s.remember_server(Login { entry: Some(a), tls_pin: Some(p), ..login("192.0.2.11", "ana", "", false) });
+        assert_eq!(s.device_token_pin("http://192.0.2.11:7890", "ana"), Some(p));
+        assert_eq!(s.device_token_pin("http://192.0.2.10:7890", "ana"), None);
+        // "Confiar no novo código".
+        s.trust_new_pin("192.0.2.11", "ana", q);
+        assert_eq!(s.server_entry(a).unwrap().tls_pin(), Some(q));
+        assert_eq!(s.device_token_pin("http://192.0.2.11:7890", "ana"), Some(q));
+        // A new token starts without a pin; the pin is not a secret but it round-trips.
+        s.set_device_token("http://192.0.2.11:7890", "ana", Some("tok2"));
+        assert_eq!(s.device_token_pin("http://192.0.2.11:7890", "ana"), None);
+        let json = serde_json::to_string(s.server_entry(a).unwrap()).unwrap();
+        assert!(json.contains(&vox_proto::tls_pin_hex(&q)), "{json}");
+        let plain = serde_json::to_string(&SavedServer::default()).unwrap();
+        assert!(!plain.contains("tls_pin"), "absent while unknown: {plain}");
+        // Audit (T0): "Editar endereço" moves the token WITH its pin (it used to lose it).
+        s.set_device_token_pin("http://192.0.2.11:7890", "ana", Some(q));
+        s.edit_server_address(a, "192.0.2.12").unwrap();
+        assert_eq!(s.device_token("http://192.0.2.12:7890", "ana").as_deref(), Some("tok2"));
+        assert_eq!(s.device_token_pin("http://192.0.2.12:7890", "ana"), Some(q), "the pin follows the token");
+        assert_eq!(s.server_entry(a).unwrap().tls_pin(), Some(q), "and the entry keeps its own");
+        // A saved settings file of v1.0.2 (no pins anywhere) still loads.
+        let old: Settings = serde_json::from_str(r#"{"device_tokens":{},"device_token_servers":{}}"#).unwrap();
+        assert!(old.device_token_pins.is_empty());
+        let old: SavedServer = serde_json::from_str(r#"{"id":1,"url":"http://192.0.2.10:7890","username":"ana","server_id":"0123456789abcdef0123456789abcdef"}"#).unwrap();
+        assert_eq!(old.tls_pin(), None);
     }
 
     #[test]
@@ -1526,7 +1634,7 @@ mod tests {
         p.soon();
         assert_eq!(p.due_in(now), Duration::ZERO);
         // A round against nothing that answers ends quickly and reports offline.
-        p.start(vec![(7, vec!["http://127.0.0.1:9".into()])], || {});
+        p.start(vec![(7, vec!["http://127.0.0.1:9".into()], None)], || {});
         let t = Instant::now();
         while !p.poll() && t.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(20));
